@@ -52,19 +52,21 @@ command -v xcrun >/dev/null || { echo "!! 需要 macOS + Xcode（xcrun 不存在
 
 # DCUniModule.h 的位置：环境变量 > 仓库内 build-ios/dcuni-inc/ > 插件目录内 dcuni-inc/
 # 放仓库根而不是插件目录，是为了不把 DCloud 的头文件混进 nativeplugins（它们只参与构建）。
+# 注意：SDK 的 inc/ 是嵌套结构，DCUniModule.h 在 inc/DCUni/ 子目录，不是 inc/ 根。
+# 所以 DCUNI_INC 应指向"解压后含 DCUni/ 的 inc 目录"，判断条件用 DCUni/DCUniModule.h。
 DCUNI_INC="${DCUNI_INC:-}"
-if [ -z "$DCUNI_INC" ] || [ ! -f "$DCUNI_INC/DCUniModule.h" ]; then
+if [ -z "$DCUNI_INC" ] || [ ! -f "$DCUNI_INC/DCUni/DCUniModule.h" ]; then
   DCUNI_INC=""
   for c in "$PROJECT_ROOT/build-ios/dcuni-inc" "$IOS_DIR/dcuni-inc"; do
-    if [ -f "$c/DCUniModule.h" ]; then DCUNI_INC="$c"; break; fi
+    if [ -f "$c/DCUni/DCUniModule.h" ]; then DCUNI_INC="$c"; break; fi
   done
 fi
 if [ -z "$DCUNI_INC" ]; then
-  echo "!! 找不到 DCUniModule.h。它来自 uni-app iOS 离线打包 SDK 解压后的 inc/ 目录" >&2
+  echo "!! 找不到 DCUni/DCUniModule.h。它来自 uni-app iOS 离线打包 SDK 解压后的 inc/ 目录" >&2
   echo "   （SDK 下载页 https://nativesupport.dcloud.net.cn/AppDocs/download/ios.html ，" >&2
   echo "     和彩云/百度网盘，提取码 a6sb；版本要和 HBuilderX 对得上）。" >&2
   echo "   用法：DCUNI_INC=<inc目录> bash $0 [输出目录]" >&2
-  echo "   或把 inc 里的头文件拷到 $PROJECT_ROOT/build-ios/dcuni-inc/" >&2
+  echo "   或把 inc 里的头文件拷到 $PROJECT_ROOT/build-ios/dcuni-inc/（含 DCUni/ 子目录）" >&2
   exit 1
 fi
 
@@ -99,6 +101,9 @@ echo
 # -I<IOS_DIR>       : JoemeWatchModule.h 在本目录
 # 第三方 framework（ZipZap/JL_BLEKit/...）只在 SDK 二进制里有引用，头文件里
 # 只有注释提到，所以这里不需要它们的 include 路径。
+# 另外：inc 是嵌套结构，DCUniModule.h 在 DCUni/ 子目录、DCUniBasePlugin.h 又
+# #import "WXComponent.h"（在 weexHeader/），所以除 -I$DCUNI_INC 根外，
+# 还要追加 DCUni/ 和 weexHeader/ 两个子目录，否则引号 include 解析不到。
 CFLAGS=(
   -target "arm64-apple-ios$MIN_IOS"
   -isysroot "$SDKROOT"
@@ -106,6 +111,8 @@ CFLAGS=(
   -fmodules -fmodules-cache-path="$OUT_DIR/ModuleCache"
   -O2 -DNDEBUG
   -I"$DCUNI_INC"
+  -I"$DCUNI_INC/DCUni"
+  -I"$DCUNI_INC/weexHeader"
   -I"$IOS_DIR"
   -F"$IOS_DIR"
   -Wno-nullability-completeness

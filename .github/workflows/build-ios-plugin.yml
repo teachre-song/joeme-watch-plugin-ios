@@ -53,8 +53,8 @@ jobs:
           set -eux
           xcodebuild -version
           echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
-          if [ ! -f build-ios/dcuni-inc/DCUniModule.h ]; then
-            echo "::error::build-ios/dcuni-inc/DCUniModule.h 不存在，无法编译。见 nativeplugins/joeme-watch/README.md 的获取方式。"
+          if [ ! -f build-ios/dcuni-inc/DCUni/DCUniModule.h ]; then
+            echo "::error::build-ios/dcuni-inc/DCUni/DCUniModule.h 不存在，无法编译。见 nativeplugins/joeme-watch/README.md 的获取方式。"
             exit 1
           fi
 
