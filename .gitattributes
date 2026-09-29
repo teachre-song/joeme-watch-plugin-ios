@@ -1,0 +1,12 @@
+# 脚本必须在 macOS (bash) 上执行，强制 LF 行尾，禁止 git 转 CRLF
+*.sh         text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+
+# 其余文本文件按平台默认
+*.m          text
+*.h          text
+*.md         text
+
+# 二进制/framework 不处理
+*.framework  binary

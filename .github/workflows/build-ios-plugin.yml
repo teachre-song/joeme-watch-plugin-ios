@@ -1,0 +1,79 @@
+name: build-ios-plugin
+
+# 为什么要有这个 workflow
+# ----------------------
+# HBuilderX 云打包**不会编译** nativeplugins/<插件>/ios/ 下的 .m 源码，只自动引用
+# .a / .framework（见 2026-09-29 那次 iOS Appstore 打包日志：整个 HBuilder target
+# 只编译了 main.m，全文 0 处出现 DCUniModule）。所以 iOS 端的插件源码必须在 macOS
+# 上先编成静态 framework 才能被云打包引用，而开发机是 Windows。
+#
+# 产物：JoemeWatchModule.framework（静态，arm64）
+#   = JoemeWatchModule.m + FMDB/*.m + MJExtension/*.m
+#
+# 前置条件
+# --------
+# build-ios/dcuni-inc/ 里要有 uni-app iOS 离线打包 SDK 的 inc 头文件
+# （至少 DCUniModule.h）。获取方式见 nativeplugins/joeme-watch/README.md。
+#
+# 跑完怎么用
+# ----------
+# 下载 artifact 解开，把 JoemeWatchModule.framework 拷进
+# nativeplugins/joeme-watch/ios/，然后重新云端打包（原生插件不能热更新）。
+#
+# ⚠ 本仓库的 origin 是阿里云 Codeup，这个文件在那边不会被触发，只有把代码放到
+#   GitHub 上才有用。不想上 GitHub 的话，直接借一台 Mac 跑
+#   nativeplugins/joeme-watch/ios/build-ios-framework.sh 更省事；
+#   要留在 Codeup 内部也可以给流水线接一台 macOS 私有构建集群。
+#   三条路的对比见 nativeplugins/joeme-watch/README.md。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'nativeplugins/joeme-watch/ios/*.m'
+      - 'nativeplugins/joeme-watch/ios/*.h'
+      - 'nativeplugins/joeme-watch/ios/FMDB/**'
+      - 'nativeplugins/joeme-watch/ios/MJExtension/**'
+      - 'nativeplugins/joeme-watch/ios/build-ios-framework.sh'
+      - 'build-ios/dcuni-inc/**'
+      - '.github/workflows/build-ios-plugin.yml'
+
+jobs:
+  build:
+    # macos-14 = Apple Silicon，原生编译 arm64 目标。Xcode 15+ 最低部署目标为
+    # iOS 12，脚本里 MIN_IOS 默认 12.0；云打包基座实际链接的是 -target
+    # arm64-apple-ios15.0，所以 12.0 只是够用，不影响最终产物。
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          set -eux
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          if [ ! -f build-ios/dcuni-inc/DCUniModule.h ]; then
+            echo "::error::build-ios/dcuni-inc/DCUniModule.h 不存在，无法编译。见 nativeplugins/joeme-watch/README.md 的获取方式。"
+            exit 1
+          fi
+
+      - name: 编译静态 framework
+        run: |
+          set -eux
+          bash nativeplugins/joeme-watch/ios/build-ios-framework.sh "$RUNNER_TEMP/out"
+          ls -la "$RUNNER_TEMP/out/JoemeWatchModule.framework"
+
+      - name: 打成 tar.gz（解出来能直接放回插件目录，Windows 上用 tar 或 7zip 解）
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/out"
+          tar -czf "$RUNNER_TEMP/JoemeWatchModule.framework.tar.gz" JoemeWatchModule.framework
+          ls -la "$RUNNER_TEMP/JoemeWatchModule.framework.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JoemeWatchModule.framework
+          path: ${{ runner.temp }}/JoemeWatchModule.framework.tar.gz
+          if-no-files-found: error
+          retention-days: 30
