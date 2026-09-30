@@ -26,6 +26,29 @@
 #import <VeepooBleSDK/VPBodyCompositionValueModel.h>
 #import <VeepooBleSDK/VPGSRResultModel.h>
 #import <VeepooBleSDK/VPECGTestDataModel.h>
+// ===== 以下为全量桥接新增业务模型（直接使用其属性，umbrella 头文件不自动带）=====
+#import <VeepooBleSDK/VPAutoMonitTestModel.h>
+#import <VeepooBleSDK/VPOxygenApneaRemindModel.h>
+#import <VeepooBleSDK/VPDeviceHealthRemindModel.h>
+#import <VeepooBleSDK/VPDeviceAlarmModel.h>
+#import <VeepooBleSDK/VPDeviceNewAlarmModel.h>
+#import <VeepooBleSDK/VPDeviceTextAlarmModel.h>
+#import <VeepooBleSDK/VPWorldClockModel.h>
+#import <VeepooBleSDK/VPDeviceBrightModel.h>
+#import <VeepooBleSDK/VPScreenDurationModel.h>
+#import <VeepooBleSDK/VPDeviceRaiseHandModel.h>
+#import <VeepooBleSDK/VPDeviceContactsModel.h>
+#import <VeepooBleSDK/VPDeviceFemaleModel.h>
+#import <VeepooBleSDK/VPDeviceCountDownModel.h>
+#import <VeepooBleSDK/VPDeviceHeartAlarmModel.h>
+#import <VeepooBleSDK/VPDeviceLongSeatModel.h>
+#import <VeepooBleSDK/VPDeviceGPSModel.h>
+#import <VeepooBleSDK/VPDeviceSportControlModel.h>
+#import <VeepooBleSDK/VPDeviceMessageTypeModel.h>
+#import <VeepooBleSDK/VPPhotoDialModel.h>
+#import <VeepooBleSDK/VPDeviceMarketDialModel.h>
+#import <VeepooBleSDK/VPTCMTestDataModel.h>
+#import <VeepooBleSDK/VPPttValueModel.h>
 
 @interface JoemeWatchModule ()
 
@@ -1215,6 +1238,1331 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
     }];
     // 对应 Android 的 funcSupport 事件（JS 侧映射为 'func'），携带数据保存天数
     [self sendEvent:@"funcSupport" data:@{ @"watchDataDay": @(pm.saveDays) }];
+}
+
+// ==================== 全量桥接（契约第 1~13 节） ====================
+// 说明：本节只新增，不改动上方既有方法。所有方法名/事件名严格对齐 bridge-spec.md。
+// SDK 方法签名均对照 VeepooBleSDK.framework/Headers 逐一核对，未编造。
+
+/**
+ 业务前置检查（对齐 powerOffDevice 的判定）：
+ 返回 YES 表示已 initWatch 且设备已连接验密，可继续；NO 表示已给 callback 错误回执。
+ */
+- (BOOL)checkReady:(UniModuleKeepAliveCallback)callback {
+    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
+    if (!manager.peripheralManage) {
+        callback(@{ @"code": @(-1), @"message": @"未初始化：请先调用 initWatch" }, NO);
+        return NO;
+    }
+    if (!manager.peripheralModel) {
+        callback(@{ @"code": @(-1), @"message": @"设备未连接，请先连接并完成密码验证" }, NO);
+        return NO;
+    }
+    return YES;
+}
+
+// ---------- 1. 基础设置（conn） ----------
+
+/**
+ 同步时间给设备。
+ iOS SDK：veepooSDKSettingTimeWithResult:（block 内 BOOL success）
+ Android：settingTime(...)；JS：joemeWatch.setTime()
+ 事件：on('time') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setTime:callback:))
+- (void)setTime:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingTimeWithResult:^(BOOL success) {
+        [self sendEvent:@"time" data:@{ @"ok": @(success) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置设备名称。options: { name }。
+ iOS SDK：veepooSDKSettingDeviceNameWithString:resultBlock:（state 0=成功 1=失败 2=溢出 3=不足）
+ Android：bleDeviceRename(...)；JS：joemeWatch.setDeviceName(name)
+ 事件：on('deviceName') -> { ok, state }
+ */
+UNI_EXPORT_METHOD(@selector(setDeviceName:callback:))
+- (void)setDeviceName:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *name = options[@"name"];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+        callback(@{ @"code": @(-1), @"message": @"name 不能为空" }, NO);
+        return;
+    }
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceNameWithString:name resultBlock:^(NSUInteger state) {
+        [self sendEvent:@"deviceName" data:@{ @"ok": @(state == 0), @"state": @(state) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 读取当前连接设备 RSSI。一次性读取：callback 与事件都带数据。
+ iOS SDK：veepooSDKReadConnectedPeripheralRSSIValue:（VPReadRSSIBlock = void(^)(NSInteger rssiValue)）
+ Android：readRssi(...)；JS：joemeWatch.readRSSI() -> resolve { rssi }
+ 事件：on('rssi') -> { rssi }
+ */
+UNI_EXPORT_METHOD(@selector(readRSSI:callback:))
+- (void)readRSSI:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKReadConnectedPeripheralRSSIValue:^(NSInteger rssiValue) {
+        NSDictionary *d = @{ @"rssi": @(rssiValue) };
+        [self sendEvent:@"rssi" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
+        [res addEntriesFromDictionary:d];
+        callback(res, NO);
+    }];
+}
+
+/**
+ 清除设备数据（恢复出厂，清完设备自动关机断开）。
+ iOS SDK：veepooSDKClearDeviceData（裸声明，无回执）——同 powerOff 处理。
+ Android：clearDeviceData(...)；JS：joemeWatch.clearDeviceData()
+ 事件：无；callback(200) 表示已下发。
+ */
+UNI_EXPORT_METHOD(@selector(clearDeviceData:callback:))
+- (void)clearDeviceData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKClearDeviceData];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 复位设备（冷启动重启，数据不清，会断开）。
+ iOS SDK：veepooSDKResetDeviceData（裸声明，无回执）
+ Android：resetDeviceData(...)；JS：joemeWatch.resetDeviceData()
+ 事件：无；callback(200) 表示已下发。
+ */
+UNI_EXPORT_METHOD(@selector(resetDeviceData:callback:))
+- (void)resetDeviceData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKResetDeviceData];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 读取电量与充电状态（与现有 readBattery 同接口，独立暴露）。
+ iOS SDK：veepooSDKReadDeviceBatteryAndChargeInfo:
+ 事件：on('battery')；callback 带 { level, isCharging, state, isLowBattery }。
+ */
+UNI_EXPORT_METHOD(@selector(readBatteryAndCharge:callback:))
+- (void)readBatteryAndCharge:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKReadDeviceBatteryAndChargeInfo:^(BOOL isPercent, VPDeviceChargeState chargeState, BOOL percenTypeIsLowBat, NSUInteger battery) {
+        NSUInteger level = isPercent ? battery : battery * 25;   // 格数换算百分比，对齐 readBattery
+        BOOL charging = (chargeState == VPDeviceChargeStateCharging);
+        NSDictionary *d = @{
+            @"level": @(level),
+            @"isCharging": @(charging),
+            @"state": @(chargeState),
+            @"isLowBattery": @(percenTypeIsLowBat)
+        };
+        [self sendEvent:@"battery" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
+        [res addEntriesFromDictionary:d];
+        callback(res, NO);
+    }];
+}
+
+/**
+ 设置设备语言。options: { lang: 'zh' | 'en' }。
+ iOS SDK：veepooSDKSettingLanguage:result:（UInt8：中文=1 英文=2，头文件列出 1~34 全量语言枚举）
+ Android：settingDeviceLanguage(..., ELanguage)；JS：joemeWatch.setLanguage(lang)
+ 事件：on('language') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setLanguage:callback:))
+- (void)setLanguage:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *lang = options[@"lang"];
+    UInt8 languageType = 2; // 默认英文
+    if ([lang isKindOfClass:[NSString class]]) {
+        if ([lang isEqualToString:@"zh"]) languageType = 1;
+        else if ([lang isEqualToString:@"en"]) languageType = 2;
+    }
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingLanguage:languageType result:^(BOOL success) {
+        [self sendEvent:@"language" data:@{ @"ok": @(success) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 2. 自动监测与提醒（auto） ----------
+
+/**
+ 设置自动测量开关。options: { type, on, timeInterval?, startHour?, startMinute?, endHour?, endMinute? }
+   type: 'heart' | 'bp' | 'bloodGlucose' | 'stress' | 'spo2' | 'temperature' | 'hrv' | 'bloodComp'
+ iOS SDK：先 veepooSDKReadAutoMonitSwitchInfo: 取出设备当前模型（model.type 只读），
+          命中对应 type 后改 on/时间，再 veepooSDKSetAutoMonitSwitchWithModel:result:
+ Android：setAutoMeasureSettingData(...)；JS：joemeWatch.setAutoMonitor(...)
+ 事件：on('autoMonitor') -> { ok, type }
+ 注：模型 type 为只读属性，必须先读再改，不能直接 new 一个指定 type 的模型。
+ */
+UNI_EXPORT_METHOD(@selector(setAutoMonitor:callback:))
+- (void)setAutoMonitor:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *type = options[@"type"];
+    BOOL on = [options[@"on"] boolValue];
+    VPAutoMonitTestType ttype = VPAutoMonitTestTypeHeartRate;
+    if ([type isEqualToString:@"heart"]) ttype = VPAutoMonitTestTypeHeartRate;
+    else if ([type isEqualToString:@"bp"]) ttype = VPAutoMonitTestTypeBloodPressure;
+    else if ([type isEqualToString:@"bloodGlucose"]) ttype = VPAutoMonitTestTypeBloodGlucose;
+    else if ([type isEqualToString:@"stress"]) ttype = VPAutoMonitTestTypeStress;
+    else if ([type isEqualToString:@"spo2"]) ttype = VPAutoMonitTestTypeBloodOxygen;
+    else if ([type isEqualToString:@"temperature"]) ttype = VPAutoMonitTestTypeBodyTemperature;
+    else if ([type isEqualToString:@"hrv"]) ttype = VPAutoMonitTestTypeHRV;
+    else if ([type isEqualToString:@"bloodComp"]) ttype = VPAutoMonitTestTypeBloodComponents;
+
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSDKReadAutoMonitSwitchInfo:^(NSArray<VPAutoMonitTestModel *> *models) {
+        VPAutoMonitTestModel *target = nil;
+        for (VPAutoMonitTestModel *m in models) {
+            if (m.type == ttype) { target = m; break; }
+        }
+        if (!target) {
+            [weakSelf sendEvent:@"autoMonitor" data:@{ @"ok": @NO, @"message": @"设备不支持该自动测量类型" }];
+            callback(resultWithCode(200), NO);
+            return;
+        }
+        target.on = on;
+        if (options[@"timeInterval"]) target.timeInterval = [options[@"timeInterval"] unsignedIntegerValue];
+        if (options[@"startHour"]) target.startHour = [options[@"startHour"] unsignedCharValue];
+        if (options[@"startMinute"]) target.startMinute = [options[@"startMinute"] unsignedCharValue];
+        if (options[@"endHour"]) target.endHour = [options[@"endHour"] unsignedCharValue];
+        if (options[@"endMinute"]) target.endMinute = [options[@"endMinute"] unsignedCharValue];
+        [pm veepooSDKSetAutoMonitSwitchWithModel:target result:^(BOOL success, VPAutoMonitTestModel *m) {
+            [weakSelf sendEvent:@"autoMonitor" data:@{ @"ok": @(success), @"type": type ?: @"" }];
+            callback(resultWithCode(200), NO);
+        }];
+    }];
+}
+
+/**
+ 24 小时血氧自动检测开关。options: { on: bool }。
+ iOS SDK：veepooSDKSettingAllDayOxygenTest:result:（VPSettingFunctionState：1=开 2=关）
+ Android：settingSpo2hAutoDetect(...)；JS：joemeWatch.setAllDayOxygen(on)
+ 事件：on('allDayOxygen') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setAllDayOxygen:callback:))
+- (void)setAllDayOxygen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose) result:^(VPSettingFunctionCompleteState state) {
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteComplete);
+        [self sendEvent:@"allDayOxygen" data:@{ @"ok": @(ok) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 血氧呼吸暂停提醒。options: { on, startHour?, startMinute?, endHour?, endMinute?, duration? }
+ iOS SDK：veepooSDKSettingOxygenApneaRemind:settingMode:successResult:failureResult:（settingMode 1=设置）
+          模型 VPOxygenApneaRemindModel：state 1=开 2=关，defaultTime 固定 YES
+ Android：settingSBBR(...)；JS：joemeWatch.setOxygenApnea({...})
+ 事件：on('oxygenApnea') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setOxygenApnea:callback:))
+- (void)setOxygenApnea:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPOxygenApneaRemindModel *m = [[VPOxygenApneaRemindModel alloc] init];
+    m.state = [options[@"on"] boolValue] ? 1 : 2;
+    if (options[@"startHour"]) m.startH = [options[@"startHour"] integerValue];
+    if (options[@"startMinute"]) m.startM = [options[@"startMinute"] integerValue];
+    if (options[@"endHour"]) m.endH = [options[@"endHour"] integerValue];
+    if (options[@"endMinute"]) m.endM = [options[@"endMinute"] integerValue];
+    if (options[@"duration"]) m.durationTime = [options[@"duration"] integerValue];
+    m.defaultTime = YES; // 头文件注明该参数暂时都给 YES
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingOxygenApneaRemind:m settingMode:1 successResult:^(VPOxygenApneaRemindModel *model) {
+        [self sendEvent:@"oxygenApnea" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"oxygenApnea" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 健康提醒（久坐/喝水/远眺等）。options: { type, on, startHour?, startMinute?, endHour?, endMinute?, interval? }
+   type: 'longSeat' | 'drink' | 'lookFar' | 'sport' | 'medicine' | 'read' | 'trip' | 'washHands'
+ iOS SDK：veepooSDKSettingHealthRemindWithRemindType:opCode:remindModel:resultBlock:deviceInfoDidChangeBlock:
+          （opCode 1=设置 2=读取）
+ Android：settingHealthRemind(...)；JS：joemeWatch.setHealthRemind(type, options)
+ 事件：on('healthRemind') -> { ok, type }
+ */
+UNI_EXPORT_METHOD(@selector(setHealthRemind:callback:))
+- (void)setHealthRemind:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *type = options[@"type"];
+    VPDeviceHealthRemindType rt = VPDeviceHealthRemindTypeLongSeat;
+    if ([type isEqualToString:@"longSeat"]) rt = VPDeviceHealthRemindTypeLongSeat;
+    else if ([type isEqualToString:@"drink"]) rt = VPDeviceHealthRemindTypeDrinkWater;
+    else if ([type isEqualToString:@"lookFar"]) rt = VPDeviceHealthRemindTypeLookFarAway;
+    else if ([type isEqualToString:@"sport"]) rt = VPDeviceHealthRemindTypeSport;
+    else if ([type isEqualToString:@"medicine"]) rt = VPDeviceHealthRemindTypeTakeMedicine;
+    else if ([type isEqualToString:@"read"]) rt = VPDeviceHealthRemindTypeRead;
+    else if ([type isEqualToString:@"trip"]) rt = VPDeviceHealthRemindTypeTrip;
+    else if ([type isEqualToString:@"washHands"]) rt = VPDeviceHealthRemindTypeWashHands;
+
+    VPDeviceHealthRemindModel *m = [[VPDeviceHealthRemindModel alloc] init];
+    m.type = rt;
+    m.open = [options[@"on"] boolValue];
+    m.startHour = [options[@"startHour"] unsignedCharValue];
+    m.startMinute = [options[@"startMinute"] unsignedCharValue];
+    m.endHour = [options[@"endHour"] unsignedCharValue];
+    m.endMinute = [options[@"endMinute"] unsignedCharValue];
+    m.remindInterval = [options[@"interval"] unsignedCharValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingHealthRemindWithRemindType:rt opCode:1 remindModel:m resultBlock:^(BOOL success, BOOL complete, VPDeviceHealthRemindModel *successModel) {
+        [self sendEvent:@"healthRemind" data:@{ @"ok": @(success), @"type": type ?: @"" }];
+        callback(resultWithCode(200), NO);
+    } deviceInfoDidChangeBlock:^(VPDeviceHealthRemindModel *changeModel) {}];
+}
+
+/**
+ 健康灯（LED）开关。options: { on: bool }。
+ iOS SDK：veepooSDKSetHealthLightStatus:callBack:（VPHealthLightStatusType：0=Off 1=慢闪 2=常闪 3=常亮；
+          on 映射为慢闪 SlowFlash，off 映射为 Off）
+ Android：setHealthLightStatus(...)；JS：joemeWatch.setHealthLight({ on })
+ 事件：on('healthLight') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setHealthLight:callback:))
+- (void)setHealthLight:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPHealthLightStatusType t = on ? VPHealthLightStatusTypeSlowFlash : VPHealthLightStatusTypeOff;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSetHealthLightStatus:t callBack:^(BOOL result, VPHealthLightStatusType type) {
+        [self sendEvent:@"healthLight" data:@{ @"ok": @(result) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 3. 闹钟与时钟（alarm） ----------
+
+/**
+ 设置老闹钟（固定 3 组）。options: { list: [{ hour, minute, enable? }] }，最多 3 组。
+ iOS SDK：veepooSDKSettingDeviceAlarmWithAlarmModel1:alarmModel2:alarmModel3:settingMode:successResult:failureResult:
+          （settingMode=VPSettingAlarmMode(1)；VPDeviceAlarmModel alarmState 0=关 1=开）
+ Android：settingAlarm(..., List<AlarmSetting>)；JS：joemeWatch.setAlarm(list)
+ 事件：on('alarm') -> { ok }
+ 注：iOS 每次设置都要把 3 组全部下发，未提供的组以 0 点/关闭占位。
+ */
+UNI_EXPORT_METHOD(@selector(setAlarm:callback:))
+- (void)setAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceAlarmModel *a1 = [[VPDeviceAlarmModel alloc] initWithAlarmHour:0 alarmMinute:0 alarmState:0];
+    VPDeviceAlarmModel *a2 = [[VPDeviceAlarmModel alloc] initWithAlarmHour:0 alarmMinute:0 alarmState:0];
+    VPDeviceAlarmModel *a3 = [[VPDeviceAlarmModel alloc] initWithAlarmHour:0 alarmMinute:0 alarmState:0];
+    NSArray *slots = @[a1, a2, a3];
+    NSArray *list = options[@"list"];
+    if ([list isKindOfClass:[NSArray class]]) {
+        for (NSInteger i = 0; i < MIN(list.count, 3); i++) {
+            NSDictionary *e = list[i];
+            if (![e isKindOfClass:[NSDictionary class]]) continue;
+            VPDeviceAlarmModel *m = slots[i];
+            m.alarmHour = [e[@"hour"] unsignedIntegerValue];
+            m.alarmMinute = [e[@"minute"] unsignedIntegerValue];
+            m.alarmState = [e[@"enable"] boolValue] ? 1 : 0;
+        }
+    }
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceAlarmWithAlarmModel1:a1 alarmModel2:a2 alarmModel3:a3 settingMode:VPSettingAlarmMode successResult:^(VPDeviceAlarmModel *r1, VPDeviceAlarmModel *r2, VPDeviceAlarmModel *r3) {
+        [self sendEvent:@"alarm" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"alarm" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置/新增新闹钟。options: { hour, minute, repeat?, enable?, id? }
+ iOS SDK：veepooSDKSettingDeviceNewAlarmWithNewAlarmModel:settingMode:successResult:failureResult:
+          （settingMode 1=设置(增/改)；模型字段均为 NSString，用 initWithAlarmDict: 构造）
+ Android：addAlarm2(...)；JS：joemeWatch.setNewAlarm(model)
+ 事件：on('newAlarm') -> { ok }
+ 注：repeatState 为 8 位二进制转十进制字符串（bit0 恒 0，其后周一~周日）；alarmScene 取值待厂商确认。
+ */
+UNI_EXPORT_METHOD(@selector(setNewAlarm:callback:))
+- (void)setNewAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%@", options[@"hour"] ?: @0];
+    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%@", options[@"minute"] ?: @0];
+    dict[@"alarmState"]   = [NSString stringWithFormat:@"%lu", (unsigned long)([options[@"enable"] boolValue] ? 1 : 0)];
+    dict[@"alarmID"]      = [NSString stringWithFormat:@"%@", options[@"id"] ?: options[@"alarmID"] ?: @1];
+    dict[@"repeatState"]  = [NSString stringWithFormat:@"%@", options[@"repeat"] ?: @0];
+    dict[@"alarmScene"]   = @"0";
+    dict[@"alarmDate"]    = @"0000-00-00";
+    VPDeviceNewAlarmModel *m = [[VPDeviceNewAlarmModel alloc] initWithAlarmDict:dict];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceNewAlarmWithNewAlarmModel:m settingMode:1 successResult:^(NSArray *alarmArray) {
+        [self sendEvent:@"newAlarm" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"newAlarm" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置/新增文字闹钟。options: { hour, minute, repeat?, enable?, id?, content }
+ iOS SDK：veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:settingMode:successResult:failureResult:
+          （settingMode=VPDeviceTextAlarmSettingModelAddOrChange(2)；alarmText 最长 60 字节）
+ Android：addTextAlarm(...)；JS：joemeWatch.setTextAlarm(model)
+ 事件：on('textAlarm') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setTextAlarm:callback:))
+- (void)setTextAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%@", options[@"hour"] ?: @0];
+    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%@", options[@"minute"] ?: @0];
+    dict[@"alarmState"]   = [NSString stringWithFormat:@"%lu", (unsigned long)([options[@"enable"] boolValue] ? 1 : 0)];
+    dict[@"alarmID"]      = [NSString stringWithFormat:@"%@", options[@"id"] ?: options[@"alarmID"] ?: @1];
+    dict[@"repeatState"]  = [NSString stringWithFormat:@"%@", options[@"repeat"] ?: @0];
+    dict[@"alarmText"]    = options[@"content"] ?: @"";
+    dict[@"alarmDate"]    = @"0000-00-00";
+    VPDeviceTextAlarmModel *m = [[VPDeviceTextAlarmModel alloc] initWithAlarmDict:dict];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:m settingMode:VPDeviceTextAlarmSettingModelAddOrChange successResult:^(NSArray *alarmArray) {
+        [self sendEvent:@"textAlarm" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"textAlarm" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 读取世界时钟。一次性读取：callback 与事件都带 list。
+ iOS SDK：veepooSDKWorldClockReadWithModels:result:（models 传本地缓存，首次传 @[]）
+          VPWorldClockModel：dataID(1-10)、cityName、standardTimeZoneDiffer(相对 GMT 的 15 分钟数)
+ Android：readWorldClock(...)；JS：joemeWatch.readWorldClock() -> resolve { list }
+ 事件：on('worldClock') -> { list }
+ */
+UNI_EXPORT_METHOD(@selector(readWorldClock:callback:))
+- (void)readWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKWorldClockReadWithModels:@[] result:^(BOOL success, NSArray<VPWorldClockModel *> *models) {
+        NSMutableArray *list = [NSMutableArray array];
+        for (VPWorldClockModel *wc in models) {
+            [list addObject:@{
+                @"id": @(wc.dataID),
+                @"city": wc.cityName ?: @"",
+                @"offset": wc.standardTimeZoneDiffer ?: @0
+            }];
+        }
+        NSDictionary *d = @{ @"list": list };
+        [self sendEvent:@"worldClock" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
+        [res addEntriesFromDictionary:d];
+        callback(res, NO);
+    }];
+}
+
+/**
+ 新增世界时钟。options: { city, id?, offset? }（offset 为相对 GMT 的 15 分钟数）。
+ iOS SDK：veepooSDKWorldClockAddWithModel:result:
+ Android：addWorldClock(...)；JS：joemeWatch.addWorldClock({...})
+ 事件：on('worldClockOp') -> { ok, op:'add' }
+ */
+UNI_EXPORT_METHOD(@selector(addWorldClock:callback:))
+- (void)addWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPWorldClockModel *m = [[VPWorldClockModel alloc] init];
+    m.cityName = options[@"city"] ?: @"";
+    m.dataID = [options[@"id"] unsignedCharValue];
+    m.standardTimeZoneDiffer = options[@"offset"] ?: options[@"hourOffset"] ?: @0;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKWorldClockAddWithModel:m result:^(BOOL success) {
+        [self sendEvent:@"worldClockOp" data:@{ @"ok": @(success), @"op": @"add" }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 删除世界时钟。options: { id }（dataID，1 起）。
+ iOS SDK：veepooSDKWorldClockDeleteWithID:result:
+ Android：deleteWorldClock(...)；JS：joemeWatch.deleteWorldClock({ id })
+ 事件：on('worldClockOp') -> { ok, op:'delete' }
+ */
+UNI_EXPORT_METHOD(@selector(deleteWorldClock:callback:))
+- (void)deleteWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    uint8_t delID = [options[@"id"] unsignedCharValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKWorldClockDeleteWithID:delID result:^(BOOL success) {
+        [self sendEvent:@"worldClockOp" data:@{ @"ok": @(success), @"op": @"delete" }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 4. 屏幕与显示（screen） ----------
+
+/**
+ 设置屏幕亮度。options: { brightness, isAutomatic, firstStart?, firstEnd?, otherValue? }
+ iOS SDK：veepooSDKSettingBrightWithBrightModel:settingMode:successResult:failureResult:（settingMode 1=设置）
+          模型 VPDeviceBrightModel initWithStartHour:startMinute:endHour:endMinute:firstBrightValue:otherBrightValue:
+ Android：settingScreenLight(...)；JS：joemeWatch.setBright({...})
+ 事件：on('screenLight') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setBright:callback:))
+- (void)setBright:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSInteger brightness = [options[@"brightness"] integerValue];
+    BOOL automatic = [options[@"isAutomatic"] boolValue];
+    NSInteger firstStartH = [options[@"firstStart"] integerValue] ?: 22;
+    NSInteger firstEndH   = [options[@"firstEnd"] integerValue] ?: 8;
+    NSInteger otherValue  = [options[@"otherValue"] integerValue] ?: brightness;
+    VPDeviceBrightModel *m = [[VPDeviceBrightModel alloc] initWithStartHour:firstStartH startMinute:0 endHour:firstEndH endMinute:0 firstBrightValue:brightness otherBrightValue:otherValue];
+    m.isAutomatic = automatic;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingBrightWithBrightModel:m settingMode:1 successResult:^(VPDeviceBrightModel *bm) {
+        [self sendEvent:@"screenLight" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"screenLight" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置亮屏时长。options: { sec }（秒）。
+ iOS SDK：veepooSDKSettingScreenDuration:settingMode:successResult:failureResult:
+          （VPScreenDurationModel.currentDuration；settingMode 1=设置）
+ Android：setScreenLightTime(..., int)；JS：joemeWatch.setScreenDuration(sec)
+ 事件：on('screenDuration') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setScreenDuration:callback:))
+- (void)setScreenDuration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSInteger sec = [options[@"sec"] integerValue];
+    VPScreenDurationModel *m = [[VPScreenDurationModel alloc] init];
+    m.currentDuration = sec;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingScreenDuration:m settingMode:1 successResult:^(VPScreenDurationModel *dm) {
+        [self sendEvent:@"screenDuration" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"screenDuration" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置屏幕样式（表盘位置）。options: { style: int }（区间 1 ~ peripheralModel.screenTypes）。
+ iOS SDK：veepooSDKSettingDeviceScreenStyle:settingMode:dialType:result:（非废弃版本）
+ Android：settingScreenStyle(..., int)；JS：joemeWatch.setScreenStyle(style)
+ 事件：on('screenStyle') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setScreenStyle:callback:))
+- (void)setScreenStyle:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    int style = [options[@"style"] intValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceScreenStyle:style settingMode:1 dialType:VPDeviceDialTypeDefault result:^(VPDeviceDialType dt, int screenStyle, BOOL settingSuccess) {
+        [self sendEvent:@"screenStyle" data:@{ @"ok": @(settingSuccess) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置翻腕亮屏。options: { on, startHour?, startMinute?, endHour?, endMinute? }
+ iOS SDK：veepooSDKSettingRaiseHandWithRaiseHandModel:settingMode:successResult:failureResult:
+          （settingMode 0=关 1=开；raiseHandState 0/1）
+ Android：settingNightTurnWriste(...)；JS：joemeWatch.setRaiseHand({...})
+ 事件：on('raiseHand') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setRaiseHand:callback:))
+- (void)setRaiseHand:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    NSUInteger startH = [options[@"startHour"] unsignedIntegerValue];
+    NSUInteger startM = [options[@"startMinute"] unsignedIntegerValue];
+    NSUInteger endH = [options[@"endHour"] unsignedIntegerValue] ?: 23;
+    NSUInteger endM = [options[@"endMinute"] unsignedIntegerValue];
+    VPDeviceRaiseHandModel *m = [[VPDeviceRaiseHandModel alloc] initWithRaiseHandStartHour:startH raiseHandStartMinute:startM raiseHandEndHour:endH raiseHandEndMinute:endM raiseHandState:(on ? 1 : 0) raiseHandSensitive:0];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingRaiseHandWithRaiseHandModel:m settingMode:(on ? 1 : 0) successResult:^(VPDeviceRaiseHandModel *rm) {
+        [self sendEvent:@"raiseHand" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"raiseHand" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置常灭屏（ZT163 定制）。options: { on: bool }。
+ iOS SDK：veepooSDK_ZT163SetDeviceAlwaysOffScreen:andResult:
+ Android：setZT163DeviceAlwaysOffScreen(...)；JS：joemeWatch.setAlwaysOffScreen(on)
+ 事件：on('alwaysOffScreen') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setAlwaysOffScreen:callback:))
+- (void)setAlwaysOffScreen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_ZT163SetDeviceAlwaysOffScreen:on andResult:^(BOOL success) {
+        [self sendEvent:@"alwaysOffScreen" data:@{ @"ok": @(success) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 5. 通知 / 社交 / 消息（notify） ----------
+
+/**
+ 单条消息推送开关。options: { type, on }
+   type: 'call' | 'sms' | 'wechat' | 'qq' | 'whatsapp' | 'line' | 'instagram' | 'other'
+ iOS SDK：veepooSDKSettingMessageType:settingState:completeBlock:
+          （VPSettingMessageSwitchType；VPSettingFunctionState 1=开 2=关）
+ Android：setFunctionSocailMsgData + settingSocialMsg；JS：joemeWatch.setMessageType(type, on)
+ 事件：on('messageType') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setMessageType:callback:))
+- (void)setMessageType:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *type = options[@"type"];
+    BOOL on = [options[@"on"] boolValue];
+    VPSettingMessageSwitchType mt = VPSettingCall;
+    if ([type isEqualToString:@"call"]) mt = VPSettingCall;
+    else if ([type isEqualToString:@"sms"]) mt = VPSettingSMS;
+    else if ([type isEqualToString:@"wechat"]) mt = VPSettingWechat;
+    else if ([type isEqualToString:@"qq"]) mt = VPSettingQQ;
+    else if ([type isEqualToString:@"whatsapp"]) mt = VPSettingwhatsapp;
+    else if ([type isEqualToString:@"line"]) mt = VPSettingLine;
+    else if ([type isEqualToString:@"instagram"]) mt = VPSettingInstagram;
+    else if ([type isEqualToString:@"other"]) mt = VPSettingOtherPlatform;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingMessageType:mt settingState:(on ? VPSettingFunctionOpen : VPSettingFunctionClose) completeBlock:^(VPSettingFunctionCompleteState state) {
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteComplete);
+        [self sendEvent:@"messageType" data:@{ @"ok": @(ok) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 批量消息推送开关。options: { items: [{ type, on }] }
+ iOS SDK：契约点名的 veepooSDKSettingMessageWithData: 入参为预编码 NSData（格式不公开），
+          这里改用同模块类型安全的批量接口 veepooSDKBatchSettingWithMessageTypeModels:completeBlock:
+          （VPDeviceMessageTypeModel.messageType/open），语义等价。
+ Android：settingSocialMsg(..., FunctionSocailMsgData)；JS：joemeWatch.setSocialMsg(data)
+ 事件：on('socialMsg') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setSocialMsg:callback:))
+- (void)setSocialMsg:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSArray *items = options[@"items"];
+    NSMutableArray<VPDeviceMessageTypeModel *> *models = [NSMutableArray array];
+    if ([items isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            VPDeviceMessageTypeModel *m = [[VPDeviceMessageTypeModel alloc] init];
+            NSString *t = it[@"type"];
+            VPSettingMessageSwitchType mt = VPSettingCall;
+            if ([t isEqualToString:@"call"]) mt = VPSettingCall;
+            else if ([t isEqualToString:@"sms"]) mt = VPSettingSMS;
+            else if ([t isEqualToString:@"wechat"]) mt = VPSettingWechat;
+            else if ([t isEqualToString:@"qq"]) mt = VPSettingQQ;
+            else if ([t isEqualToString:@"whatsapp"]) mt = VPSettingwhatsapp;
+            else if ([t isEqualToString:@"line"]) mt = VPSettingLine;
+            else if ([t isEqualToString:@"instagram"]) mt = VPSettingInstagram;
+            else if ([t isEqualToString:@"other"]) mt = VPSettingOtherPlatform;
+            m.messageType = mt;
+            m.open = [it[@"on"] boolValue];
+            [models addObject:m];
+        }
+    }
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKBatchSettingWithMessageTypeModels:models completeBlock:^(VPSettingFunctionCompleteState state) {
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteComplete);
+        [self sendEvent:@"socialMsg" data:@{ @"ok": @(ok) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 基础功能开关。options: { type, on }
+   type: 'raiseHand' | 'lose' | 'wearDetect' | 'metric' | 'timeFormat' | 'autoHeart' | 'autoBp'
+         | 'disconnectRemind' | 'autoOxygen'
+ iOS SDK：veepooSDKSettingBaseFunctionType:settingState:completeBlock:
+ Android：setFunSwitchState(int, EFunctionStatus)；JS：joemeWatch.setBaseFunction({...})
+ 事件：on('baseFunction') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setBaseFunction:callback:))
+- (void)setBaseFunction:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *type = options[@"type"];
+    BOOL on = [options[@"on"] boolValue];
+    VPSettingBaseFunctionSwitchType bt = VPSettingRaiseHand;
+    if ([type isEqualToString:@"raiseHand"]) bt = VPSettingRaiseHand;
+    else if ([type isEqualToString:@"lose"]) bt = VPSettingDeviceLose;
+    else if ([type isEqualToString:@"wearDetect"]) bt = VPSettingWearDetection;
+    else if ([type isEqualToString:@"metric"]) bt = VPSettingMetric;
+    else if ([type isEqualToString:@"timeFormat"]) bt = VPSettingTimeFormat;
+    else if ([type isEqualToString:@"autoHeart"]) bt = VPSettingAutomaticHRTest;
+    else if ([type isEqualToString:@"autoBp"]) bt = VPSettingAutomaticBPTest;
+    else if ([type isEqualToString:@"disconnectRemind"]) bt = VPSettingDisconnectRemind;
+    else if ([type isEqualToString:@"autoOxygen"]) bt = VPSettingAutomaticOxygenTest;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingBaseFunctionType:bt settingState:(on ? VPSettingFunctionOpen : VPSettingFunctionClose) completeBlock:^(VPSettingFunctionCompleteState state) {
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteComplete);
+        [self sendEvent:@"baseFunction" data:@{ @"ok": @(ok) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 6. 通讯录 / SOS（contact） ----------
+
+/**
+ 读取通讯录。一次性读取：callback 与事件都带 list。
+ iOS SDK：veepooSDKSettingDeviceContactsWithOpCode:opModel:toID:resultBlock:（opCode=Read(0)）
+          VPDeviceContactsModel：contactID / nickName(≤20字节) / phoneNumber / isSOS
+ Android：readContact(...)；JS：joemeWatch.readContact() -> resolve { list }
+ 事件：on('contact') -> { list }
+ */
+UNI_EXPORT_METHOD(@selector(readContact:callback:))
+- (void)readContact:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceContactsWithOpCode:VPDeviceContactsOpCodeRead opModel:nil toID:0 resultBlock:^(VPDeviceContactsOpState state, NSArray<VPDeviceContactsModel *> *contactModels) {
+        NSMutableArray *list = [NSMutableArray array];
+        for (VPDeviceContactsModel *c in contactModels) {
+            [list addObject:@{
+                @"id": @(c.contactID),
+                @"name": c.nickName ?: @"",
+                @"phone": c.phoneNumber ?: @"",
+                @"isSOS": @(c.isSOS)
+            }];
+        }
+        NSDictionary *d = @{ @"list": list };
+        [self sendEvent:@"contact" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
+        [res addEntriesFromDictionary:d];
+        callback(res, NO);
+    }];
+}
+
+/**
+ 新增通讯录。options: { name, phone, isSOS? }。
+ iOS SDK：veepooSDKSettingDeviceContactsWithOpCode:...（opCode=Add(1)）
+ Android：addContact(...)；JS：joemeWatch.addContact({...})
+ 事件：on('contactOp') -> { ok, op:'add' }
+ */
+UNI_EXPORT_METHOD(@selector(addContact:callback:))
+- (void)addContact:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceContactsModel *m = [[VPDeviceContactsModel alloc] init];
+    m.nickName = options[@"name"] ?: @"";
+    m.phoneNumber = options[@"phone"] ?: @"";
+    m.isSOS = [options[@"isSOS"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceContactsWithOpCode:VPDeviceContactsOpCodeAdd opModel:m toID:0 resultBlock:^(VPDeviceContactsOpState state, NSArray<VPDeviceContactsModel *> *contactModels) {
+        [self sendEvent:@"contactOp" data:@{ @"ok": @(state == VPDeviceContactsOpStateComplete), @"op": @"add" }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 删除通讯录。options: { id, name?, phone? }。
+ iOS SDK：veepooSDKSettingDeviceContactsWithOpCode:...（opCode=Delete(2)）
+ Android：deleteContact(...)；JS：joemeWatch.deleteContact({ id })
+ 事件：on('contactOp') -> { ok, op:'delete' }
+ */
+UNI_EXPORT_METHOD(@selector(deleteContact:callback:))
+- (void)deleteContact:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceContactsModel *m = [[VPDeviceContactsModel alloc] init];
+    m.contactID = [options[@"id"] intValue];
+    m.nickName = options[@"name"] ?: @"";
+    m.phoneNumber = options[@"phone"] ?: @"";
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceContactsWithOpCode:VPDeviceContactsOpCodeDelete opModel:m toID:0 resultBlock:^(VPDeviceContactsOpState state, NSArray<VPDeviceContactsModel *> *contactModels) {
+        [self sendEvent:@"contactOp" data:@{ @"ok": @(state == VPDeviceContactsOpStateComplete), @"op": @"delete" }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置 SOS。options 二选一：
+   - { callTimes: int }：设置 SOS 呼叫次数（veepooSDKSettingDeviceContactsSOSInfoWithOpCode:times:）
+   - { id, name?, phone?, on }：设置某联系人是否为 SOS（通讯录 opCode=Edit，头文件注释即"操作是否开启SOS"）
+ iOS SDK：veepooSDKSettingDeviceContactsSOSInfoWithOpCode:times:resultBlock: / veepooSDKSettingDeviceContactsWithOpCode:...(Edit)
+ Android：setContactSOSState + setSOSCallTimes；JS：joemeWatch.setSOS({...})
+ 事件：on('sos') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setSOS:callback:))
+- (void)setSOS:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (options[@"callTimes"]) {
+        int times = [options[@"callTimes"] intValue];
+        [pm veepooSDKSettingDeviceContactsSOSInfoWithOpCode:VPSOSOperationTypeSetting times:times resultBlock:^(VPDeviceContactsOpState state, int t, int timesMin, int timesMax) {
+            [self sendEvent:@"sos" data:@{ @"ok": @(state == VPDeviceContactsOpStateComplete) }];
+            callback(resultWithCode(200), NO);
+        }];
+    } else {
+        VPDeviceContactsModel *m = [[VPDeviceContactsModel alloc] init];
+        m.contactID = [options[@"id"] intValue];
+        m.nickName = options[@"name"] ?: @"";
+        m.phoneNumber = options[@"phone"] ?: @"";
+        m.isSOS = [options[@"on"] boolValue];
+        [pm veepooSDKSettingDeviceContactsWithOpCode:VPDeviceContactsOpCodeEdit opModel:m toID:0 resultBlock:^(VPDeviceContactsOpState state, NSArray<VPDeviceContactsModel *> *contactModels) {
+            [self sendEvent:@"sos" data:@{ @"ok": @(state == VPDeviceContactsOpStateComplete) }];
+            callback(resultWithCode(200), NO);
+        }];
+    }
+}
+
+// ---------- 7. 相机遥控（camera） ----------
+
+/**
+ 进入相机遥控模式。
+ iOS SDK：veepooSDKSettingCameraType:settingAndMonitorResult:（VPCameraTypeEnter=1）
+          回调里 VPCameraTypePhoto(2) 表示用户按下拍照，App 应据此调用系统相机拍照。
+ Android：startCamera(...)；JS：joemeWatch.startCamera()
+ 事件：on('camera') -> { state }
+ */
+UNI_EXPORT_METHOD(@selector(startCamera:callback:))
+- (void)startCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSDKSettingCameraType:VPCameraTypeEnter settingAndMonitorResult:^(VPCameraType cameraType) {
+        [weakSelf sendEvent:@"camera" data:@{ @"state": @(cameraType) }];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 退出相机遥控模式。
+ iOS SDK：veepooSDKSettingCameraType:...（VPCameraTypeExit=0）
+ Android：stopCamera(...)；JS：joemeWatch.stopCamera()
+ 事件：on('camera') -> { state }
+ */
+UNI_EXPORT_METHOD(@selector(stopCamera:callback:))
+- (void)stopCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSettingCameraType:VPCameraTypeExit settingAndMonitorResult:^(VPCameraType cameraType) {}];
+    [self sendEvent:@"camera" data:@{ @"state": @(VPCameraTypeExit) }];
+    callback(resultWithCode(200), NO);
+}
+
+// ---------- 8. 查找设备 / 防丢（find） ----------
+
+/**
+ 手机查找手环（手环响铃/震动）。options: { on: bool }。
+ iOS SDK：veepooSDK_searchDeviceFuntionWithState:result:
+ Android：settingFindDevice(..., boolean)；JS：joemeWatch.findDevice(on)
+ 事件：on('findDevice') -> { ok, open }
+ */
+UNI_EXPORT_METHOD(@selector(findDevice:callback:))
+- (void)findDevice:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_searchDeviceFuntionWithState:on result:^(BOOL open, VPSearchDeviceFunctionState state) {
+        [self sendEvent:@"findDevice" data:@{ @"ok": @(state == VPSearchDeviceFunctionStateEnter), @"open": @(open) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设备查找手机（让手机响铃）。
+ iOS SDK：veepooSDKSettingDeviceExitSearchPhone（裸声明、无回执，同 powerOff 处理）
+ Android：start/stopFindDeviceByPhone；JS：joemeWatch.findPhone(on)
+ 事件：on('findPhone') -> { ok:false, sent:true }（sent 仅表示命令已下发）
+ */
+UNI_EXPORT_METHOD(@selector(findPhone:callback:))
+- (void)findPhone:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSettingDeviceExitSearchPhone];
+    [self sendEvent:@"findPhone" data:@{ @"ok": @NO, @"sent": @YES }];
+    callback(resultWithCode(200), NO);
+}
+
+// ---------- 9. 运动模式（sport） ----------
+
+/**
+ 开始运动。options: { runMode? }（runMode 取 VPDeviceRuningMode 数值，0=普通单运动）。
+ iOS SDK：veepooSDKSettingDeviceRunning:runMode:result:（settingType 1=开启）
+ Android：startSportModel / startMultSportModel；JS：joemeWatch.startSport(mode)
+ 事件：on('sport') -> { state, ok }
+ */
+UNI_EXPORT_METHOD(@selector(startSport:callback:))
+- (void)startSport:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceRuningMode runMode = VPDeviceRuningModeCommon;
+    if (options[@"runMode"]) runMode = (VPDeviceRuningMode)[options[@"runMode"] integerValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceRunning:1 runMode:runMode result:^(int runningType, BOOL settingSuccess) {
+        [self sendEvent:@"sport" data:@{ @"state": @(runningType), @"ok": @(settingSuccess) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 停止运动。iOS 无独立 stop 接口：start 接口传 0（settingType=0）。
+ iOS SDK：veepooSDKSettingDeviceRunning:runMode:result:（settingType 0=关闭）
+ Android：stopSportModel(...)；JS：joemeWatch.stopSport()
+ 事件：on('sport') -> { state }
+ */
+UNI_EXPORT_METHOD(@selector(stopSport:callback:))
+- (void)stopSport:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSettingDeviceRunning:0 runMode:VPDeviceRuningModeCommon result:^(int runningType, BOOL settingSuccess) {
+        [self sendEvent:@"sport" data:@{ @"state": @(runningType) }];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 运动过程控制（暂停/继续/停止）。options: { code: 'pause'|'resume'|'stop', type? }
+ iOS SDK：veepooSDK_deviceSportControlWithCode:type:
+          （VPDeviceSportControlOpCode：1=Start 2=Pause 3=Continue 4=Stop；type=VPDeviceRuningMode）
+ Android：setSportControlInfo(...)；JS：joemeWatch.sportControl({...})
+ 事件：on('sportControl') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(sportControl:callback:))
+- (void)sportControl:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *code = options[@"code"];
+    VPDeviceSportControlOpCode oc = VPDeviceSportControlOpCodeStart;
+    if ([code isEqualToString:@"pause"]) oc = VPDeviceSportControlOpCodePause;
+    else if ([code isEqualToString:@"resume"]) oc = VPDeviceSportControlOpCodeContinue;
+    else if ([code isEqualToString:@"stop"]) oc = VPDeviceSportControlOpCodeStop;
+    VPDeviceRuningMode type = (VPDeviceRuningMode)[options[@"type"] integerValue];
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_deviceSportControlWithCode:oc type:type];
+    [self sendEvent:@"sportControl" data:@{ @"ok": @YES }];
+    callback(resultWithCode(200), NO);
+}
+
+// ---------- 10. 女性健康 / 倒计时（female） ----------
+
+/**
+ 设置女性健康。options: { femaleState?, lastMenstrualDate?, menstrualCircle?, menstrualDays?,
+                        expectedDateOfChildbirth?, babyBirthday?, isGirl?, on }
+   femaleState: 'menstrual'|'pregnancy'|'gestation'|'baoma'|none
+ iOS SDK：veepooSDKSettingDeviceFemaleWithFemaleModel:settingMode:successResult:failureResult:
+          （settingMode 0=关 1=开；VPDeviceFemaleState 见 VPPublicDefine）
+ Android：settingWomenState(...)；JS：joemeWatch.setFemale({...})
+ 事件：on('female') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setFemale:callback:))
+- (void)setFemale:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceFemaleModel *m = [[VPDeviceFemaleModel alloc] init];
+    NSString *state = options[@"femaleState"] ?: options[@"state"];
+    if ([state isEqualToString:@"menstrual"]) m.femaleState = VPDeviceFemaleStateMenstrual;
+    else if ([state isEqualToString:@"pregnancy"]) m.femaleState = VPDeviceFemaleStatePregnancy;
+    else if ([state isEqualToString:@"gestation"]) m.femaleState = VPDeviceFemaleStateGestation;
+    else if ([state isEqualToString:@"baoma"]) m.femaleState = VPDeviceFemaleStateBaoma;
+    else m.femaleState = VPDeviceFemaleStateNone;
+    m.lastMenstrualDate = options[@"lastMenstrualDate"] ?: @"";
+    m.menstrualCircle = [options[@"menstrualCircle"] integerValue];
+    m.menstrualDays = [options[@"menstrualDays"] integerValue];
+    m.expectedDateOfChildbirth = options[@"expectedDateOfChildbirth"] ?: @"";
+    m.babyBirthday = options[@"babyBirthday"] ?: @"";
+    m.isGirl = [options[@"isGirl"] boolValue];
+    NSUInteger mode = [options[@"on"] boolValue] ? 1 : 0;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceFemaleWithFemaleModel:m settingMode:mode successResult:^(VPDeviceFemaleModel *fm) {
+        [self sendEvent:@"female" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"female" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置倒计时。options: { seconds?, repeatTime?, isShow?, settingOperation? }
+ iOS SDK：veepooSDKSettingDeviceCountDownWithCountDownModel:settingMode:successResult:failureResult:
+          （settingMode 1=设置；模型 settingOperation 0=关常驻 1=开常驻 2=立即单次）
+ Android：settingCountDown(...)；JS：joemeWatch.setCountDown({...})
+ 事件：on('countDown') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setCountDown:callback:))
+- (void)setCountDown:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceCountDownModel *m = [[VPDeviceCountDownModel alloc] init];
+    m.currentCountDownTime = [options[@"seconds"] unsignedIntegerValue];
+    m.repeatTime = [options[@"repeatTime"] unsignedIntegerValue];
+    m.isShow = [options[@"isShow"] boolValue];
+    m.settingOperation = [options[@"settingOperation"] unsignedIntegerValue] ?: 1;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceCountDownWithCountDownModel:m settingMode:1 successResult:^(VPDeviceCountDownModel *cm) {
+        [self sendEvent:@"countDown" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"countDown" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 11. 心率报警 / 久坐（heart） ----------
+
+/**
+ 设置心率报警。options: { high?, low?, on }（high 默认 160，low 默认 50）。
+ iOS SDK：veepooSDKSettingDeviceHeartAlarmWithHeartAlarmModel:settingMode:successResult:failureResult:
+          （settingMode 0=关 1=开）
+ Android：settingHeartWarning(...)；JS：joemeWatch.setHeartAlarm({...})
+ 事件：on('heartAlarm') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setHeartAlarm:callback:))
+- (void)setHeartAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSUInteger high = [options[@"high"] unsignedIntegerValue] ?: 160;
+    NSUInteger low = [options[@"low"] unsignedIntegerValue] ?: 50;
+    BOOL on = [options[@"on"] boolValue];
+    VPDeviceHeartAlarmModel *m = [[VPDeviceHeartAlarmModel alloc] initWithHeartMaxValue:high heartMinValue:low openState:on];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceHeartAlarmWithHeartAlarmModel:m settingMode:(on ? 1 : 0) successResult:^(VPDeviceHeartAlarmModel *hm) {
+        [self sendEvent:@"heartAlarm" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"heartAlarm" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 设置久坐提醒。options: { on, startHour?, startMinute?, endHour?, endMinute?, interval? }
+ iOS SDK：veepooSDKSettingDeviceLongSeatWithLongSeatModel:settingMode:successResult:failureResult:
+          （settingMode 0=关 1=开；interval 闸值分钟，区间 30~240）
+ Android：settingLongSeat(...)；JS：joemeWatch.setLongSeat({...})
+ 事件：on('longSeat') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(setLongSeat:callback:))
+- (void)setLongSeat:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    NSUInteger startH = [options[@"startHour"] unsignedIntegerValue];
+    NSUInteger startM = [options[@"startMinute"] unsignedIntegerValue];
+    NSUInteger endH = [options[@"endHour"] unsignedIntegerValue] ?: 20;
+    NSUInteger endM = [options[@"endMinute"] unsignedIntegerValue];
+    NSUInteger interval = [options[@"interval"] unsignedIntegerValue] ?: 60;
+    VPDeviceLongSeatModel *m = [[VPDeviceLongSeatModel alloc] initWithLongSeatStartHour:startH longSeatStartMinute:startM LongSeatEndHour:endH longSeatEndMinute:endM longSeatGateValue:interval longSeatState:(on ? 1 : 0)];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKSettingDeviceLongSeatWithLongSeatModel:m settingMode:(on ? 1 : 0) successResult:^(VPDeviceLongSeatModel *lm) {
+        [self sendEvent:@"longSeat" data:@{ @"ok": @YES }];
+        callback(resultWithCode(200), NO);
+    } failureResult:^{
+        [self sendEvent:@"longSeat" data:@{ @"ok": @NO }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+// ---------- 12. 数据读取（read） ----------
+
+/**
+ 读取全部健康数据（带进度，与现有 readHealthData 同底层，独立暴露）。
+ iOS SDK：veepooSdkStartReadDeviceAllDataWithReadStateChangeBlock:（事件复用 healthData）
+ Android：readAllHealthData(..., days)；JS：joemeWatch.readAllHealthData()
+ 事件：on('healthData') -> { progress } / { complete:true }；callback 仅表示已开始。
+ */
+UNI_EXPORT_METHOD(@selector(readAllHealthData:callback:))
+- (void)readAllHealthData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSdkStartReadDeviceAllDataWithReadStateChangeBlock:^(VPReadDeviceBaseDataState state, NSUInteger totalDay, NSUInteger currentReadDayNumber, NSUInteger readCurrentDayProgress) {
+        switch (state) {
+            case VPReadDeviceBaseDataStart:
+                [weakSelf sendEvent:@"healthData" data:@{ @"progress": @0 }];
+                break;
+            case VPReadDeviceBaseDataReading:
+                [weakSelf sendEvent:@"healthData" data:@{ @"progress": @(readCurrentDayProgress / 100.0) }];
+                break;
+            case VPReadDeviceBaseDataComplete:
+                [weakSelf sendEvent:@"healthData" data:@{ @"complete": @YES }];
+                break;
+            default:
+                break;
+        }
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 读取运动模式（历史）数据，带进度。
+ iOS SDK：veepooSDKStartReadDeviceRunningData:（进度）；读完后 veepooSDK_readDeviceRunningCrcResult: 拉取 CRC 列表。
+          逐块详情读取为 veepooSDK_readDeviceRunningDataWithBlockNumber:result:（字典原样透传）。
+ Android：readSportModelOrigin(...)；JS：joemeWatch.readDeviceRunningData()
+ 事件：on('runningData') -> { progress } / { complete:true } / { day:'crc', summary:[...] }；callback 仅表示已开始。
+ 注：逐块详情的字段结构以设备回包字典为准，透传给 JS。
+ */
+UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
+- (void)readDeviceRunningData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSDKStartReadDeviceRunningData:^(VPReadDeviceBaseDataState state, NSUInteger totalTimes, NSUInteger currentReadTimes, NSUInteger readCurrentTimesProgress) {
+        switch (state) {
+            case VPReadDeviceBaseDataStart:
+                [weakSelf sendEvent:@"runningData" data:@{ @"progress": @0 }];
+                break;
+            case VPReadDeviceBaseDataReading:
+                [weakSelf sendEvent:@"runningData" data:@{ @"progress": @(readCurrentTimesProgress / 100.0) }];
+                break;
+            case VPReadDeviceBaseDataComplete:
+                [weakSelf sendEvent:@"runningData" data:@{ @"complete": @YES }];
+                // 读完后拉 CRC 列表（数组长度=设备存储的运动组数，值为 0 的组无数据）
+                [pm veepooSDK_readDeviceRunningCrcResult:^(NSArray *crcValues) {
+                    [weakSelf sendEvent:@"runningData" data:@{ @"day": @"crc", @"summary": crcValues ?: @[] }];
+                }];
+                break;
+            default:
+                break;
+        }
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+// ---------- 13. 可选·第三层（能桥则桥） ----------
+
+/**
+ 进入 OTA 升级模式（仅进入，不做完整固件传输）。
+ iOS SDK：veepooSDKSendUpdateFirmCommand:（带 block 版本）
+ Android：enterOad(...)；JS：joemeWatch.enterOAD()
+ 事件：on('oad') -> { ok }
+ 注：完整固件升级需文件传输与各芯片方案支持，超出本次桥接范围。
+ */
+UNI_EXPORT_METHOD(@selector(enterOAD:callback:))
+- (void)enterOAD:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSendUpdateFirmCommand:^(void) {
+        [self sendEvent:@"oad" data:@{ @"ok": @YES }];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 下发 GPS 与时区。options: { lon, lat, timezone?, altitude? }（经纬度为十进制度）。
+ iOS SDK：veepooSDK_setDeviceGPSAndTimezoneWithModel:result:
+          （VPDeviceGPSModel：longitude/latitude 放大 100000 倍为 int；timezone 单位分钟、15 的倍数）
+ Android：settingGpsLatLon(...)；JS：joemeWatch.gpsLocation({...})
+ 事件：on('gps') -> { ok, state }（state 0=不支持 1=成功 2=失败）
+ */
+UNI_EXPORT_METHOD(@selector(gpsLocation:callback:))
+- (void)gpsLocation:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPDeviceGPSModel *m = [[VPDeviceGPSModel alloc] init];
+    m.longitude = (int)([options[@"lon"] doubleValue] * 100000);
+    m.latitude  = (int)([options[@"lat"] doubleValue] * 100000);
+    m.timezone  = (short)([options[@"timezone"] shortValue] ?: (8 * 60));
+    m.timestamp = (long)[[NSDate date] timeIntervalSince1970];
+    if (options[@"altitude"]) m.altitude = [options[@"altitude"] shortValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_setDeviceGPSAndTimezoneWithModel:m result:^(NSInteger state) {
+        [self sendEvent:@"gps" data:@{ @"ok": @(state == 1), @"state": @(state) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 下发 AGPS 星历。options: { url }（rtcm 星历文件地址）。
+ iOS SDK：veepooSDK_AGPSTransformWithFileUrl:timestamp:result:transformProgress:
+ Android：makeDeviceIntoUpdateModeAGPS(...)；JS：joemeWatch.agps(url)
+ 事件：on('agps') -> { progress } / { ok, message }
+ 注：需设备支持 agpsFunction；时间戳取当前时间，星历文件生成时间戳待真机确认。
+ */
+UNI_EXPORT_METHOD(@selector(agps:callback:))
+- (void)agps:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *urlStr = options[@"url"];
+    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
+        callback(@{ @"code": @(-1), @"message": @"url 不能为空" }, NO);
+        return;
+    }
+    NSURL *fileUrl = [NSURL URLWithString:urlStr];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_AGPSTransformWithFileUrl:fileUrl timestamp:(long)[[NSDate date] timeIntervalSince1970] result:^(VPPhotoDialModel *p, VPDeviceMarketDialModel *d, NSError *error) {
+        [self sendEvent:@"agps" data:@{ @"ok": @(error == nil), @"message": error.localizedDescription ?: @"" }];
+        callback(resultWithCode(200), NO);
+    } transformProgress:^(double progress) {
+        [self sendEvent:@"agps" data:@{ @"progress": @(progress) }];
+    }];
+}
+
+/**
+ 绑定 4G 设备账号。options: { account, password }。
+ iOS SDK：veepooSDK_bind4GDeviceAccount:password:callback:
+ Android：set4gServerInfo(...)；JS：joemeWatch.bind4GAccount({ account, password })
+ 事件：on('net4g') -> { ok }
+ */
+UNI_EXPORT_METHOD(@selector(bind4GAccount:callback:))
+- (void)bind4GAccount:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSString *account = options[@"account"];
+    NSString *password = options[@"password"];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_bind4GDeviceAccount:account password:password callback:^(BOOL isSucc) {
+        [self sendEvent:@"net4g" data:@{ @"ok": @(isSucc) }];
+        callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 读取当前表盘列表/信息。
+ iOS SDK：veepooSDK_dialChannelWithChannelModel:dialType:photoDialModel:result:transformProgress:
+          （VPDialChannelModelRead；需 JL 系设备）
+ Android：listJLWatchList(...)；JS：joemeWatch.dialList() -> resolve { list }
+ 事件：on('dial') -> { list }
+ 注：返回 VPDeviceMarketDialModel.imageId（当前市场表盘图片 ID）；完整表盘下载列表需厂商联调。
+ */
+UNI_EXPORT_METHOD(@selector(dialList:callback:))
+- (void)dialList:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelRead dialType:VPDeviceDialTypeMarket photoDialModel:nil result:^(VPPhotoDialModel *photoDialModel, VPDeviceMarketDialModel *deviceMarketDialModel, NSError *error) {
+        NSMutableArray *list = [NSMutableArray array];
+        if (deviceMarketDialModel) {
+            [list addObject:@{ @"imageId": @(deviceMarketDialModel.imageId) }];
+        }
+        NSDictionary *d = @{ @"list": list };
+        [self sendEvent:@"dial" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
+        [res addEntriesFromDictionary:d];
+        callback(res, NO);
+    } transformProgress:^(double progress) {}];
+}
+
+/**
+ 设置表盘。options: { dialId }。
+ iOS SDK：veepooSDK_dialChannelWithChannelModel:...（Setup 模式；需 JL 系设备，市场表盘 bin 需先下载再流式传输）
+ Android：setJLWatchDial / setJLWatchPhotoDial；JS：joemeWatch.setDial(dialId)
+ 事件：on('dial') -> { ok }
+ 注：iOS 端完整换表盘需 bin 文件流式下发，本桥接仅触发通道建立；dialId 到 bin 的映射待厂商/真机确认。
+ */
+UNI_EXPORT_METHOD(@selector(setDial:callback:))
+- (void)setDial:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelSetup dialType:VPDeviceDialTypeMarket photoDialModel:nil result:^(VPPhotoDialModel *photoDialModel, VPDeviceMarketDialModel *deviceMarketDialModel, NSError *error) {
+        [self sendEvent:@"dial" data:@{ @"ok": @(error == nil) }];
+        callback(resultWithCode(200), NO);
+    } transformProgress:^(double progress) {
+        [self sendEvent:@"dial" data:@{ @"progress": @(progress) }];
+    }];
+}
+
+/**
+ 打开设备经典蓝牙开关。options: { on }（iOS 仅有"打开"命令）。
+ iOS SDK：veepooSDK_openDeviceBTSwitch（裸声明）
+ Android：setBTSwitchStatus(...)；JS：joemeWatch.btOpen(on)
+ 事件：on('bt') -> { ok, sent }
+ 注：完整 BT 通话连接流程不桥接；BT 连接状态由 VPBTConnectStateChangeBlock 统一上报。
+ */
+UNI_EXPORT_METHOD(@selector(btOpen:callback:))
+- (void)btOpen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_openDeviceBTSwitch];
+    [self sendEvent:@"bt" data:@{ @"ok": @YES, @"sent": @YES }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ PTT 测试（产测）。options: { on }。
+ iOS SDK：veepooSDKPTTTest:valueBlock:signalBlock:
+ Android：startReadPttSignData / openDevicePtt；JS：joemeWatch.ptt()
+ 事件：on('ptt') -> { value } / { signal }
+ */
+UNI_EXPORT_METHOD(@selector(ptt:callback:))
+- (void)ptt:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL start = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKPTTTest:start valueBlock:^(VPPttValueModel *valueModel) {
+        [self sendEvent:@"ptt" data:@{ @"value": valueModel ?: @{} }];
+    } signalBlock:^(NSArray<NSNumber *> *signals) {
+        [self sendEvent:@"ptt" data:@{ @"signal": signals ?: @[] }];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ GSensor 测试（产测）。options: { on }。
+ iOS SDK：veepooSDKTestGSensorStart:testResult:（回包字典 key：totalSteps / x / y / z）
+ Android：startGsensorSport / stopGsensorSport；JS：joemeWatch.gsensorTest(on)
+ 事件：on('gsensor') -> { totalSteps, x, y, z }
+ */
+UNI_EXPORT_METHOD(@selector(gsensorTest:callback:))
+- (void)gsensorTest:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL start = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDKTestGSensorStart:start testResult:^(NSDictionary *gSensorParameter) {
+        [self sendEvent:@"gsensor" data:gSensorParameter ?: @{}];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ PPG 实时原始信号订阅（G08W/JM19A 等特定型号）。options: { on }。
+ iOS SDK：veepooSDK_G08WProjectPPGSubscribe:（type 0/1/2 = 绿/红/红外；传 nil 取消订阅）
+ Android：start/stopPPGRealTimeTransmission；JS：joemeWatch.ppgRealTime(on)
+ 事件：on('ppg') -> { type, data }
+ */
+UNI_EXPORT_METHOD(@selector(ppgRealTime:callback:))
+- (void)ppgRealTime:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL start = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (start) {
+        [pm veepooSDK_G08WProjectPPGSubscribe:^(int type, NSArray<NSNumber *> *valueArr) {
+            [self sendEvent:@"ppg" data:@{ @"type": @(type), @"data": valueArr ?: @[] }];
+        }];
+    } else {
+        [pm veepooSDK_G08WProjectPPGSubscribe:nil];
+    }
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 中医诊断 TCM 测试（JM19A 特定型号）。options: { on }。
+ iOS SDK：veepooSDK_JM19AProjectTCMTestWithStart:testResult:（state/progress/VPTCMTestDataModel）
+ Android：start/stopDetectTcmDiagnosis；JS：joemeWatch.tcmDiagnosis(on)
+ 事件：on('tcm') -> { state, progress }
+ */
+UNI_EXPORT_METHOD(@selector(tcmDiagnosis:callback:))
+- (void)tcmDiagnosis:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL start = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_JM19AProjectTCMTestWithStart:start testResult:^(VPTestECGState state, NSUInteger progress, VPTCMTestDataModel *m) {
+        [self sendEvent:@"tcm" data:@{ @"state": @(state), @"progress": @(progress) }];
+    }];
+    callback(resultWithCode(200), NO);
+}
+
+/**
+ 小体检 PPG+加速度主动测量（JH58 特定型号）。options: { on }。
+ iOS SDK：veepooSDK_JH58ActiveTestPPGAndAcceleration:andResult:
+          （VPJH58ActiveMeasurementState：1=实时 2=断点续传 3=关；on 映射实时开，off 映射关）
+ Android：start/stopMiniCheckup；JS：joemeWatch.miniCheckup(on)
+ 事件：on('miniCheckup') -> { state }
+ */
+UNI_EXPORT_METHOD(@selector(miniCheckup:callback:))
+- (void)miniCheckup:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPJH58ActiveMeasurementState st = on ? VPJH58ActiveMeasurementStateRealTime : VPJH58ActiveMeasurementStateOff;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_JH58ActiveTestPPGAndAcceleration:st andResult:^(VPJH58ActiveMeasurementResultState state) {
+        [self sendEvent:@"miniCheckup" data:@{ @"state": @(state) }];
+        callback(resultWithCode(200), NO);
+    }];
 }
 
 @end
