@@ -2309,19 +2309,22 @@ UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
     __weak typeof(self) weakSelf = self;
     [pm veepooSDKStartReadDeviceRunningData:^(VPReadDeviceBaseDataState state, NSUInteger totalTimes, NSUInteger currentReadTimes, NSUInteger readCurrentTimesProgress) {
         switch (state) {
-            case VPReadDeviceBaseDataStart:
+            case VPReadDeviceBaseDataStart: {
                 [weakSelf sendEvent:@"runningData" data:@{ @"progress": @0 }];
                 break;
-            case VPReadDeviceBaseDataReading:
+            }
+            case VPReadDeviceBaseDataReading: {
                 [weakSelf sendEvent:@"runningData" data:@{ @"progress": @(readCurrentTimesProgress / 100.0) }];
                 break;
-            case VPReadDeviceBaseDataComplete:
+            }
+            case VPReadDeviceBaseDataComplete: {
                 [weakSelf sendEvent:@"runningData" data:@{ @"complete": @YES }];
                 // 读完后拉 CRC 列表（数组长度=设备存储的运动组数，值为 0 的组无数据）
                 [pm veepooSDK_readDeviceRunningCrcResult:^(NSArray *crcValues) {
                     [weakSelf sendEvent:@"runningData" data:@{ @"day": @"crc", @"summary": crcValues ?: @[] }];
                 }];
                 break;
+            }
             default:
                 break;
         }
