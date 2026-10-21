@@ -95,6 +95,9 @@
 /** 本次 ECG 测量的模型（结束时取 filterSignals 补发尾段） */
 @property (nonatomic, strong) VPECGTestDataModel *ecgModel;
 
+/** 运动记录读取会话号；每次 readDeviceRunningData 自增，旧会话的迟到回调按它丢弃 */
+@property (nonatomic, assign) NSInteger sportReadSeq;
+
 @end
 
 /** 分页累计原始点的小容器：同一 (h,m) 合并（分页可能重复回同一包）。
@@ -161,6 +164,47 @@ UNI_EXPORT_METHOD(@selector(startEventListen:callback:))
 
 static NSDictionary *resultWithCode(NSInteger code) {
     return @{ @"code": @(code) };
+}
+
+// ---------- 库/字典取值小工具（C 函数必须先声明再用，所以放在最前） ----------
+
+/** NSNumber/NSString -> double；其它类型与 nil 返回 0（库里的值两种类型混用） */
+static double JoemeDouble(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v doubleValue];
+    if ([v isKindOfClass:[NSString class]]) return [(NSString *)v doubleValue];
+    return 0;
+}
+
+static NSInteger JoemeInt(id v) {
+    return (NSInteger)JoemeDouble(v);
+}
+
+/** dict 上按多个候选 key 取值（库里不同协议版本 key 名不一致） */
+static id JoemeFirstValue(NSDictionary *dict, NSArray<NSString *> *keys) {
+    if (![dict isKindOfClass:[NSDictionary class]]) return nil;
+    for (NSString *k in keys) {
+        id v = dict[k];
+        if (v && v != [NSNull null]) return v;
+    }
+    return nil;
+}
+
+/** dict 里的时间 -> (hour, minute)。支持 "HH:mm"/"HH:mm:ss" 字符串与 hour/minute 数值字段 */
+static void JoemeTimeOfDict(NSDictionary *dict, NSInteger *hour, NSInteger *minute) {
+    NSInteger h = 0, m = 0;
+    id t = JoemeFirstValue(dict, @[ @"Time", @"time", @"TimeValue" ]);
+    if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] >= 4) {
+        NSArray<NSString *> *parts = [(NSString *)t componentsSeparatedByString:@":"];
+        if (parts.count >= 2) {
+            h = [parts[0] integerValue];
+            m = [parts[1] integerValue];
+        }
+    } else {
+        h = JoemeInt(JoemeFirstValue(dict, @[ @"hour", @"hourValue", @"startHour" ]));
+        m = JoemeInt(JoemeFirstValue(dict, @[ @"minute", @"minuteValue", @"startMinute" ]));
+    }
+    if (hour) *hour = h;
+    if (minute) *minute = m;
 }
 
 // ==================== 1. 初始化 ====================
@@ -2866,41 +2910,211 @@ UNI_EXPORT_METHOD(@selector(readAllHealthData:callback:))
 }
 
 /**
- 读取运动模式（历史）数据，带进度。
- iOS SDK：veepooSDKStartReadDeviceRunningData:（进度）；读完后 veepooSDK_readDeviceRunningCrcResult: 拉取 CRC 列表。
-          逐块详情读取为 veepooSDK_readDeviceRunningDataWithBlockNumber:result:（字典原样透传）。
- Android：readSportModelOrigin(...)；JS：joemeWatch.readDeviceRunningData()
- 事件：on('runningData') -> { progress } / { complete:true } / { day:'crc', summary:[...] }；callback 仅表示已开始。
- 注：逐块详情的字段结构以设备回包字典为准，透传给 JS。
+ 读取运动模式（历史）数据，带进度 + head 摘要 + 逐分钟明细。
+ JS：joemeWatch.readDeviceRunningData({ days: 3 } / { day: 0 }) -> on('runningData')
+ 事件（与 Android 完全同形，页面不用分端）：
+   { progress: 0~1 }                     已读天数 / 总天数
+   { head: {...} }                       一条运动的头部摘要（带 day 日索引）
+   { items: [{...}], day }               该次运动的逐分钟明细
+   { complete: true, days, startDay }    全部读完
+   { day: 'crc', summary: [...] }        CRC 列表（去重用的指纹，页面可忽略）
+
+ 实现路径（iOS 与 Android 不同）：
+   ① veepooSDKStartReadDeviceRunningData —— 让设备把存着的运动记录同步进 SDK 本地库；
+      这个回调只有进度/完成，没有数据体。
+   ② 读完后用 VPDataBaseOperation 按「每一天」查库：
+      veepooSDKGetDeviceRunningDataWithDate:andTableID:（queryDate 传 yyyy-MM-dd）。
+      按天查的好处是日索引由我们确定（day 是查询参数），不依赖设备 RTC 写进记录里的日期
+      —— 设备时钟错时 head.date 会整年偏差，页面正是靠 day 索引落缓存。
+ 单位换算（库 → Android 口径）：
+   totalDis 是米 → distance 给公里；totalCal 是 cal → kcal 要 ÷1000；
+   oneMinuteData 里 disValue 仍是米、calValue 仍是 cal（页面逐分钟那侧自己 ÷1000）。
  */
 UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
 - (void)readDeviceRunningData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
+    VPPeripheralBaseManage *pm = manager.peripheralManage;
+    NSString *mac = manager.peripheralModel.deviceAddress ?: @"";
+
+    // 日索引区间：{ day: n } 只读那天；{ days: n } 从今天起连读 n 天（默认/上限 3）
+    NSInteger deviceDays = manager.peripheralModel.runningSaveTimes > 0
+        ? manager.peripheralModel.runningSaveTimes : 3;
+    NSInteger maxDays = MAX(1, MIN(3, deviceDays));
+    BOOL hasDay = (options[@"day"] != nil);
+    NSInteger firstDay = 0, endDay;
+    if (hasDay) {
+        firstDay = MAX(0, MIN([options[@"day"] integerValue], maxDays - 1));
+        endDay = firstDay + 1;
+    } else {
+        NSInteger reqDays = options[@"days"] ? [options[@"days"] integerValue] : maxDays;
+        if (reqDays <= 0) reqDays = maxDays;
+        endDay = MAX(1, MIN(reqDays, maxDays));
+    }
+    NSInteger totalDays = endDay - firstDay;
+
+    // 会话号：新一次读取让上一场的迟到回调失效
+    NSInteger seq = ++self.sportReadSeq;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKStartReadDeviceRunningData:^(VPReadDeviceBaseDataState state, NSUInteger totalTimes, NSUInteger currentReadTimes, NSUInteger readCurrentTimesProgress) {
-        switch (state) {
-            case VPReadDeviceBaseDataStart: {
-                [weakSelf sendEvent:@"runningData" data:@{ @"progress": @0 }];
-                break;
+    __block BOOL started = NO;
+
+    // 读设备 + 查库 + 发事件，只跑一次（SDK 的完成回调与看门狗都可能触发）
+    void (^collect)(void) = ^{
+        if (started) return;
+        started = YES;
+        if (weakSelf.sportReadSeq != seq) return;
+
+        [weakSelf sendEvent:@"runningData" data:@{ @"progress": @0 }];
+        NSInteger done = 0;
+        NSInteger recordTotal = 0;
+        for (NSInteger day = firstDay; day < endDay; day++) {
+            if (weakSelf.sportReadSeq != seq) return;
+            NSString *date = [weakSelf dateStrForDay:day];
+            NSArray *arr = [VPDataBaseOperation veepooSDKGetDeviceRunningDataWithDate:date andTableID:mac];
+            for (id it in arr) {
+                if (![it isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *rec = (NSDictionary *)it;
+                NSDictionary *head = [weakSelf sportHeadFromDBRecord:rec day:day];
+                if (!head) continue;
+                recordTotal++;
+                [weakSelf sendEvent:@"runningData" data:@{ @"head": head }];
+                NSArray *items = [weakSelf sportItemsFromDBRecord:rec head:head day:day];
+                if (items.count > 0) {
+                    [weakSelf sendEvent:@"runningData" data:@{ @"items": items, @"day": @(day) }];
+                }
             }
-            case VPReadDeviceBaseDataReading: {
-                [weakSelf sendEvent:@"runningData" data:@{ @"progress": @(readCurrentTimesProgress / 100.0) }];
-                break;
-            }
-            case VPReadDeviceBaseDataComplete: {
-                [weakSelf sendEvent:@"runningData" data:@{ @"complete": @YES }];
-                // 读完后拉 CRC 列表（数组长度=设备存储的运动组数，值为 0 的组无数据）
-                [pm veepooSDK_readDeviceRunningCrcResult:^(NSArray *crcValues) {
-                    [weakSelf sendEvent:@"runningData" data:@{ @"day": @"crc", @"summary": crcValues ?: @[] }];
-                }];
-                break;
-            }
-            default:
-                break;
+            done++;
+            [weakSelf sendEvent:@"runningData" data:@{
+                @"progress": totalDays > 0 ? @((double)done / (double)totalDays) : @1
+            }];
+        }
+
+        // CRC 列表：页面不需要，保留给排查「设备上到底存了几组」
+        if (weakSelf.sportReadSeq == seq) {
+            [pm veepooSDK_readDeviceRunningCrcResult:^(NSArray *crcValues) {
+                [weakSelf sendEvent:@"runningData" data:@{ @"day": @"crc", @"summary": crcValues ?: @[] }];
+            }];
+        }
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"complete"] = @YES;
+        d[@"days"] = @(totalDays);
+        d[@"startDay"] = @(firstDay);
+        d[@"count"] = @(recordTotal);
+        [weakSelf sendEvent:@"runningData" d];
+
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        r[@"days"] = @(totalDays);
+        r[@"startDay"] = @(firstDay);
+        r[@"count"] = @(recordTotal);
+        callback(r, NO);
+    };
+
+    // 25 秒看门狗：设备无响应时直接读库（库里是上次同步的数据，比空手而归有用）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        collect();
+    });
+
+    [pm veepooSDKStartReadDeviceRunningData:^(VPReadDeviceBaseDataState state, NSUInteger totalTimes,
+                                              NSUInteger currentReadTimes, NSUInteger progress) {
+        if (weakSelf.sportReadSeq != seq) return;
+        if (state == VPReadDeviceBaseDataComplete) {
+            collect();
         }
     }];
-    callback(resultWithCode(200), NO);
+}
+
+/** 库里一条运动记录 -> Android 同形 head（字段单位已换算：distance 公里、kcal 千卡） */
+- (NSDictionary *)sportHeadFromDBRecord:(NSDictionary *)rec day:(NSInteger)day {
+    if (![rec isKindOfClass:[NSDictionary class]]) return nil;
+    // 隐藏记录（用户删掉的）不下发
+    if (JoemeInt(rec[@"isHide"]) == 1) return nil;
+
+    NSString *begin = rec[@"beginTime"] ?: @"";
+    NSString *end = rec[@"endTime"] ?: @"";
+    NSDictionary *b = [self hourMinuteSecondFromString:begin];
+    NSDictionary *e = [self hourMinuteSecondFromString:end];
+
+    double totalDisM = JoemeDouble(rec[@"totalDis"]);
+    double totalCalCal = JoemeDouble(rec[@"totalCal"]);
+    NSInteger recordCount = JoemeInt(rec[@"recordCount"]);
+    if (recordCount <= 0) {
+        NSArray *minutes = rec[@"oneMinuteData"];
+        recordCount = [minutes isKindOfClass:[NSArray class]] ? (NSInteger)minutes.count : 0;
+    }
+
+    NSMutableDictionary *h = [NSMutableDictionary dictionary];
+    h[@"day"] = @(day);
+    h[@"sportType"] = @(JoemeInt(rec[@"type"]));
+    h[@"date"] = begin.length >= 10 ? [begin substringToIndex:10] : @"";
+    h[@"startHour"] = b[@"hour"] ?: @0;
+    h[@"startMinute"] = b[@"minute"] ?: @0;
+    h[@"startSecond"] = b[@"second"] ?: @0;
+    h[@"stopHour"] = e[@"hour"] ?: @0;
+    h[@"stopMinute"] = e[@"minute"] ?: @0;
+    h[@"stopSecond"] = e[@"second"] ?: @0;
+    h[@"stepCount"] = @(JoemeInt(rec[@"totalStep"]));
+    h[@"sportTime"] = @(JoemeInt(rec[@"totalTime"]));
+    // 库里的 totalDis 单位是米，Android/页面都用公里（保留 3 位，与 Android 的 round3 一致）
+    h[@"distance"] = @(round(totalDisM) / 1000.0);
+    // 库里的 totalCal 单位是 cal，Android 的 head.kcal 是千卡
+    h[@"kcal"] = @(round(totalCalCal) / 1000.0);
+    h[@"recordCount"] = @(recordCount);
+    h[@"pauseCount"] = @(JoemeInt(rec[@"pauseCount"]));
+    h[@"pauseTime"] = @(JoemeInt(rec[@"pauseTotalTime"]));
+    h[@"peisu"] = @(JoemeInt(rec[@"averPace"]));
+    h[@"averRate"] = @(JoemeInt(rec[@"averHeart"]));
+    h[@"sportCount"] = @(JoemeInt(rec[@"totalSport"]));
+    // 有氧运动时长（秒）：Android 叫 oxsporttimes；iOS 库里有 aerobTime，直接透出
+    h[@"oxsporttimes"] = @(JoemeInt(rec[@"aerobTime"]));
+    h[@"raw"] = [NSString stringWithFormat:
+                 @"SportModel{type=%ld, begin=%@, end=%@, step=%ld, dis=%f m, cal=%f cal, time=%ld s}",
+                 (long)JoemeInt(rec[@"type"]), begin, end,
+                 (long)JoemeInt(rec[@"totalStep"]), totalDisM, totalCalCal,
+                 (long)JoemeInt(rec[@"totalTime"])];
+    return h;
+}
+
+/** 库里一条运动记录的 oneMinuteData -> Android 同形 items */
+- (NSArray *)sportItemsFromDBRecord:(NSDictionary *)rec head:(NSDictionary *)head day:(NSInteger)day {
+    NSArray *minutes = rec[@"oneMinuteData"];
+    if (![minutes isKindOfClass:[NSArray class]] || minutes.count == 0) return @[];
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:minutes.count];
+    NSInteger allMinute = (NSInteger)minutes.count;
+    for (NSInteger i = 0; i < allMinute; i++) {
+        NSDictionary *m = minutes[i];
+        if (![m isKindOfClass:[NSDictionary class]]) continue;
+        [out addObject:@{
+            @"day": @(day),
+            @"date": head[@"date"] ?: @"",
+            @"startHour": head[@"startHour"] ?: @0,
+            @"startMinute": head[@"startMinute"] ?: @0,
+            @"startSecond": head[@"startSecond"] ?: @0,
+            // iOS 的逐分钟包没有「第几分钟」字段，按数组下标（每分钟一条）
+            @"minute": @(i),
+            @"allMinute": @(allMinute),
+            @"rate": @(JoemeInt(m[@"heartValue"])),
+            @"stepCount": @(JoemeInt(m[@"stepValue"])),
+            @"sportCount": @(JoemeInt(m[@"sportValue"])),
+            @"distance": @(JoemeInt(m[@"disValue"])),   // 米
+            @"kcal": @(JoemeInt(m[@"calValue"])),       // cal（页面 ÷1000）
+            @"beathPause": @(JoemeInt(m[@"isPause"]))
+        }];
+    }
+    return out;
+}
+
+/** "yyyy-MM-dd HH:mm:ss" -> { hour, minute, second }（解析不到给 0） */
+- (NSDictionary *)hourMinuteSecondFromString:(NSString *)str {
+    if (![str isKindOfClass:[NSString class]]) return @{ @"hour": @0, @"minute": @0, @"second": @0 };
+    NSArray *parts = [str componentsSeparatedByString:@" "];
+    NSString *t = parts.count >= 2 ? parts.lastObject : str;
+    NSArray *hms = [t componentsSeparatedByString:@":"];
+    return @{
+        @"hour": hms.count >= 1 ? @([hms[0] integerValue]) : @0,
+        @"minute": hms.count >= 2 ? @([hms[1] integerValue]) : @0,
+        @"second": hms.count >= 3 ? @([hms[2] integerValue]) : @0
+    };
 }
 
 /**
@@ -3567,45 +3781,6 @@ UNI_EXPORT_METHOD(@selector(setWearCheck:callback:))
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"yyyy-MM-dd";
     return [fmt stringFromDate:target];
-}
-
-/** NSNumber/NSString -> double；其它类型与 nil 返回 0（库里的值两种类型混用） */
-static double JoemeDouble(id v) {
-    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v doubleValue];
-    if ([v isKindOfClass:[NSString class]]) return [(NSString *)v doubleValue];
-    return 0;
-}
-
-static NSInteger JoemeInt(id v) {
-    return (NSInteger)JoemeDouble(v);
-}
-
-/** dict 上按多个候选 key 取值（库里不同协议版本 key 名不一致） */
-static id JoemeFirstValue(NSDictionary *dict, NSArray<NSString *> *keys) {
-    if (![dict isKindOfClass:[NSDictionary class]]) return nil;
-    for (NSString *k in keys) {
-        id v = dict[k];
-        if (v && v != [NSNull null]) return v;
-    }
-    return nil;
-}
-
-/** dict 里的时间 -> (hour, minute)。支持 "HH:mm"/"HH:mm:ss" 字符串与 hour/minute 数值字段 */
-static void JoemeTimeOfDict(NSDictionary *dict, NSInteger *hour, NSInteger *minute) {
-    NSInteger h = 0, m = 0;
-    id t = JoemeFirstValue(dict, @[ @"Time", @"time", @"TimeValue" ]);
-    if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] >= 4) {
-        NSArray<NSString *> *parts = [(NSString *)t componentsSeparatedByString:@":"];
-        if (parts.count >= 2) {
-            h = [parts[0] integerValue];
-            m = [parts[1] integerValue];
-        }
-    } else {
-        h = JoemeInt(JoemeFirstValue(dict, @[ @"hour", @"hourValue", @"startHour" ]));
-        m = JoemeInt(JoemeFirstValue(dict, @[ @"minute", @"minuteValue", @"startMinute" ]));
-    }
-    if (hour) *hour = h;
-    if (minute) *minute = m;
 }
 
 /** 归一化一条 5 分钟原始数据（Android OriginData(3) 的字段名），iOS/旧库 key 都在这里兜底 */
