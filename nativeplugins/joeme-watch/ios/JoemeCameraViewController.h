@@ -45,4 +45,6 @@ NS_ASSUME_NONNULL_BEGIN
 /** 从当前最上层控制器全屏拉起相机页；返回是否成功发起 present */
 + (BOOL)presentNew;
 
+@end
+
 NS_ASSUME_NONNULL_END

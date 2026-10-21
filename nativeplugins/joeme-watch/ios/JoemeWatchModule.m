@@ -1587,6 +1587,9 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
     [self sendEvent:@"funcSupport" data:@{
         @"watchDataDay": @(pm.saveDays),
         @"contactType": @(pm.contactType),
+        // SOS：contactType==2 才支持（与 Android 同口径，见 android JoemeWatchModule 同名分支）；
+        // 另外给一个布尔位，联系页优先读它（f.sosContactSupported），缺失时退回 contactType
+        @"sosContactSupported": @(pm.contactType == 2),
         // 协议版本：与 Android 的 originProtocolVersion 同义（3/5 → 数据挂在 5 分钟原始点上）
         @"originProtocolVersion": @(pm.fiveProtocolType),
         @"ecg": @(pm.ecgType != 0),
@@ -6247,11 +6250,15 @@ UNI_EXPORT_METHOD(@selector(changeCustomSetting:callback:))
 /**
  读取单位设置（结构化）。
  JS：joemeWatch.readUnitSetting() -> resolve + on('unitSetting')
-   { code, metricSystem:boolean, metricSystemSupport:boolean, metricSystemRaw,
+   { code, index, metricSystem?:boolean, metricSystemSupport, metricSystemRaw,
      temperatureUnit:'CELSIUS'|'FAHRENHEIT'|'', bloodGlucoseUnit, uricAcidUnit, bloodFatUnit,
-     supportWeather:boolean, supportTemperatureUnit:boolean }
- 说明：与 readCustomSetting 读的是同一组基本开关，只是按单位字段单独输出；
-      index/unitFrame 保留 Android 的字段（iOS 一次读完，恒为 1/true）。
+     supportWeather:boolean, supportTemperatureUnit:boolean, temperatureType, weatherFunction }
+ 说明：与 readCustomSetting 读的是同一组基本开关，只是按单位字段单独输出。
+ iOS 没有 Android 那种「B8 两帧」结构，一次串行读完就齐了，所以正常情况下 index=1。
+ 但读失败（VPFunctionCompleteFailure）**不等于设备不支持**：
+   - Unknown（设备没有此功能）→ 字段给 'UNSUPPORT'，页面据此置灰，是可信结论；
+   - Failure（命令失败/超时）→ 该字段缺失，此时把 index 降为 0，
+     页面就不会把空值当「不支持」，保存时也不会用界面默认值覆盖设备。
  */
 UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
 - (void)readUnitSetting:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -6260,6 +6267,7 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
     __weak typeof(self) weakSelf = self;
 
     NSMutableDictionary *v = [NSMutableDictionary dictionary];
+    __block NSUInteger failed = 0;   // 读取失败（非「设备没有此功能」）的次数
     NSArray<NSNumber *> *types = @[
         @(VPSettingMetric),
         @(VPSettingTemperatureUnit),
@@ -6274,18 +6282,26 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
     void (^emit)(void) = ^{
         NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
         NSString *metric = v[@"metric"];
-        r[@"metricSystem"] = @([metric isEqualToString:@"SUPPORT_OPEN"]);
-        r[@"metricSystemSupport"] = @(metric != nil && ![metric isEqualToString:@"UNSUPPORT"]);
+        // metricSystem 只在读到确定值时给：读失败时缺省，页面保留原值而不是当成「非公制」
+        if (metric != nil) {
+            r[@"metricSystem"] = @([metric isEqualToString:@"SUPPORT_OPEN"]);
+        }
+        // 只有明确 UNSUPPORT 才算不支持；读失败不能当成不支持（否则整组被置灰）
+        r[@"metricSystemSupport"] = @(![metric isEqualToString:@"UNSUPPORT"]);
         r[@"metricSystemRaw"] = metric ?: @"";
-        r[@"temperatureUnit"] = [weakSelf unitNameOf:v[@"temperature"] celsius:@"CELSIUS" other:@"FAHRENHEIT"];
-        r[@"bloodGlucoseUnit"] = [weakSelf unitNameOf:v[@"glucose"] celsius:@"mmol_L" other:@"mg_dl"];
-        r[@"uricAcidUnit"] = [weakSelf unitNameOf:v[@"uricAcid"] celsius:@"umol_L" other:@"mg_dl"];
-        r[@"bloodFatUnit"] = [weakSelf unitNameOf:v[@"bloodFat"] celsius:@"mmol_L" other:@"mg_dl"];
-        // 能力位（iOS 用握手字段；weatherType==1 才有天气）
+        r[@"temperatureUnit"] = [weakSelf unitNameOf:v[@"temperature"] first:@"CELSIUS" second:@"FAHRENHEIT"];
+        r[@"bloodGlucoseUnit"] = [weakSelf unitNameOf:v[@"glucose"] first:@"mmol_L" second:@"mg_dl"];
+        r[@"uricAcidUnit"] = [weakSelf unitNameOf:v[@"uricAcid"] first:@"umol_L" second:@"mg_dl"];
+        r[@"bloodFatUnit"] = [weakSelf unitNameOf:v[@"bloodFat"] first:@"mmol_L" second:@"mg_dl"];
+        // index=1 表示「单位字段可信」；任一读取失败就降为 0（与 Android 的帧语义对齐）
+        BOOL frameOk = (failed == 0);
+        r[@"index"] = @(frameOk ? 1 : 0);
+        r[@"unitFrame"] = @(frameOk);
+        // 能力位（iOS 用握手字段；weatherType==1 才有天气）。仅作诊断，页面不据此置灰。
         r[@"supportWeather"] = @(model.weatherType == 1);
         r[@"supportTemperatureUnit"] = @(model.temperatureType > 0);
-        r[@"index"] = @1;
-        r[@"unitFrame"] = @YES;
+        r[@"temperatureType"] = @(model.temperatureType);
+        r[@"weatherFunction"] = (model.weatherType == 1) ? @"SUPPORT" : @"UNSUPPORT";
         [weakSelf sendEvent:@"unitSetting" data:r];
         callback(r, NO);
     };
@@ -6297,14 +6313,15 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
         [weakSelf readBaseSwitch:t done:^(VPSettingFunctionCompleteState state) {
             NSString *name = [weakSelf functionStateName:state];
             if (name) v[keys[i]] = name;
+            else failed++;          // Failure：读失败，字段缺失
             next();
         }];
     };
     next();
 }
 
-/** Open/Close -> 单位枚举名（Open 为第一档：摄氏 / mmol/L / μmol/L） */
-- (NSString *)unitNameOf:(NSString *)state celsius:(NSString *)first other:(NSString *)second {
+/** Open/Close -> 单位枚举名（Open 为第一档：摄氏 / mmol/L / μmol/L；其它给空串） */
+- (NSString *)unitNameOf:(NSString *)state first:(NSString *)first second:(NSString *)second {
     if ([state isEqualToString:@"SUPPORT_OPEN"]) return first;
     if ([state isEqualToString:@"SUPPORT_CLOSE"]) return second;
     return @"";
@@ -6325,12 +6342,18 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
         BOOL ok = (state == VPWeatherSettingStateSuccess) && cfg != nil;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(ok);
+        // oprate：与 Android 同口径（READ_SUCCESS / READ_FAIL / UNKONW）。
+        // 页面靠它区分「状态回包」和「写回执」，也靠 FAIL 丢弃无效状态。
+        d[@"oprate"] = ok ? @"READ_SUCCESS"
+                          : (state == VPWeatherSettingStateNone ? @"UNKONW" : @"READ_FAIL");
         if (cfg) {
             d[@"isOpen"] = @(cfg.switchState == 1);
             d[@"weatherType"] = (cfg.weatherUnit == 1) ? @"F" : @"C";
             d[@"raw"] = [NSString stringWithFormat:@"WeatherStatusData{isOpen=%@, weatherType=%@}",
                          cfg.switchState == 1 ? @"true" : @"false", d[@"weatherType"]];
         } else {
+            // 拿不到模型：不给 isOpen，避免页面把开关误翻成「关」
+            d[@"noData"] = @YES;
             d[@"message"] = @"设备不支持天气或读取失败";
         }
         [weakSelf sendEvent:@"weather" data:d];
@@ -6343,7 +6366,9 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
 /**
  设置天气开关与单位。options: { isOpen, unit:'C'|'F' }
  iOS SDK：VPWeatherHandle settingWeatherInfo:（VPWeatherConfigModel）
- JS：joemeWatch.setWeatherStatus({...}) -> on('weather') { isOpen, weatherType, ok }
+ JS：joemeWatch.setWeatherStatus({...}) -> on('weather') { isOpen, weatherType, ok, oprate }
+ 说明：oprate 固定 SETTING_STATUS_SUCCESS / SETTING_STATUS_FAIL（与 Android 同名），
+      页面据此判断写入是否真的成功，而不是只看命令已下发。
  */
 UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
 - (void)setWeatherStatus:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -6361,6 +6386,7 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
         BOOL ok = (state == VPWeatherSettingStateSuccess);
         NSDictionary *d = @{
             @"ok": @(ok),
+            @"oprate": ok ? @"SETTING_STATUS_SUCCESS" : @"SETTING_STATUS_FAIL",
             @"isOpen": @(open),
             @"weatherType": celsius ? @"C" : @"F"
         };
@@ -6405,7 +6431,13 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
     __weak typeof(self) weakSelf = self;
     [[VPWeatherHandle share] syncWeatherDataToDeviceWithWeatherServerModel:m result:^(VPWeatherSettingState state) {
         BOOL ok = (state == VPWeatherSettingStateSuccess);
-        NSDictionary *d = @{ @"ok": @(ok), @"setWeatherData": @(ok), @"cityName": m.city ?: @"" };
+        // oprate 与 Android 的 SETTING_CONTENT_SUCCESS/FAIL 对齐，页面据此判同步结果
+        NSDictionary *d = @{
+            @"ok": @(ok),
+            @"oprate": ok ? @"SETTING_CONTENT_SUCCESS" : @"SETTING_CONTENT_FAIL",
+            @"setWeatherData": @(ok),
+            @"cityName": m.city ?: @""
+        };
         [weakSelf sendEvent:@"weather" data:d];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
