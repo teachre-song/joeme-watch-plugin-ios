@@ -21,6 +21,10 @@
 //
 
 #import "JoemeWatchModule.h"
+#import "JoemeCameraCapture.h"
+#import "JoemeCameraStore.h"
+#import "JoemeCameraViewController.h"
+#import <UIKit/UIKit.h>
 #import <VeepooBleSDK/VeepooBleSDK.h>
 #import <math.h>
 // dispatch_block_create/cancel（readActivityByDay 的可取消看门狗）需要显式引入
@@ -98,6 +102,31 @@
 /** 运动记录读取会话号；每次 readDeviceRunningData 自增，旧会话的迟到回调按它丢弃 */
 @property (nonatomic, assign) NSInteger sportReadSeq;
 
+/** 最近一次拿到的文本闹钟整表（新增时用它挑空闲 alarmId，避免覆盖已有闹钟） */
+@property (nonatomic, strong) NSArray<NSDictionary *> *lastTextAlarms;
+
+/** 相机遥控是否已进入（避免重复下发 Enter/Exit 让手表闪屏） */
+@property (nonatomic, assign) BOOL cameraEntered;
+/** listenCamera 是否已注册常驻相机 block（SDK 只有一个槽位，装一次即可） */
+@property (nonatomic, assign) BOOL cameraMonitorInstalled;
+/** 常驻相机监听 block：SDK 只存一个槽位，Enter/Exit 必须复用它 */
+@property (nonatomic, copy) void (^cameraMonitor)(VPCameraType type);
+/** 本模块主动下发、尚未收到回执的 Exit 条数（用于过滤自己发的 Exit 回执） */
+@property (nonatomic, assign) NSInteger pendingSelfExit;
+/** 最近一次主动下发 Exit 的时间；超出窗口就认为对端没回包，不再过滤 */
+@property (nonatomic, assign) NSTimeInterval pendingSelfExitAt;
+
+// 相机相关内部方法（第 7 节实现）：显式声明，避免后向调用产生
+// "instance method not found" 告警
+- (void (^)(VPCameraType))cameraMonitorBlock;
+- (void)sendCameraExitCommand;
+- (void)installCameraMonitorIfNeeded;
+- (void)enterCameraMode;
+- (void)exitCameraMode;
+- (void)handleCameraType:(VPCameraType)type;
+- (void)capturePhotoSilentlyInto:(NSMutableDictionary *)cameraEvent;
+- (BOOL)presentCameraScreenNotifyWatch:(BOOL)notifyWatch;
+
 @end
 
 /** 分页累计原始点的小容器：同一 (h,m) 合并（分页可能重复回同一包）。
@@ -166,6 +195,9 @@ static NSDictionary *resultWithCode(NSInteger code) {
     return @{ @"code": @(code) };
 }
 
+// 相机相关的前置声明：实现放在第 7 节（相机遥控）里，但 initWatch 里要先注册前后台通知
+static void JoemeStartAppStateTracking(void);
+
 // ---------- 库/字典取值小工具（C 函数必须先声明再用，所以放在最前） ----------
 
 /** NSNumber/NSString -> double；其它类型与 nil 返回 0（库里的值两种类型混用） */
@@ -220,6 +252,9 @@ UNI_EXPORT_METHOD(@selector(initWatch:callback:))
 
     // 单例持有的 block 用 weak 引用，避免模块与 JS 回调被强持有到进程结束
     __weak typeof(self) weakSelf = self;
+
+    // 前后台标记（相机静默拍照要判断 App 是否在前台）
+    JoemeStartAppStateTracking();
 
     // 手机系统蓝牙开关状态监听 -> on('bluetooth')
     manager.VPBleCentralManageChangeBlock = ^(VPCentralManagerState state) {
@@ -1479,6 +1514,13 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
 - (void)handlePersistentConnectState:(VPDeviceConnectState)state {
     switch (state) {
         case VPDeviceConnectStateDisConnect:
+            // 断连后手表已经不在拍照模式，手机上的预览页留着只会卡在最后一帧
+            // （与 Android 的 onConnectStatusChanged 一致）
+            [JoemeCameraViewController finishIfOpen];
+            self.cameraEntered = NO;
+            self.pendingSelfExit = 0;
+            // 重连后要重新装一次监听：SDK 的 block 槽位可能随连接重建被清掉
+            self.cameraMonitorInstalled = NO;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
@@ -1487,6 +1529,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         case VPDeviceConnectStateVerifyPasswordSuccess:
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @YES }];
             [self emitDeviceInfo];
+            // 对齐 Android：连上就占住相机监听槽位，手表上报的相机状态/快门
+            // 即使 App 相机页没开也能被原生接住。
+            // iOS 没有「只注册不下发」的接口，这里靠一条 Exit 装监听（回执会被
+            // pendingSelfExit 过滤掉，不会当成「手表退出拍照页」抛给 JS）。
+            [self installCameraMonitorIfNeeded];
             break;
         case VPDeviceConnectStateVerifyPasswordFailure:
             // 蓝牙已连但验密失败：不能发 pwd（JS 层会无条件当成"验密通过"），仅更新连接状态
@@ -1516,11 +1563,55 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         @"deviceVersion": pm.deviceVersion ?: @"",
         @"deviceTestVersion": pm.deviceTestVersion ?: @""
     }];
-    // 对应 Android 的 funcSupport 事件（JS 侧映射为 'func'），携带数据保存天数
-    // contactType：2 表示设备支持 SOS 紧急联系人（与 Android FunctionDeviceSupportData.getContactType 同源）
+    // 对应 Android 的 funcSupport 事件（JS 侧映射为 'func'），携带数据保存天数与能力位。
+    //
+    // 为什么要把能力位补齐：Android 的 funcSupport 里带 summary（SDK 的中文 toString 文本，
+    // 形如「ECG=SUPPORT，身体成分=UNSUPPORT」），页面从这段文本里正则抠能力位；iOS 没有这种
+    // 文本，能力全在 VPPeripheralModel 的属性上。不补的话页面在 iOS 上拿不到任何能力位 →
+    // 对身体不支持的功能（心电图/身体成分/运动记录/HRV）照样下发读取，白等一轮超时。
+    //
+    // 所以这里把 VPPeripheralModel 的属性映射成与 summary 同义的**结构化字段**，
+    // 页面同时认这两种来源（见 watch/health/index.vue 的 CAP_ALIAS / _capOk）。
+    // 每个字段的判定口径都以 VPPeripheralModel.h 的属性注释为准：
+    //   ecgType            0=没有该功能，1=E 系列，2=G 系列
+    //   runningSaveTimes   非 0 代表有运动模式（头文件明写「判断是否有运动模式用这个字段」）
+    //   hrvType            非 0 代表有 hrv 功能
+    //   oxygenType         非 0 代表有血氧功能
+    //   temperatureType    0=没有，1=有但不自动测，2/4/5=有且自动测
+    //   stressType/metType 0/1 为不支持，>1 才支持
+    //   bloodGlucoseType   0=没有，其余各档都代表有（2 校准 / 3 仅校准 / 4 多校准 / 5 风险等级…）
+    //   bloodAnalysisType / bodyCompositionType / bloodPressureType / heartRateType / worldClockType
+    //                     非 0 代表有该功能（worldClockType 注释明写 0 表示不支持）
+    // 布尔字段用 @(条件) 直接给 YES/NO，页面按「false = 明确不支持」处理；
+    // 数值字段（体温/血糖/压力/梅脱）保留原始档位，页面需要时还能细分。
     [self sendEvent:@"funcSupport" data:@{
         @"watchDataDay": @(pm.saveDays),
-        @"contactType": @(pm.contactType)
+        @"contactType": @(pm.contactType),
+        // 协议版本：与 Android 的 originProtocolVersion 同义（3/5 → 数据挂在 5 分钟原始点上）
+        @"originProtocolVersion": @(pm.fiveProtocolType),
+        @"ecg": @(pm.ecgType != 0),
+        @"bodyComposition": @(pm.bodyCompositionType != 0),
+        @"sportModel": @(pm.runningSaveTimes != 0),
+        @"sportModelDay": @(pm.runningSaveTimes),
+        @"hrv": @(pm.hrvType != 0 || pm.isSupportHRVTest),
+        @"spo2": @(pm.oxygenType != 0),
+        @"spo2Type": @(pm.oxygenType),
+        // 体温：给布尔（是否具备体温功能）+ 原始档位（2/5 走 origin 通路，页面用得上）
+        @"temperature": @(pm.temperatureType != 0),
+        @"temperatureType": @(pm.temperatureType),
+        // 压力/梅脱：0/1 不支持，>1 支持；梅脱另外还有 isSupportMetTest 这个显式能力位
+        @"stress": @(pm.stressType > 1),
+        @"stressType": @(pm.stressType),
+        @"met": @(pm.metType > 1 || pm.isSupportMetTest),
+        @"metType": @(pm.metType),
+        @"bloodGlucose": @(pm.bloodGlucoseType != 0),
+        @"bloodGlucoseType": @(pm.bloodGlucoseType),
+        @"bloodAnalysis": @(pm.bloodAnalysisType != 0),
+        @"bp": @(pm.bloodPressureType != 0 || pm.isSupportBPTest),
+        @"heartRate": @(pm.heartRateType != 0),
+        @"worldClock": @(pm.worldClockType != 0),
+        // 没有 summary 文本：页面遇到 iOS 只会走结构化字段分支
+        @"summary": @""
     }];
 }
 
@@ -1902,27 +1993,38 @@ UNI_EXPORT_METHOD(@selector(setNewAlarm:callback:))
  iOS SDK：veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:settingMode:successResult:failureResult:
           （settingMode=VPDeviceTextAlarmSettingModelAddOrChange(2)；alarmText 最长 60 字节）
  Android：addTextAlarm(...)；JS：joemeWatch.setTextAlarm(model)
- 事件：on('textAlarm') -> { ok }
+ 事件：on('textAlarm') -> { ok, oprate, list }（与 Android 一致，成功时回整表）
  */
 UNI_EXPORT_METHOD(@selector(setTextAlarm:callback:))
 - (void)setTextAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    id alarmId = options[@"id"] ?: options[@"alarmID"];
     NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%@", options[@"hour"] ?: @0];
-    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%@", options[@"minute"] ?: @0];
-    dict[@"alarmState"]   = [NSString stringWithFormat:@"%lu", (unsigned long)([options[@"enable"] boolValue] ? 1 : 0)];
-    dict[@"alarmID"]      = [NSString stringWithFormat:@"%@", options[@"id"] ?: options[@"alarmID"] ?: @1];
-    dict[@"repeatState"]  = [NSString stringWithFormat:@"%@", options[@"repeat"] ?: @0];
-    dict[@"alarmText"]    = options[@"content"] ?: @"";
-    dict[@"alarmDate"]    = @"0000-00-00";
+    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%ld", (long)(options[@"hour"] ? [options[@"hour"] integerValue] : 0)];
+    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%ld", (long)(options[@"minute"] ? [options[@"minute"] integerValue] : 0)];
+    dict[@"alarmState"]   = [NSString stringWithFormat:@"%d", options[@"enable"] ? ([options[@"enable"] boolValue] ? 1 : 0) : 1];
+    // 新增必须用空闲 ID：固定传 1 会把设备上已有的 1 号闹钟覆盖掉
+    dict[@"alarmID"]      = alarmId ? [NSString stringWithFormat:@"%@", alarmId] : [self nextTextAlarmId];
+    // repeat 是 7 位「周日..周一」串，必须换算成 SDK 的 8 位十进制串（与 modify 同一条路径）
+    dict[@"repeatState"]  = [self iosRepeatStateFromAndroid:options[@"repeat"]];
+    dict[@"alarmText"]    = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
+    dict[@"alarmDate"]    = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
     VPDeviceTextAlarmModel *m = [[VPDeviceTextAlarmModel alloc] initWithAlarmDict:dict];
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
     [pm veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:m settingMode:VPDeviceTextAlarmSettingModelAddOrChange successResult:^(NSArray *alarmArray) {
-        [self sendEvent:@"textAlarm" data:@{ @"ok": @YES }];
-        callback(resultWithCode(200), NO);
+        NSArray *list = [weakSelf textAlarmListFromModels:alarmArray];
+        NSDictionary *d = @{ @"ok": @YES, @"oprate": @"SETTING_SUCCESS", @"list": list };
+        [weakSelf sendEvent:@"textAlarm" data:d];
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
     } failureResult:^{
-        [self sendEvent:@"textAlarm" data:@{ @"ok": @NO }];
-        callback(resultWithCode(200), NO);
+        NSDictionary *d = @{ @"ok": @NO, @"oprate": @"SETTING_FAIL", @"list": @[] };
+        [weakSelf sendEvent:@"textAlarm" data:d];
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
     }];
 }
 
@@ -2605,53 +2707,393 @@ UNI_EXPORT_METHOD(@selector(isCameraSupported:callback:))
 }
 
 /**
- 注册常驻相机监听（不下发任何指令）。
- iOS SDK 没有独立的 setCameraListener：拍照回调必须随 veepooSDKSettingCameraType 一起注册，
- 所以「手表自己进拍照页唤醒 App」在 iOS 上不成立，只能由 App 先发 Enter。
- 此方法在 iOS 上等价于空操作，只为与 Android 保持 JS 接口一致。
- Android：setCameraListener（只占监听槽位，不写 0xB6）
+ 取常驻相机监听 block（只建一次，之后复用）。
+
+ iOS SDK 与 Android 的关键差异：没有独立的 setCameraListener，
+ 拍照回调只能随 veepooSDKSettingCameraType:settingAndMonitorResult: 一起注册。
+ 所以本模块把所有相机状态都收口到这一个 block 上，Enter/Exit 也复用它 ——
+ 否则每次 startCamera/stopCamera 都会新建一个 block 覆盖掉上一个，
+ 手表上报的 Photo 回调（以及相机页关闭时的收尾）就会丢。
+
+ 插件方法跑在 uni 工作线程、SDK 回调跑在自己的线程，所以创建用 @synchronized
+ 包一层，避免并发调用各建一个 block（后者覆盖前者，先注册的回调就再也收不到）。
+ */
+- (void (^)(VPCameraType))cameraMonitorBlock {
+    @synchronized (self) {
+        if (!self.cameraMonitor) {
+            __weak typeof(self) weakSelf = self;
+            self.cameraMonitor = ^(VPCameraType type) {
+                [weakSelf handleCameraType:type];
+            };
+        }
+        return self.cameraMonitor;
+    }
+}
+
+/** 装一次常驻监听：SDK 只存一个槽位，装过就不再重复下发 */
+- (void)installCameraMonitorIfNeeded {
+    if (self.cameraMonitorInstalled) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    self.cameraMonitorInstalled = YES;
+    if (!self.cameraEntered) {
+        // iOS 没有「只监听不下发」的接口，只能用 Exit 把 block 装进去。
+        // 手表本来就不在拍照模式时这条命令无副作用（回执由 pendingSelfExit 过滤掉）。
+        [self sendCameraExitCommand];
+    }
+}
+
+/**
+ 下发 Exit 并登记一条「自己发的 Exit」，用于过滤随之而来的回执。
+ 必须成对维护计数：设备不回包时计数会挂住，所以另加时间窗（见 handleCameraType）。
+ */
+- (void)sendCameraExitCommand {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    self.pendingSelfExit++;
+    self.pendingSelfExitAt = [[NSDate date] timeIntervalSince1970];
+    [pm veepooSDKSettingCameraType:VPCameraTypeExit settingAndMonitorResult:self.cameraMonitorBlock];
+}
+
+- (void)enterCameraMode {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    self.cameraEntered = YES;
+    self.cameraMonitorInstalled = YES;
+    // 不清 pendingSelfExit：占槽位那条 Exit 的回执可能是在 Enter 之后才到的，
+    // 清掉就会被误当成「手表退出拍照页」把刚打开的相机页关掉。
+    // 计数由回执自己消耗，设备不回包时由 handleCameraType 的 10 秒窗口兜底。
+    [pm veepooSDKSettingCameraType:VPCameraTypeEnter settingAndMonitorResult:self.cameraMonitorBlock];
+}
+
+- (void)exitCameraMode {
+    self.cameraEntered = NO;
+    self.cameraMonitorInstalled = YES;
+    // 断连时（peripheralModel 已被清掉）不要再下发：SDK 会走到写特征值失败的分支，
+    // 且手表已经不在拍照模式，发过去只会换来一条失败回执。
+    // 相机页关闭时要走到这里，所以判断放在方法内部而不是调用处。
+    if (![VPBleCentralManage sharedBleManager].peripheralModel) return;
+    [self sendCameraExitCommand];
+}
+
+/**
+ 相机状态的统一处理（对齐 Android 的 ICameraDataListener）。
+
+ iOS 的 VPCameraType 只有 Exit(0)/Enter(1)/Photo(2)，没有 Android 的
+ DEVICE_OPEN_SUCCESS 语义，所以 deviceInitiated 恒为 NO、也不会触发
+ 「手表自己进拍照页 → 手机自动开相机」这条链路。
+
+ 事件 camera 同时给两个字段：
+   state   —— 原始 VPCameraType 数值（历史字段，保持兼容）
+   status  —— 与 Android 同名的字符串（OPEN_SUCCESS / CLOSE_SUCCESS / TAKEPHOTO_CAN）
+   handled —— Photo 的处理方式：activity / activity-not-ready / silent
+   capture —— 静默拍照的不做原因：busy / permission-required / background
+
+ 注意 Exit 回执的过滤：installCameraMonitorIfNeeded / exitCameraMode 会主动下发 Exit，
+ 这些回执不该当成「手表退出了拍照页」抛给 JS（Android 那条是纯注册，没有对应事件）。
+ 用 pendingSelfExit 计数扣掉自己发的 Exit；设备不回包时计数会一直挂着，
+ 所以另加 10 秒时间窗（见下面的判断），过期后不再过滤，保证真正的手表退出不会被吞。
+ */
+- (void)handleCameraType:(VPCameraType)type {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"state"] = @(type);
+    d[@"deviceInitiated"] = @NO;
+
+    if (type == VPCameraTypePhoto) {
+        d[@"status"] = @"TAKEPHOTO_CAN";
+        // 与 Android 一致：手表按快门时尽量不依赖 JS 页面是否存活
+        if ([JoemeCameraViewController isReady]) {
+            d[@"handled"] = @"activity";
+            [JoemeCameraViewController takePictureNow];
+        } else if ([JoemeCameraViewController isOpen]) {
+            // 相机页在但会话没起来（切后台/刚打开/切镜头中）：
+            // takePictureNow 会把这次快门挂起到会话就绪后补拍，同时补开一次会话
+            d[@"handled"] = @"activity-not-ready";
+            [JoemeCameraViewController takePictureNow];
+            [JoemeCameraViewController retryOpen];
+        } else {
+            [self capturePhotoSilentlyInto:d];
+        }
+    } else if (type == VPCameraTypeEnter) {
+        d[@"status"] = @"OPEN_SUCCESS";
+        self.cameraEntered = YES;
+        // 不在这里清 pendingSelfExit：占槽位那条 Exit 的回执可能晚于 Enter 到达，
+        // 清掉之后它会被误判成「手表退出拍照页」而把刚打开的相机页关掉。
+    } else {
+        // 超过 10 秒还没回包的自己发的 Exit 视为丢失，不再占着配额，
+        // 否则设备不回包时会把之后真正的「手表退出拍照页」误吞。
+        if (self.pendingSelfExit > 0
+            && [[NSDate date] timeIntervalSince1970] - self.pendingSelfExitAt > 10) {
+            self.pendingSelfExit = 0;
+        }
+        if (self.pendingSelfExit > 0) {
+            // 这条 Exit 是我们自己下发的（占槽位 / 关页），不是手表退出的
+            self.pendingSelfExit--;
+            self.cameraEntered = NO;
+            return;
+        }
+        d[@"status"] = @"CLOSE_SUCCESS";
+        self.cameraEntered = NO;
+        // 手表退出拍照页 → 手机预览页也收掉，否则留下一个控制不了的界面。
+        // finishFromWatch 让关闭回调跳过回发 Exit（手表已经退出了）
+        if ([JoemeCameraViewController isOpen]) {
+            [JoemeCameraViewController finishFromWatch];
+        }
+    }
+
+    [self sendEvent:@"camera" data:d];
+}
+
+/** App 是否在前台的缓存标记（由 JoemeStartAppStateTracking 维护） */
+static BOOL JoemeAppActiveFlag = YES;
+
+/**
+ 维护前后台标记：相机 block 可能在非主线程回调，不能在那里读 UIApplication。
+ 初值取 YES（能调到插件时 App 基本就在前台），之后完全由通知驱动，
+ 这样不必在非主线程读 applicationState。
+ */
+static void JoemeStartAppStateTracking(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        JoemeAppActiveFlag = YES;
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            JoemeAppActiveFlag = YES;
+        }];
+        [nc addObserverForName:UIApplicationWillResignActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            JoemeAppActiveFlag = NO;
+        }];
+    });
+}
+
+/** App 是否在前台：iOS 在后台会挂起进程，拿不到摄像头 */
+static BOOL JoemeAppIsActive(void) {
+    // 读缓存标记而不是 dispatch_sync 主队列：相机 block 可能就在主线程之外被调用，
+    // 一旦主线程正等 SDK 回调就会死锁。
+    return JoemeAppActiveFlag;
+}
+
+/**
+ 手表按了快门但相机页没开：静默拍一张存相册（对齐 Android 的 capturePhotoSilently）。
+ 结果通过 photoCapture 事件告知 JS；camera 事件里带上 capture 字段便于排查。
+ */
+- (void)capturePhotoSilentlyInto:(NSMutableDictionary *)cameraEvent {
+    if (!JoemeAppIsActive()) {
+        cameraEvent[@"capture"] = @"background";
+        return;
+    }
+    if (![JoemeCameraCapture hasCameraPermission]) {
+        cameraEvent[@"capture"] = @"permission-required";
+        return;
+    }
+    if ([JoemeCameraCapture isCapturing]) {
+        cameraEvent[@"capture"] = @"busy";
+        return;
+    }
+    cameraEvent[@"capture"] = @"silent";
+
+    __weak typeof(self) weakSelf = self;
+    [JoemeCameraCapture captureJPEGFront:NO completion:^(NSData *data, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!data.length) {
+            NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+            r[@"ok"] = @NO;
+            r[@"source"] = @"silent";
+            r[@"message"] = error.localizedDescription ?: @"拍照失败";
+            [strongSelf sendEvent:@"photoCapture" data:r];
+            return;
+        }
+        [JoemeCameraStore saveJPEGData:data completion:^(NSString *path, BOOL albumSaved, NSError *saveError) {
+            NSMutableDictionary *r = [resultWithCode(path ? 200 : -1) mutableCopy];
+            r[@"ok"] = @(path != nil);
+            r[@"source"] = @"silent";
+            r[@"albumSaved"] = @(albumSaved);
+            if (path) r[@"path"] = path;
+            else r[@"message"] = saveError.localizedDescription ?: @"保存失败";
+            [strongSelf sendEvent:@"photoCapture" data:r];
+        }];
+    }];
+}
+
+/**
+ 注册常驻相机监听（不下发拍照指令，但要走一次 SDK 调用才能占到 block 槽位）。
+ 装好之后，只要手表处在拍照模式（App 发过 Enter），上报的快门都会由原生处理，
+ 即使 App 相机页没开也会静默拍照。
+ Android：setCameraListener（只占监听槽位）—— 那条是纯注册，不写 0xB6。
+ iOS：没有纯注册接口，这里用一条 Exit 占槽位（手表若本就在拍照模式才会受影响，
+      相机页没开时也不会误关用户的拍照模式，因为 iOS 没有「手表主动进入」语义）。
  JS：joemeWatch.listenCamera()
  返回：{ code, supported }
  */
 UNI_EXPORT_METHOD(@selector(listenCamera:callback:))
 - (void)listenCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self installCameraMonitorIfNeeded];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
     r[@"supported"] = @YES;
     callback(r, NO);
 }
 
 /**
- 静默拍照。
- 本插件 iOS 端未实现无界面拍照（需 AVCapturePhotoOutput），直接回 -2 让 JS 回退到
- uni.chooseImage / plus.camera，避免调用方以为拍到了但其实没有。
- Android：Camera2 静默拍照 + 写入相册
- JS：joemeWatch.capturePhoto()
- 返回：{ code: -2, message }
+ 静默拍照：不开任何界面，直接拍一张存进相册（AVCapturePhotoOutput）。
+ 手表遥控场景要求收到快门后立刻出片，不能再让用户按一次快门。
+ Android：Camera2 静默拍照；JS：joemeWatch.capturePhoto()
+ 事件：photoCapture -> { ok, path, source:'silent', albumSaved }
+ 返回：{ code, path }（成功）/ -3 无权限 / -4 上一次未完成
  */
 UNI_EXPORT_METHOD(@selector(capturePhoto:callback:))
 - (void)capturePhoto:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    NSMutableDictionary *r = [resultWithCode(-2) mutableCopy];
-    r[@"message"] = @"iOS 端不支持静默拍照，请使用系统相机";
+    NSString *camera = options[@"camera"];
+    BOOL front = [camera isKindOfClass:[NSString class]] && [camera isEqualToString:@"front"];
+
+    // 相机页开着时不能另起一个 AVCaptureSession —— 摄像头是独占资源，
+    // 第二个 session 必然 startRunning 失败。这时直接转成页面的快门，
+    // 结果仍走 photoCapture 事件（source:'screen'）。
+    if ([JoemeCameraViewController isOpen]) {
+        [JoemeCameraViewController takePictureNow];
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        r[@"ok"] = @YES;
+        r[@"source"] = @"screen";
+        r[@"deferred"] = @YES;   // 真正结果走 photoCapture 事件
+        callback(r, NO);
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [JoemeCameraCapture captureJPEGFront:front completion:^(NSData *data, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!data.length) {
+            // 采集层已经按 Android 的口径返回 -1 / -3（无权限）/ -4（忙）
+            NSInteger code = error ? error.code : -1;
+            if (code != -3 && code != -4) code = -1;
+            NSMutableDictionary *r = [resultWithCode(code) mutableCopy];
+            r[@"ok"] = @NO;
+            r[@"message"] = error.localizedDescription ?: @"拍照失败";
+            if (code == -3) r[@"permission"] = @"camera";
+            [strongSelf sendEvent:@"photoCapture" data:r];
+            callback(r, NO);
+            return;
+        }
+        [JoemeCameraStore saveJPEGData:data completion:^(NSString *path, BOOL albumSaved, NSError *saveError) {
+            NSMutableDictionary *r;
+            if (path) {
+                r = [resultWithCode(200) mutableCopy];
+                r[@"ok"] = @YES;
+                r[@"path"] = path;
+            } else {
+                r = [resultWithCode(-1) mutableCopy];
+                r[@"ok"] = @NO;
+                r[@"message"] = saveError.localizedDescription ?: @"保存失败";
+            }
+            r[@"albumSaved"] = @(albumSaved);
+            r[@"source"] = @"silent";
+            [strongSelf sendEvent:@"photoCapture" data:r];
+            callback(r, NO);
+        }];
+    }];
+}
+
+/**
+ 打开 App 内的全屏相机页（AVCaptureSession 实时预览 + 快门），
+ 同时命令手表进入拍照模式（这样手表按快门才会把 Photo 上报上来）。
+ Android：JoemeCameraActivity；JS：joemeWatch.openCameraScreen()
+ 事件：cameraScreen -> { open:false, count, closedByWatch }（关闭时）
+       photoCapture -> { ok, path, source:'screen' }（每拍一张）
+ 返回：{ code, supported }；-3 表示没有相机权限
+ */
+UNI_EXPORT_METHOD(@selector(openCameraScreen:callback:))
+- (void)openCameraScreen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    // 先把相机权限拿到，否则页面起来了也是黑屏（iOS 不会像 Android 一样抛异常）
+    [JoemeCameraCapture requestCameraAccess:^(BOOL granted) {
+        if (!granted) {
+            NSMutableDictionary *r = [resultWithCode(-3) mutableCopy];
+            r[@"message"] = @"缺少相机权限";
+            r[@"permission"] = @"camera";
+            r[@"supported"] = @YES;
+            callback(r, NO);
+            return;
+        }
+        BOOL opened = [self presentCameraScreenNotifyWatch:YES];
+        NSMutableDictionary *r = [resultWithCode(opened ? 200 : -1) mutableCopy];
+        r[@"supported"] = @YES;
+        if (!opened) r[@"message"] = @"无法打开相机界面";
+        callback(r, NO);
+    }];
+}
+
+/**
+ 拉起相机页（JS 主动打开与手表快门兜底两条链路共用）。
+ @param notifyWatch YES 时先给手表下发 Enter —— 手表不在拍照模式就不会上报快门
+ */
+- (BOOL)presentCameraScreenNotifyWatch:(BOOL)notifyWatch {
+    // 重复打开：presentNew 内部会判重，但 Enter 不能重复下发（手表会闪一下）
+    if (notifyWatch && !self.cameraEntered) [self enterCameraMode];
+
+    __weak typeof(self) weakSelf = self;
+    [JoemeCameraViewController setCloseHandler:^(NSInteger count) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // 关闭相机页 → 让手表也退出拍照模式；手表自己退出的那次不再回发
+        BOOL closedByWatch = [JoemeCameraViewController consumeClosedByWatch];
+        if (!closedByWatch) [strongSelf exitCameraMode];
+        [strongSelf sendEvent:@"cameraScreen" data:@{
+            @"open": @NO,
+            @"count": @(count),
+            @"closedByWatch": @(closedByWatch)
+        }];
+    }];
+    [JoemeCameraViewController setCaptureHandler:^(NSString *path) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSMutableDictionary *d = [resultWithCode(200) mutableCopy];
+        d[@"ok"] = @YES;
+        d[@"path"] = path;
+        d[@"source"] = @"screen";
+        [strongSelf sendEvent:@"photoCapture" data:d];
+    }];
+
+    BOOL opened = [JoemeCameraViewController presentNew];
+    if (!opened) {
+        // 页面没起来（拿不到 window/rootViewController）：把刚下发的 Enter 撤回，
+        // 否则手表会一直停在拍照页，用户退出 App 前都退不出来。
+        // 回调也一并清掉，避免下次打开时被上一次的闭包误触发。
+        [JoemeCameraViewController setCloseHandler:nil];
+        [JoemeCameraViewController setCaptureHandler:nil];
+        if (notifyWatch && self.cameraEntered) [self exitCameraMode];
+    }
+    return opened;
+}
+
+/** 关闭 App 相机页（关闭回调里会给手表下发 Exit） */
+UNI_EXPORT_METHOD(@selector(closeCameraScreen:callback:))
+- (void)closeCameraScreen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if ([JoemeCameraViewController isOpen]) {
+        [JoemeCameraViewController finishIfOpen];
+    }
+    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+    r[@"supported"] = @YES;
     callback(r, NO);
 }
 
 /**
  进入相机遥控模式。
  iOS SDK：veepooSDKSettingCameraType:settingAndMonitorResult:（VPCameraTypeEnter=1）
-          回调里 VPCameraTypePhoto(2) 表示用户按下拍照，App 应据此调用系统相机拍照。
+          回调里 VPCameraTypePhoto(2) 表示用户按下快门，由原生直接出片（见 handleCameraType）。
  Android：startCamera(...)；JS：joemeWatch.startCamera()
- 事件：on('camera') -> { state, deviceInitiated }
+ 事件：on('camera') -> { state, status, deviceInitiated, handled?, capture? }
  说明：iOS 的 VPCameraType 只有 Exit/Enter/Photo，没有「设备主动进入」语义，
        deviceInitiated 恒为 false。
  */
 UNI_EXPORT_METHOD(@selector(startCamera:callback:))
 - (void)startCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    __weak typeof(self) weakSelf = self;
-    [pm veepooSDKSettingCameraType:VPCameraTypeEnter settingAndMonitorResult:^(VPCameraType cameraType) {
-        [weakSelf sendEvent:@"camera" data:@{ @"state": @(cameraType), @"deviceInitiated": @NO }];
-    }];
+    [self enterCameraMode];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
     r[@"supported"] = @YES;
     callback(r, NO);
@@ -2661,13 +3103,12 @@ UNI_EXPORT_METHOD(@selector(startCamera:callback:))
  退出相机遥控模式。
  iOS SDK：veepooSDKSettingCameraType:...（VPCameraTypeExit=0）
  Android：stopCamera(...)；JS：joemeWatch.stopCamera()
- 事件：on('camera') -> { state, deviceInitiated }
+ 事件：on('camera') -> { state, status, deviceInitiated }
  */
 UNI_EXPORT_METHOD(@selector(stopCamera:callback:))
 - (void)stopCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSettingCameraType:VPCameraTypeExit settingAndMonitorResult:^(VPCameraType cameraType) {}];
-    [self sendEvent:@"camera" data:@{ @"state": @(VPCameraTypeExit), @"deviceInitiated": @NO }];
+    [self exitCameraMode];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
     r[@"supported"] = @YES;
     callback(r, NO);
@@ -2925,7 +3366,8 @@ UNI_EXPORT_METHOD(@selector(readAllHealthData:callback:))
    ② 读完后用 VPDataBaseOperation 按「每一天」查库：
       veepooSDKGetDeviceRunningDataWithDate:andTableID:（queryDate 传 yyyy-MM-dd）。
       按天查的好处是日索引由我们确定（day 是查询参数），不依赖设备 RTC 写进记录里的日期
-      —— 设备时钟错时 head.date 会整年偏差，页面正是靠 day 索引落缓存。
+      —— 设备时钟错时 head.date 会整年偏差。head 同时带 day 和 date：页面优先用 date，
+      只在 date 不可信（年份 < 2000 / 与手机今天差超过 -1~180 天）时才退回 day 推出的日期。
  单位换算（库 → Android 口径）：
    totalDis 是米 → distance 给公里；totalCal 是 cal → kcal 要 ÷1000；
    oneMinuteData 里 disValue 仍是米、calValue 仍是 cal（页面逐分钟那侧自己 ÷1000）。
@@ -5095,24 +5537,27 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
 // iOS 的「读」几乎都是「同一个 settingMode 传 2/Read」拿回模型，所以这里都是
 // 一次调用 + 模型转事件；只有健康提醒是一次读全部类型、逐条回调。
 
-/** iOS 8 位重复串（十进制字符串）-> Android/JS 的 7 位「周一..周日」串 */
+/** iOS 8 位重复串（十进制字符串）-> Android/JS 的 7 位「周日..周一」串 */
 - (NSString *)androidRepeatFromIOSState:(NSString *)state {
     NSInteger v = [state isKindOfClass:[NSString class]] ? [state integerValue] : 0;
     NSMutableString *out = [NSMutableString string];
-    // b[7]=周一 … b[1]=周日（头文件：开头一位恒 0，最后一位是周一）
-    for (NSInteger bit = 7; bit >= 1; bit--) {
+    // 头文件：bit0=周一 … bit6=周日，bit7 恒 0（示例 00000011=周一+周二=3）。
+    // JS 的 7 位串是 charAt(0)=周日 … charAt(6)=周一，即 charAt(i) 取 bit(6-i)，
+    // 所以从 bit6 往 bit0 依次追加，共 7 位。
+    for (NSInteger bit = 6; bit >= 0; bit--) {
         [out appendString:((v >> bit) & 1) ? @"1" : @"0"];
     }
     return out;
 }
 
-/** Android/JS 的 7 位「周一..周日」串 -> iOS 8 位重复串（十进制字符串） */
+/** Android/JS 的 7 位「周日..周一」串 -> iOS 8 位重复串（十进制字符串） */
 - (NSString *)iosRepeatStateFromAndroid:(NSString *)repeat {
     if (![repeat isKindOfClass:[NSString class]] || repeat.length < 7) return @"0";
     NSInteger v = 0;
     for (NSInteger i = 0; i < 7; i++) {
         unichar c = [repeat characterAtIndex:i];
-        if (c == '1') v |= (1 << (7 - i));
+        // charAt(6)=周一=bit0 … charAt(0)=周日=bit6
+        if (c == '1') v |= (1 << (6 - i));
     }
     return [NSString stringWithFormat:@"%ld", (long)v];
 }
@@ -5141,7 +5586,26 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
         if (va == vb) return NSOrderedSame;
         return va < vb ? NSOrderedAscending : NSOrderedDescending;
     }];
+    // 留一份快照：新增闹钟时据此挑空闲 ID（否则固定传 1 会覆盖已有闹钟）。
+    // 只有拿到数组才更新，避免失败路径把缓存冲成空表导致下次新增又用回 ID 1。
+    if ([alarmArray isKindOfClass:[NSArray class]]) self.lastTextAlarms = list;
     return list;
+}
+
+/**
+ 下一个可用的闹钟 ID：取已用 ID 里最小的空缺（1~10），都占满时返回 1。
+ 设备侧 ID 范围是 1-10（ALARM_FULL），所以按这个区间找空位。
+ */
+- (NSString *)nextTextAlarmId {
+    NSMutableSet<NSNumber *> *used = [NSMutableSet set];
+    for (NSDictionary *a in self.lastTextAlarms) {
+        NSInteger v = [a[@"alarmId"] integerValue];
+        if (v > 0) [used addObject:@(v)];
+    }
+    for (NSInteger i = 1; i <= 10; i++) {
+        if (![used containsObject:@(i)]) return [NSString stringWithFormat:@"%ld", (long)i];
+    }
+    return @"1";
 }
 
 /** 从 options 构造 iOS 文本闹钟模型（增/改/删共用） */
@@ -6130,33 +6594,8 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
     }];
 }
 
-/**
- 打开 App 内相机页（手表遥控拍照）。
- iOS 端未实现原生相机预览页（需要 AVCaptureSession + 自定义 UI，超出 SDK 桥接范围），
- Android 的 openCameraScreen 承担的是「App 内预览 + 手表快门」这条链路，iOS 没有等价实现。
- JS：joemeWatch.openCameraScreen()
- 返回：{ code:-2, supported:false, message }，调用方需回退到 startCamera + 系统相机。
- */
-UNI_EXPORT_METHOD(@selector(openCameraScreen:callback:))
-- (void)openCameraScreen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    NSMutableDictionary *r = [resultWithCode(-2) mutableCopy];
-    r[@"supported"] = @NO;
-    r[@"message"] = @"iOS 端未实现 App 内相机预览，请用 startCamera + 系统相机";
-    callback(r, NO);
-}
-
-/** 关闭 App 内相机页（iOS 无该页面）：顺手让手表退出拍照模式，接口保持幂等。 */
-UNI_EXPORT_METHOD(@selector(closeCameraScreen:callback:))
-- (void)closeCameraScreen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if ([VPBleCentralManage sharedBleManager].peripheralManage) {
-        [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDKSettingCameraType:VPCameraTypeExit
-                                                                 settingAndMonitorResult:^(VPCameraType cameraType) {}];
-    }
-    [self sendEvent:@"cameraScreen" data:@{ @"open": @NO, @"count": @0, @"closedByWatch": @NO }];
-    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
-    r[@"supported"] = @NO;
-    callback(r, NO);
-}
+// 注：openCameraScreen / closeCameraScreen 与 capturePhoto 一起放在第 7 节「相机遥控」，
+// 避免两处重复定义同一个 selector（UNI_EXPORT_METHOD 重复注册会互相覆盖）。
 
 /**
  GPS 实时上报开关（运动中手表每秒回报定位点）。

@@ -79,8 +79,12 @@ echo "输出:       $FW"
 echo
 
 # ── 收集源码 ─────────────────────────────────────────────────────────
+# 插件根目录的 .m 全部编译：JoemeWatchModule.m 是插件本体，JoemeCamera* 是
+# 手表遥控拍照链路（相册落盘 / 静默拍照 / App 内相机页）。
 SOURCES=()
-[ -f "$IOS_DIR/$FRAMEWORK_NAME.m" ] && SOURCES+=("$IOS_DIR/$FRAMEWORK_NAME.m")
+for f in "$IOS_DIR"/*.m; do
+  [ -f "$f" ] && SOURCES+=("$f")
+done
 for d in FMDB MJExtension; do
   if [ -d "$IOS_DIR/$d" ]; then
     while IFS= read -r f; do SOURCES+=("$f"); done < <(find "$IOS_DIR/$d" -name '*.m' | sort)
@@ -172,7 +176,9 @@ DEFINED="$(nm -g "$BIN" 2>/dev/null | grep -E '^[0-9a-f]{8,} ' || true)"
 # 管道整体返回 141 —— 于是「符号存在」被判成缺失（实测：FMDatabaseQueue 偶发误报）。
 contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 fail=0
-for sym in _OBJC_CLASS_\$_JoemeWatchModule _OBJC_CLASS_\$_FMDatabaseQueue _OBJC_CLASS_\$_MJProperty; do
+for sym in _OBJC_CLASS_\$_JoemeWatchModule _OBJC_CLASS_\$_FMDatabaseQueue _OBJC_CLASS_\$_MJProperty \
+           _OBJC_CLASS_\$_JoemeCameraViewController _OBJC_CLASS_\$_JoemeCameraCapture \
+           _OBJC_CLASS_\$_JoemeCameraStore; do
   if contains "$DEFINED" "$sym"; then
     echo "  ✓ $sym"
   else
