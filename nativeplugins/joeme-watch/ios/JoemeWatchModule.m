@@ -6145,6 +6145,7 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
  写入个性化设置（逐字段下发对应的基本开关）。
  options 与 Android changeCustomSetting 完全一致：
    { heart, temperature, unit:'C'|'F', glucose, glucoseUnit:'mmol'|'mgdl',
+     uricAcidUnit:'umol'|'mgdl', bloodFatUnit:'mmol'|'mgdl',
      hrv, spo2Low, bloodComponent, sleep, stress, fall, metric }
  JS：joemeWatch.setCustomSetting({...}) -> on('customSettingRead')（写完后回读一次）
  说明：iOS 没有整包写接口，也只能逐条下发；写完后自动调一次 readCustomSetting 回读，
