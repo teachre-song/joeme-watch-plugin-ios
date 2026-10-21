@@ -1887,7 +1887,8 @@ UNI_EXPORT_METHOD(@selector(setOxygenApnea:callback:))
 
 /**
  健康提醒（久坐/喝水/远眺等）。options: { type, on, startHour?, startMinute?, endHour?, endMinute?, interval? }
-   type: 'longSeat' | 'drink' | 'lookFar' | 'sport' | 'medicine' | 'read' | 'trip' | 'washHands'
+   type: 'longSeat' | 'drink' | 'sports' | 'medicine' | 'reading' | 'out' | 'wash' | 'overlook'
+         （同时兼容 iOS 旧别名: sport/read/trip/washHands/lookFar）
  iOS SDK：veepooSDKSettingHealthRemindWithRemindType:opCode:remindModel:resultBlock:deviceInfoDidChangeBlock:
           （opCode 1=设置 2=读取）
  Android：settingHealthRemind(...)；JS：joemeWatch.setHealthRemind(type, options)
@@ -1898,28 +1899,50 @@ UNI_EXPORT_METHOD(@selector(setHealthRemind:callback:))
     if (![self checkReady:callback]) return;
     NSString *type = options[@"type"];
     VPDeviceHealthRemindType rt = VPDeviceHealthRemindTypeLongSeat;
+    BOOL typeValid = YES;
     if ([type isEqualToString:@"longSeat"]) rt = VPDeviceHealthRemindTypeLongSeat;
     else if ([type isEqualToString:@"drink"]) rt = VPDeviceHealthRemindTypeDrinkWater;
-    else if ([type isEqualToString:@"lookFar"]) rt = VPDeviceHealthRemindTypeLookFarAway;
-    else if ([type isEqualToString:@"sport"]) rt = VPDeviceHealthRemindTypeSport;
+    else if ([type isEqualToString:@"sports"] || [type isEqualToString:@"sport"]) rt = VPDeviceHealthRemindTypeSport;
     else if ([type isEqualToString:@"medicine"]) rt = VPDeviceHealthRemindTypeTakeMedicine;
-    else if ([type isEqualToString:@"read"]) rt = VPDeviceHealthRemindTypeRead;
-    else if ([type isEqualToString:@"trip"]) rt = VPDeviceHealthRemindTypeTrip;
-    else if ([type isEqualToString:@"washHands"]) rt = VPDeviceHealthRemindTypeWashHands;
+    else if ([type isEqualToString:@"reading"] || [type isEqualToString:@"read"]) rt = VPDeviceHealthRemindTypeRead;
+    else if ([type isEqualToString:@"out"] || [type isEqualToString:@"trip"]) rt = VPDeviceHealthRemindTypeTrip;
+    else if ([type isEqualToString:@"wash"] || [type isEqualToString:@"washHands"]) rt = VPDeviceHealthRemindTypeWashHands;
+    else if ([type isEqualToString:@"overlook"] || [type isEqualToString:@"lookFar"]) rt = VPDeviceHealthRemindTypeLookFarAway;
+    else typeValid = NO;
 
+    if (!typeValid) {
+        callback(@{ @"code": @(-1), @"message": [NSString stringWithFormat:@"不支持的健康提醒类型：%@", type ?: @""] }, NO);
+        return;
+    }
+
+    // on 缺省与 Android 一致（默认开）；时间/间隔缺省给 0，由 SDK 处理
+    BOOL on = (options[@"on"] == nil) ? YES : [options[@"on"] boolValue];
     VPDeviceHealthRemindModel *m = [[VPDeviceHealthRemindModel alloc] init];
     m.type = rt;
-    m.open = [options[@"on"] boolValue];
+    m.open = on;
     m.startHour = [options[@"startHour"] unsignedCharValue];
     m.startMinute = [options[@"startMinute"] unsignedCharValue];
     m.endHour = [options[@"endHour"] unsignedCharValue];
     m.endMinute = [options[@"endMinute"] unsignedCharValue];
     m.remindInterval = [options[@"interval"] unsignedCharValue];
+
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    [pm veepooSDKSettingHealthRemindWithRemindType:rt opCode:1 remindModel:m resultBlock:^(BOOL success, BOOL complete, VPDeviceHealthRemindModel *successModel) {
-        [self sendEvent:@"healthRemind" data:@{ @"ok": @(success), @"type": type ?: @"" }];
+    __weak typeof(self) weakSelf = self;
+    __block BOOL cbFired = NO;
+    void (^fireCb)(BOOL ok) = ^(BOOL ok) {
+        if (cbFired) return;
+        cbFired = YES;
+        [weakSelf sendEvent:@"healthRemind" data:@{ @"ok": @(ok), @"type": type ?: @"" }];
         callback(resultWithCode(200), NO);
+    };
+
+    [pm veepooSDKSettingHealthRemindWithRemindType:rt opCode:1 remindModel:m resultBlock:^(BOOL success, BOOL complete, VPDeviceHealthRemindModel *successModel) {
+        fireCb(success);
     } deviceInfoDidChangeBlock:^(VPDeviceHealthRemindModel *changeModel) {}];
+
+    // 设备不回包时 10 秒兜底，避免 JS Promise 永久挂起
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ fireCb(NO); });
 }
 
 /**
