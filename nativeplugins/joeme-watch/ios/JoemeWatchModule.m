@@ -3000,7 +3000,7 @@ UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
         d[@"days"] = @(totalDays);
         d[@"startDay"] = @(firstDay);
         d[@"count"] = @(recordTotal);
-        [weakSelf sendEvent:@"runningData" d];
+        [weakSelf sendEvent:@"runningData" data:d];
 
         NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
         r[@"days"] = @(totalDays);
