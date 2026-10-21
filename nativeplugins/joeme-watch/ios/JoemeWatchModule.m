@@ -63,6 +63,8 @@
 #import <VeepooBleSDK/VPDeviceMarketDialModel.h>
 #import <VeepooBleSDK/VPTCMTestDataModel.h>
 #import <VeepooBleSDK/VPPttValueModel.h>
+#import <VeepooBleSDK/VPDeviceSportWithGPSModel.h>
+#import <VeepooBleSDK/VPDeviceSportModel.h>
 
 @interface JoemeWatchModule ()
 
@@ -126,6 +128,13 @@
 - (void)handleCameraType:(VPCameraType)type;
 - (void)capturePhotoSilentlyInto:(NSMutableDictionary *)cameraEvent;
 - (BOOL)presentCameraScreenNotifyWatch:(BOOL)notifyWatch;
+
+// 个性化设置 / 单位 / 天气（第 6 节实现）：显式声明，避免后向调用告警
+- (void)readBaseSwitch:(VPSettingBaseFunctionSwitchType)type
+                  done:(void (^)(VPSettingFunctionCompleteState state))done;
+- (NSString *)functionStateName:(VPSettingFunctionCompleteState)state;
+- (NSString *)unitNameOf:(NSString *)state first:(NSString *)first second:(NSString *)second;
+- (VPSettingBaseFunctionSwitchType)baseFunctionTypeForKey:(NSString *)key;
 
 @end
 
@@ -255,6 +264,15 @@ UNI_EXPORT_METHOD(@selector(initWatch:callback:))
 
     // 前后台标记（相机静默拍照要判断 App 是否在前台）
     JoemeStartAppStateTracking();
+
+    // 经典蓝牙（通话通道）自动配对/自动连接。
+    // SDK 默认即 YES，但显式写一行防止未来版本默认值变更导致 iOS 上 BT 不自动连。
+    // iOS 13 以下 SDK 不支持自动连 BT，届时由 VPBTConnectStateChangeBlock 上报 disconnected，
+    // 电话页据此提示用户去系统蓝牙手动配对。
+    if (@available(iOS 13.0, *)) {
+        manager.isAutoConnectBT = YES;
+    }
+    manager.isAutoShowPair = YES;
 
     // 手机系统蓝牙开关状态监听 -> on('bluetooth')
     manager.VPBleCentralManageChangeBlock = ^(VPCentralManagerState state) {
@@ -2472,20 +2490,84 @@ UNI_EXPORT_METHOD(@selector(setSocialMsg:callback:))
 }
 
 /**
- 读取消息推送开关。
- iOS 没有「主动读」接口：开关随验密一起下发（deviceAncsData / deviceAncsDataTwo），
- 所以这里直接回最近的快照，并补发一次 socialMsg 事件，保证页面拿到完整结构。
- JS: joemeWatch.readSocialMsg()
+ 读取消息推送开关（主动逐类型读，不再只读 ANCS 缓存快照）。
+ SDK 头文件 VPPeripheralBaseManage.h 写明 veepooSDKSettingMessageType:settingState:
+   同时支持「设置」和「读取」：settingState 传 VPReadFunctionState(0) 即读该类型。
+   回 completeBlock(state)：0=设备无此功能(UNSUPPORT)，1=已开，2=已关，3=读取失败。
+ 注意：completeBlock 只回 state、不回 messageType，无法并发对应到 key，
+   所以这里**串行下发**（读一个、回包、再读下一个），保证回包顺序=发送顺序。
+ JS: joemeWatch.readSocialMsg() -> resolve { sms:'SUPPORT_OPEN', smsOpen:@YES, ... }
+ 事件：on('socialMsg') -> 同上（整包）
+ 超时：总时长 6 秒兜底（与页面 load() 的 6s toast 对齐），超时后用已读结果 + ANCS 快照合并回调。
  */
 UNI_EXPORT_METHOD(@selector(readSocialMsg:callback:))
 - (void)readSocialMsg:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSDictionary *d = [self socialMsgFromPeripheral];
-    [self sendEvent:@"socialMsg" data:d];
-    NSMutableDictionary *r = [NSMutableDictionary dictionaryWithDictionary:d];
-    r[@"code"] = @200;
-    r[@"cached"] = @YES;
-    callback(r, NO);
+
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+
+    // 页面 notify.vue ROWS 涉及的 key；call 顺手带上，与 Android socialMsgObj 结构对齐
+    NSArray<NSString *> *keys = @[
+        @"call", @"sms", @"wechat", @"qq", @"sina", @"facebook", @"twitter",
+        @"flickr", @"linkin", @"whatsapp", @"line", @"instagram", @"snapchat",
+        @"skype", @"gmail", @"dingding", @"wxwork", @"other",
+        @"tiktok", @"telegram", @"connected2", @"kakao", @"shieldPolice", @"messenger"
+    ];
+
+    // 兜底打底：先用 ANCS 缓存快照填一遍，主动读失败/超时的项不至于全空
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    [result addEntriesFromDictionary:[self socialMsgFromPeripheral]];
+
+    NSMutableArray<NSString *> *queue = [NSMutableArray array];
+    for (NSString *key in keys) {
+        VPSettingMessageSwitchType mt;
+        if (JoemeMessageTypeFromKey(key, &mt)) [queue addObject:key];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    __block BOOL finished = NO;
+    void (^finish)(void) = ^{
+        if (finished) return;
+        finished = YES;
+        NSMutableDictionary *r = [result mutableCopy];
+        r[@"code"] = @200;
+        r[@"readActive"] = @YES;
+        [weakSelf sendEvent:@"socialMsg" data:r];
+        callback(r, NO);
+    };
+
+    // 总超时：6 秒没读完就用已读结果回调（页面自己也有 6s toast 兜底）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(); });
+
+    // 串行递归：读 queue.firstObject，回包后取下一个
+    void (^__block next)(void);
+    next = ^void(void) {
+        if (finished || queue.count == 0) { finish(); return; }
+        NSString *key = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        VPSettingMessageSwitchType mt;
+        if (!JoemeMessageTypeFromKey(key, &mt)) { next(); return; }
+
+        [pm veepooSDKSettingMessageType:mt settingState:VPReadFunctionState completeBlock:^(VPSettingFunctionCompleteState state) {
+            // state: 0=Unknown(无此功能) 1=Open 2=Close 3=Failure
+            // Failure(3) 不覆盖快照值；Unknown/Open/Close 用主动读结果
+            if (state != VPFunctionCompleteFailure) {
+                NSString *st;
+                BOOL open;
+                switch (state) {
+                    case VPFunctionCompleteOpen:  st = @"SUPPORT_OPEN";  open = YES;  break;
+                    case VPFunctionCompleteClose: st = @"SUPPORT_CLOSE"; open = NO;   break;
+                    case VPFunctionCompleteUnknown:
+                    default:                     st = @"UNSUPPORT";     open = NO;   break;
+                }
+                result[key] = st;
+                result[[key stringByAppendingString:@"Open"]] = @(open);
+            }
+            next();
+        }];
+    };
+    next();
 }
 
 /**
@@ -2636,19 +2718,25 @@ UNI_EXPORT_METHOD(@selector(setSOS:callback:))
 /**
  读取经典蓝牙状态。
  iOS SDK：无独立读取接口，状态由 VPBTConnectStateChangeBlock 持续上报并被本模块缓存
- JS：joemeWatch.readBTInfo() -> resolve { state, connected, btOpen, audioOpen }
+ JS：joemeWatch.readBTInfo() -> resolve { state, connected, btOpen, audioOpen, pending? }
  事件：on('btInfo')
+ 差异：若 block 还没上报过任何状态（lastBTInfo==nil），不回默认 disconnected，
+      而是回 pending:YES —— 电话页据此保持上次 UI，等 block 真正回调再刷新，
+      避免刚进页面时把"已配对但状态未同步"误显示成"未连接"。
  */
 UNI_EXPORT_METHOD(@selector(readBTInfo:callback:))
 - (void)readBTInfo:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSDictionary *d = self.lastBTInfo ?: @{
-        @"state": @"disconnected", @"connected": @NO,
-        @"status": @"DISCONNECTED", @"btOpen": @NO, @"audioOpen": @NO
-    };
-    [self sendEvent:@"btInfo" data:d];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
-    [r addEntriesFromDictionary:d];
+    if (self.lastBTInfo) {
+        [r addEntriesFromDictionary:self.lastBTInfo];
+        [self sendEvent:@"btInfo" data:self.lastBTInfo];
+    } else {
+        // 还没拿到任何状态：不发 btInfo 事件、不回 disconnected，只回 pending
+        r[@"pending"] = @YES;
+        r[@"state"] = @"unknown";
+        r[@"connected"] = @(NO);
+    }
     callback(r, NO);
 }
 
@@ -2677,17 +2765,29 @@ UNI_EXPORT_METHOD(@selector(setBTStatus:callback:))
  iOS SDK：veepooSDK_openDeviceBTSwitch（开启开关即可触发系统配对）
  JS：joemeWatch.connectBT({ on })
  事件：on('btStatus')
- 差异：iOS 无按 mac 连接/断开的接口，on=false 时不做任何事（返回 sent:false）。
+ 差异：iOS 无按 mac 连接/断开的接口。
+   - on=true：调 veepooSDK_openDeviceBTSwitch 触发系统配对，返回 sent:true。
+   - on=false：iOS 不允许 App 主动断开经典蓝牙（系统蓝牙配对由用户在
+     「设置 → 蓝牙」里管理），这里返回 unsupported:YES + reason:@"system"，
+     电话页据此弹引导让用户去系统蓝牙忽略设备，而不是静默 no-op。
  */
 UNI_EXPORT_METHOD(@selector(connectBT:callback:))
 - (void)connectBT:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     BOOL on = options && options[@"on"] ? [options[@"on"] boolValue] : YES;
+    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
     if (on) {
         [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_openDeviceBTSwitch];
+        r[@"sent"] = @(YES);
+        r[@"ok"] = @(YES);
+    } else {
+        // iOS 无法在 App 内断开经典蓝牙
+        r[@"sent"] = @(NO);
+        r[@"ok"] = @(NO);
+        r[@"unsupported"] = @(YES);
+        r[@"reason"] = @"system";
+        r[@"message"] = @"iOS 需在系统蓝牙设置中断开";
     }
-    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
-    r[@"sent"] = @(on);
     callback(r, NO);
 }
 
@@ -3434,6 +3534,31 @@ UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
             }];
         }
 
+        // GPS 运动表：老接口 veepooSDKStartReadDeviceRunningData 只读普通运动，
+        // GPS 表（isHasGpsInfo=true 的那些）要走 readDeviceSportCRCArr + readDeviceSportWithCRC。
+        // 对应 Android 的 onGPSWatchSportModeHeadChange 回调。两条事件同一次读取里发，
+        // 页面按 day 归属到同一条记录。
+        if (weakSelf.sportReadSeq == seq) {
+            [pm readDeviceSportCRCArr:^(bool success, NSArray<NSNumber *> *crcArr) {
+                if (!success || crcArr.count == 0) return;
+                if (weakSelf.sportReadSeq != seq) return;
+                [pm readDeviceSportWithCRC:crcArr result:^(NSArray<VPDeviceSportModel *> *normalArr, NSArray<VPDeviceSportWithGPSModel *> *gpsArr) {
+                    if (weakSelf.sportReadSeq != seq) return;
+                    for (VPDeviceSportWithGPSModel *m in gpsArr) {
+                        NSInteger day = [weakSelf dayIndexFromTimestamp:m.startTimestamp];
+                        if (day == NSNotFound || day < firstDay || day >= endDay) continue;
+                        NSDictionary *head = [weakSelf gpsHeadFromGPSModel:m day:day];
+                        if (!head) continue;
+                        [weakSelf sendEvent:@"runningData" data:@{ @"head": head }];
+                        NSArray *items = [weakSelf gpsItemsFromGPSModel:m head:head day:day];
+                        if (items.count > 0) {
+                            [weakSelf sendEvent:@"runningData" data:@{ @"items": items, @"day": @(day) }];
+                        }
+                    }
+                }];
+            }];
+        }
+
         // CRC 列表：页面不需要，保留给排查「设备上到底存了几组」
         if (weakSelf.sportReadSeq == seq) {
             [pm veepooSDK_readDeviceRunningCrcResult:^(NSArray *crcValues) {
@@ -3545,6 +3670,155 @@ UNI_EXPORT_METHOD(@selector(readDeviceRunningData:callback:))
             @"kcal": @(JoemeInt(m[@"calValue"])),       // cal（页面 ÷1000）
             @"beathPause": @(JoemeInt(m[@"isPause"]))
         }];
+    }
+    return out;
+}
+
+#pragma mark - GPS 运动表（VPDeviceSportWithGPSModel）
+
+/**
+ * 时间戳（秒）-> day 索引（0=今天，1=昨天…）。超出设备存储范围返回 NSNotFound。
+ * 与 dateStrForDay 同口径：按本地日历的年月日差算，不涉及时区换算。
+ */
+- (NSInteger)dayIndexFromTimestamp:(NSTimeInterval)ts {
+    if (ts <= 0) return NSNotFound;
+    NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateComponents *diff = [cal components:(NSCalendarUnitDay) fromDate:[NSDate date] toDate:date options:0];
+    NSInteger day = -diff.day;   // ts 在过去 -> diff.day 为负 -> day 为正
+    if (day < 0) return NSNotFound;
+    return day;
+}
+
+/**
+ * 时间戳（秒）-> "yyyy-MM-dd HH:mm:ss"。
+ */
+- (NSString *)dateTimeStringFromTimestamp:(NSTimeInterval)ts {
+    if (ts <= 0) return @"";
+    NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    return [fmt stringFromDate:date];
+}
+
+/**
+ * VPDeviceSportWithGPSModel -> Android 同形 head（含 GPS 表独有的心率/配速/速度/步频极值、
+ * 海拔、累计爬升/下降）。单位换算：
+ *   dis      m -> distance(km) + distanceM(m)
+ *   cal      cal -> kcal(千卡)
+ *   altitude/cm -> m
+ *   cumulativeClimb/Decline/cm -> m
+ * showType: 1/2/5/6 有 GPS；5/6/7 有海拔（见 VPDeviceSportWithGPSModel.h）。
+ */
+- (NSDictionary *)gpsHeadFromGPSModel:(VPDeviceSportWithGPSModel *)m day:(NSInteger)day {
+    if (!m) return nil;
+    BOOL hasGps = (m.showType == 1 || m.showType == 2 || m.showType == 5 || m.showType == 6);
+    BOOL haveAlt = (m.showType == 5 || m.showType == 6 || m.showType == 7);
+
+    NSString *begin = [self dateTimeStringFromTimestamp:m.startTimestamp];
+    NSString *end = [self dateTimeStringFromTimestamp:m.stopTimestamp];
+    NSDictionary *b = [self hourMinuteSecondFromString:begin];
+    NSDictionary *e = [self hourMinuteSecondFromString:end];
+
+    NSMutableDictionary *h = [NSMutableDictionary dictionary];
+    h[@"day"] = @(day);
+    h[@"sportType"] = @(m.sportType);
+    h[@"date"] = begin.length >= 10 ? [begin substringToIndex:10] : @"";
+    h[@"startHour"] = b[@"hour"] ?: @0;
+    h[@"startMinute"] = b[@"minute"] ?: @0;
+    h[@"startSecond"] = b[@"second"] ?: @0;
+    h[@"stopHour"] = e[@"hour"] ?: @0;
+    h[@"stopMinute"] = e[@"minute"] ?: @0;
+    h[@"stopSecond"] = e[@"second"] ?: @0;
+    h[@"stepCount"] = @(m.step);
+    h[@"sportTime"] = @(m.duration);
+    h[@"distanceM"] = @(m.dis);
+    h[@"distance"] = @(round(m.dis) / 1000.0);
+    h[@"kcal"] = @(round(m.cal) / 1000.0);
+    h[@"recordCount"] = @(m.recordCount);
+    h[@"pauseCount"] = @(m.pauseCount);
+    h[@"pauseTime"] = @(m.pauseDuration);
+    h[@"peisu"] = @(m.avePace);
+    h[@"averRate"] = @(m.aveHeart);
+    h[@"sportCount"] = @(m.sport);
+    h[@"oxsporttimes"] = @(m.aerobicCount);
+    h[@"hasGpsInfo"] = @(hasGps);
+    // 心率 / 配速 / 速度 / 步频 整场极值与均值
+    h[@"maxHeartRate"] = @(m.maxHeart);
+    h[@"minHeartRate"] = @(m.minHeart);
+    h[@"avgHeartRate"] = @(m.aveHeart);
+    h[@"maxPace"] = @(m.maxPace);
+    h[@"minPace"] = @(m.minPace);
+    h[@"avgPace"] = @(m.avePace);
+    h[@"maxSpeed"] = @(m.maxSpeed);
+    h[@"minSpeed"] = @(m.minSpeed);
+    h[@"avgSpeed"] = @(m.aveSpeed);
+    h[@"maxCadence"] = @(m.maxCadence);
+    h[@"minCadence"] = @(m.minCadence);
+    h[@"avgCadence"] = @(m.aveCadence);
+    // 海拔：cm -> m
+    h[@"haveAltitude"] = @(haveAlt);
+    h[@"maxAltitude"] = @(m.maxAltitude / 100.0);
+    h[@"minAltitude"] = @(m.minAltitude / 100.0);
+    h[@"avgAltitude"] = @(m.aveAltitude / 100.0);
+    h[@"cumulativeClimb"] = @(m.cumulativeClimb / 100.0);
+    h[@"cumulativeDecline"] = @(m.cumulativeDecline / 100.0);
+    h[@"dataType"] = @(m.showType);
+    // a7ProtectSportType：Android SDK 特有字段（A7 芯片保护的子运动类型），iOS 无对应属性，
+    // 用 showType 顶上（页面主要拿 dataType 判断有无海拔/GPS）
+    h[@"a7ProtectSportType"] = @(m.showType);
+    h[@"raw"] = [NSString stringWithFormat:
+                 @"SportWithGPSModel{type=%d, begin=%@, end=%@, step=%u, dis=%u m, cal=%u cal, time=%u s, showType=%d}",
+                 m.sportType, begin, end, m.step, m.dis, m.cal, m.duration, m.showType];
+    return h;
+}
+
+/**
+ * VPDeviceSportWithGPSModel.minutes -> items 数组（含逐分钟海拔与抽稀后的 GPS 轨迹点）。
+ * GPS 轨迹点每分钟最多保留 12 个（≈5 秒一个），与 Android GPS_POINTS_PER_MINUTE 一致，
+ * 避免整场几千个点把 JS 存储撑爆。
+ */
+- (NSArray *)gpsItemsFromGPSModel:(VPDeviceSportWithGPSModel *)m head:(NSDictionary *)head day:(NSInteger)day {
+    if (!m.minutes) return @[];
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:m.minutes.count];
+    NSInteger allMinute = (NSInteger)m.minutes.count;
+    for (NSInteger i = 0; i < allMinute; i++) {
+        VPDSOneMinuteModel *mm = m.minutes[i];
+        if (![mm isKindOfClass:[VPDSOneMinuteModel class]]) continue;
+        NSMutableDictionary *item = [NSMutableDictionary dictionary];
+        item[@"day"] = @(day);
+        item[@"date"] = head[@"date"] ?: @"";
+        item[@"startHour"] = head[@"startHour"] ?: @0;
+        item[@"startMinute"] = head[@"startMinute"] ?: @0;
+        item[@"startSecond"] = head[@"startSecond"] ?: @0;
+        item[@"minute"] = @(i);
+        item[@"allMinute"] = @(allMinute);
+        item[@"rate"] = @(mm.heart);
+        item[@"stepCount"] = @(mm.step);
+        item[@"sportCount"] = @(mm.sport);
+        item[@"distance"] = @(mm.dis);   // 米
+        item[@"kcal"] = @(mm.cal);       // cal（页面 ÷1000）
+        item[@"beathPause"] = @(mm.pause);
+        // 逐分钟海拔（cm -> m）
+        if (mm.altitude != 0) item[@"altitude"] = @(mm.altitude / 100.0);
+
+        // GPS 轨迹点抽稀
+        if (mm.gpsDatas.count > 0) {
+            NSMutableArray *lats = [NSMutableArray array];
+            NSMutableArray *lngs = [NSMutableArray array];
+            NSUInteger total = mm.gpsDatas.count;
+            NSUInteger keep = MIN(total, 12);
+            for (NSUInteger k = 0; k < keep; k++) {
+                NSUInteger idx = (total <= 1) ? 0 : (NSUInteger)round(k * (total - 1) / (double)(keep - 1));
+                VPDSMinuteGPSModel *g = mm.gpsDatas[idx];
+                [lats addObject:@(g.latitude)];
+                [lngs addObject:@(g.longitude)];
+            }
+            item[@"hasGpsInfo"] = @YES;
+            item[@"latArray"] = lats;
+            item[@"lngArray"] = lngs;
+        }
+        [out addObject:item];
     }
     return out;
 }
@@ -5148,10 +5422,23 @@ UNI_EXPORT_METHOD(@selector(readTemperatureSetting:callback:))
     r[@"supportUnitSetting"] = @(m.temperatureType > 0);
     r[@"supportAutoMeasure"] = @(m.temperatureType >= 2);
 
+    __block BOOL emitted = NO;   // 防重入：超时兜底与正常收尾只允许 emit 一次
+
     void (^emit)(void) = ^{
+        if (emitted) return;
+        emitted = YES;
         [weakSelf sendEvent:@"tempSetting" data:r];
         callback(r, NO);
     };
+
+    // 超时兜底：两个开关串行读，设备不回包时回调永不触发、页面 Promise 会一直 pending。
+    // 5 秒后先回一次已读到的部分（缺的字段页面按 null 处理，保留本地值）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (emitted) return;
+        r[@"timeout"] = @YES;
+        emit();
+    });
 
     // ① 读体温单位
     [pm veepooSDKSettingBaseFunctionType:VPSettingTemperatureUnit
@@ -6279,8 +6566,12 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
     NSArray<NSString *> *keys = @[ @"metric", @"temperature", @"glucose", @"uricAcid", @"bloodFat" ];
     __block NSUInteger idx = 0;
     __block void (^next)(void);
+    __block BOOL emitted = NO;         // 防重入：超时兜底与正常收尾只允许 emit 一次
+    __block NSUInteger timeoutCount = 0;
 
     void (^emit)(void) = ^{
+        if (emitted) return;
+        emitted = YES;
         NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
         NSString *metric = v[@"metric"];
         // metricSystem 只在读到确定值时给：读失败时缺省，页面保留原值而不是当成「非公制」
@@ -6294,10 +6585,11 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
         r[@"bloodGlucoseUnit"] = [weakSelf unitNameOf:v[@"glucose"] first:@"mmol_L" second:@"mg_dl"];
         r[@"uricAcidUnit"] = [weakSelf unitNameOf:v[@"uricAcid"] first:@"umol_L" second:@"mg_dl"];
         r[@"bloodFatUnit"] = [weakSelf unitNameOf:v[@"bloodFat"] first:@"mmol_L" second:@"mg_dl"];
-        // index=1 表示「单位字段可信」；任一读取失败就降为 0（与 Android 的帧语义对齐）
-        BOOL frameOk = (failed == 0);
+        // index=1 表示「单位字段可信」；任一读取失败/超时就降为 0（与 Android 的帧语义对齐）
+        BOOL frameOk = (failed == 0 && timeoutCount == 0);
         r[@"index"] = @(frameOk ? 1 : 0);
         r[@"unitFrame"] = @(frameOk);
+        if (timeoutCount > 0) r[@"timeout"] = @YES;
         // 能力位（iOS 用握手字段；weatherType==1 才有天气）。仅作诊断，页面不据此置灰。
         r[@"supportWeather"] = @(model.weatherType == 1);
         r[@"supportTemperatureUnit"] = @(model.temperatureType > 0);
@@ -6306,6 +6598,15 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
         [weakSelf sendEvent:@"unitSetting" data:r];
         callback(r, NO);
     };
+
+    // 超时兜底：5 个开关串行读，任一命令无回包会让整条链卡死、页面 Promise 永远 pending。
+    // 6 秒后无论如何先回一次已读到的部分（index 降为 0，页面就不会据此置灰/写回）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (emitted) return;
+        timeoutCount = MAX(timeoutCount, 1);
+        emit();
+    });
 
     next = ^{
         if (idx >= types.count) { emit(); return; }
