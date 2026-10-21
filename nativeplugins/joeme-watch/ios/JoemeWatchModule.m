@@ -1213,8 +1213,8 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
 /**
  ECG 结果字段（实时结果与历史记录共用，字段名对齐 Android 的 ecgResultExtra）。
  iOS 的数值字段都是 NSString，这里统一转成 NSNumber，页面不用再两边判类型。
- filterSignals / powers 保持 ADC 原值，页面用 ecgType + gain 换算 mV
- （Android 是原生算 mV，iOS 传增益让页面用 SDK 公式换算，见 ecg-cache.js）。
+ 波形给两种口径：filterSignals 是 ADC 原值（保留原样，排查用），
+ waveMv 是已按 ecgType/testType/gain 换算好的 mV —— 页面只认 waveMv。
  */
 - (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model {
     NSMutableDictionary *extra = [NSMutableDictionary dictionary];
@@ -1244,6 +1244,11 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     extra[@"powers"] = @[];               // iOS 侧无逐点信号质量，页面按默认值画
     extra[@"waveMv"] = [self ecgMvArrayFromModel:model signals:signals];
     extra[@"wavePoints"] = @(signals.count);
+    // 逐秒数组（Android 叫 detectHeart/detectHrv/detectQT，这里给同名键）。
+    // 详情页的「心率分布 / 最高最低心率」只认这三项；不映射的话 iOS 上永远是占位。
+    extra[@"detectHeart"] = [self ecgNumArrayFrom:model.hearts];
+    extra[@"detectHrv"]   = [self ecgNumArrayFrom:model.hrvs];
+    extra[@"detectQT"]    = [self ecgNumArrayFrom:model.qts];
     NSDate *tm = [self ecgDateFromModel:model];
     if (tm) extra[@"ts"] = @((long long)(tm.timeIntervalSince1970 * 1000));
     return extra;
@@ -1267,6 +1272,25 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     return out;
 }
 
+/**
+ 逐秒数组 -> NSNumber 数组。
+ Android 的 detectHeart/detectHrv/detectQT 是 int[]，iOS 这边 hearts/hrvs/qts 是 NSArray（元素可能是 NSNumber 也可能是 NSString）。
+ 页面只认数字，这里统一转一遍；非数字元素丢掉。
+ */
+- (NSArray<NSNumber *> *)ecgNumArrayFrom:(NSArray *)arr {
+    if (!arr || ![arr isKindOfClass:[NSArray class]]) return @[];
+    NSMutableArray<NSNumber *> *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (id v in arr) {
+        if ([v isKindOfClass:[NSNumber class]]) {
+            [out addObject:v];
+        } else if ([v isKindOfClass:[NSString class]]) {
+            NSNumber *n = @([(NSString *)v doubleValue]);
+            [out addObject:n];
+        }
+    }
+    return out;
+}
+
 /** model.date + testTime -> NSDate（yyyy-MM-dd HH:mm:ss，本地时区） */
 - (NSDate *)ecgDateFromModel:(VPECGTestDataModel *)model {
     if (!model.date.length) return nil;
@@ -1284,7 +1308,7 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
 /**
  实时波形增量下发。SDK 的 filterSignals 只追加不重置，用 ecgWaveIndex 记已发的长度。
  按 100ms 合帧（Demo 注释的推荐刷新节奏），收尾时 force 一次补发尾段。
- 发送的是 ADC 原始值 —— mV 换算交给页面（iOS SDK 的换算函数是 ObjC 侧 API）。
+ 发送的是 mV（与 Android 的 ecgWave 同口径，页面直接用，不再自己换算）。
  */
 - (void)flushEcgWave:(VPECGTestDataModel *)model force:(BOOL)force {
     if (!model || !model.filterSignals.count) return;
@@ -4354,6 +4378,36 @@ UNI_EXPORT_METHOD(@selector(readManualData:callback:))
             }
             [weakSelf sendEvent:@"manualData.spo2" data:@{ @"list": list }];
         }
+        // 压力（手动测量通道）。页面 index.vue 按 Android 的 toString 文本解析
+        // （正则抠 pressure / timeStamp），所以这里给同形文本 + 结构化 list 两份。
+        if (m.stressArr.count > 0) {
+            NSMutableArray *list = [NSMutableArray array];
+            NSMutableString *text = [NSMutableString stringWithString:@"["];
+            for (VPManualStressModel *r in m.stressArr) {
+                [list addObject:@{
+                    @"ts": @((long long)r.timestamp * 1000LL),
+                    @"pressure": @(r.value)
+                }];
+                [text appendFormat:@"PressureManualData{timeStamp=%u, pressure=%d}, ",
+                 r.timestamp, r.value];
+            }
+            [text appendString:@"]"];
+            [weakSelf sendEvent:@"manualData.stress" data:@{ @"list": list, @"data": text }];
+        }
+        // 梅脱（手动测量通道）。同上：页面按 'meto' 和 'timeStamp' 两个字段名抠值。
+        if (m.metArr.count > 0) {
+            NSMutableArray *list = [NSMutableArray array];
+            NSMutableString *text = [NSMutableString stringWithString:@"["];
+            for (VPManualMetModel *r in m.metArr) {
+                [list addObject:@{
+                    @"ts": @((long long)r.timestamp * 1000LL),
+                    @"meto": @(r.value)
+                }];
+                [text appendFormat:@"MetoManualData{timeStamp=%u, meto=%d}, ", r.timestamp, r.value];
+            }
+            [text appendString:@"]"];
+            [weakSelf sendEvent:@"manualData.met" data:@{ @"list": list, @"data": text }];
+        }
 
         [weakSelf sendEvent:@"manualData" data:@{ @"complete": @YES }];
         callback(resultWithCode(200), NO);
@@ -4741,6 +4795,22 @@ UNI_EXPORT_METHOD(@selector(setNotifyOtherApps:callback:))
     NSArray *packages = [options[@"packages"] isKindOfClass:[NSArray class]] ? options[@"packages"] : @[];
     [self sendEvent:@"notifyOtherApps" data:@{ @"ok": @NO, @"count": @(packages.count), @"unsupported": @YES }];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+    r[@"unsupported"] = @YES;
+    callback(r, NO);
+}
+
+/**
+ 来电监听开关（仅 Android）。
+ iOS 的来电提醒由系统 ANCS 在收到真实来电时直接转发给手表，
+ App 既不需要也不允许监听通话状态（无 CallKit 观察者时拿不到话单），
+ 因此这里回 unsupported，`active` 恒为 NO —— 页面据此不会误报"监听已生效"。
+ */
+UNI_EXPORT_METHOD(@selector(startCallMonitor:callback:))
+- (void)startCallMonitor:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self sendEvent:@"callMonitor" data:@{ @"active": @NO, @"unsupported": @YES }];
+    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+    r[@"active"] = @NO;
+    r[@"granted"] = @NO;
     r[@"unsupported"] = @YES;
     callback(r, NO);
 }
