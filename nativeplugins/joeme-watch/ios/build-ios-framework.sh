@@ -167,9 +167,13 @@ PLIST
 echo "=== 产物符号自检 ==="
 BIN="$FW/$FRAMEWORK_NAME"
 DEFINED="$(nm -g "$BIN" 2>/dev/null | grep -E '^[0-9a-f]{8,} ' || true)"
+# 用 case 做子串匹配，不写 `printf ... | grep -qF`：
+# 脚本开了 pipefail，grep -q 命中后立即退出会让 printf 收到 SIGPIPE，
+# 管道整体返回 141 —— 于是「符号存在」被判成缺失（实测：FMDatabaseQueue 偶发误报）。
+contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 fail=0
 for sym in _OBJC_CLASS_\$_JoemeWatchModule _OBJC_CLASS_\$_FMDatabaseQueue _OBJC_CLASS_\$_MJProperty; do
-  if printf '%s\n' "$DEFINED" | grep -qF "$sym"; then
+  if contains "$DEFINED" "$sym"; then
     echo "  ✓ $sym"
   else
     echo "  ✗ $sym 缺失" >&2
@@ -178,7 +182,7 @@ for sym in _OBJC_CLASS_\$_JoemeWatchModule _OBJC_CLASS_\$_FMDatabaseQueue _OBJC_
 done
 # 绝不能带进去的：这些由基座 / VeepooBleSDK.framework 提供，重复定义会在最终链接时炸
 for sym in _OBJC_CLASS_\$_DCUniModule _OBJC_CLASS_\$_VPDFUOperation _OBJC_CLASS_\$_ZZArchive; do
-  if printf '%s\n' "$DEFINED" | grep -qF "$sym"; then
+  if contains "$DEFINED" "$sym"; then
     echo "  ✗ 产物里含 $sym（应由基座/VeepooBleSDK 提供），最终链接会重复符号" >&2
     fail=1
   fi
