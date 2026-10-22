@@ -2174,25 +2174,28 @@ UNI_EXPORT_METHOD(@selector(setAlarm:callback:))
 }
 
 /**
- 设置/新增新闹钟。options: { hour, minute, repeat?, enable?, id? }
+ 设置/新增新闹钟。options: { hour, minute, repeat?, enable?, id?, scene? }
  iOS SDK：veepooSDKSettingDeviceNewAlarmWithNewAlarmModel:settingMode:successResult:failureResult:
-          （settingMode 1=设置(增/改)；模型字段均为 NSString，用 initWithAlarmDict: 构造）
+          （settingMode 1=设置(增/改)；模型字段均为 NSString）
  Android：addAlarm2(...)；JS：joemeWatch.setNewAlarm(model)
  事件：on('newAlarm') -> { ok }
  注：repeatState 为 8 位二进制转十进制字符串（bit0 恒 0，其后周一~周日）；alarmScene 取值待厂商确认。
+ 构造必须用 init + 直接赋值，不能用 initWithAlarmDict:（SDK 内部字典 key 与属性名
+ 不一致，会解析丢字段）；alarmID 不硬编码 1——固定传 1 会静默覆盖设备上已有的
+ 1 号闹钟，显式传 id 则用它，否则交给 SDK init 分配最小空闲 ID（与官方 Demo 一致）。
  */
 UNI_EXPORT_METHOD(@selector(setNewAlarm:callback:))
 - (void)setNewAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%@", options[@"hour"] ?: @0];
-    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%@", options[@"minute"] ?: @0];
-    dict[@"alarmState"]   = [NSString stringWithFormat:@"%lu", (unsigned long)([options[@"enable"] boolValue] ? 1 : 0)];
-    dict[@"alarmID"]      = [NSString stringWithFormat:@"%@", options[@"id"] ?: options[@"alarmID"] ?: @1];
-    dict[@"repeatState"]  = [NSString stringWithFormat:@"%@", options[@"repeat"] ?: @0];
-    dict[@"alarmScene"]   = @"0";
-    dict[@"alarmDate"]    = @"0000-00-00";
-    VPDeviceNewAlarmModel *m = [[VPDeviceNewAlarmModel alloc] initWithAlarmDict:dict];
+    VPDeviceNewAlarmModel *m = [[VPDeviceNewAlarmModel alloc] init];
+    m.alarmHour   = [NSString stringWithFormat:@"%@", options[@"hour"] ?: @0];
+    m.alarmMinute = [NSString stringWithFormat:@"%@", options[@"minute"] ?: @0];
+    m.alarmState  = [NSString stringWithFormat:@"%lu", (unsigned long)([options[@"enable"] boolValue] ? 1 : 0)];
+    id alarmId = options[@"id"] ?: options[@"alarmID"];
+    if (alarmId) m.alarmID = [NSString stringWithFormat:@"%@", alarmId];
+    m.repeatState = [NSString stringWithFormat:@"%@", options[@"repeat"] ?: @0];
+    m.alarmScene  = [NSString stringWithFormat:@"%@", options[@"scene"] ?: @"0"];
+    m.alarmDate   = @"0000-00-00";
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     [pm veepooSDKSettingDeviceNewAlarmWithNewAlarmModel:m settingMode:1 successResult:^(NSArray *alarmArray) {
         [self sendEvent:@"newAlarm" data:@{ @"ok": @YES }];
@@ -5114,6 +5117,60 @@ UNI_EXPORT_METHOD(@selector(readSportStep:callback:))
 }
 
 /**
+ 按天读取计步汇总（iOS 专用：每日活动页在 iOS 上走这条）。
+ iOS SDK：veepooSDK_readStepDataWithDayNumber:result:（一次命令读某一天的计步数据，
+         回调字典含计步/距离/卡路里，无 5 分钟逐点；day 0=今天 1=昨天，与 readActivityByDay 同口径）。
+ Android：readActivityByDay（readOriginDataSingleDay，原始数据一次命令，汇总+逐点全有）
+ JS：joemeWatch.readStepDataByDay(day) -> Promise<{ code, day, date, totalStep, totalDistance,
+     totalCalorie, totalSportValue:0, pointCount:0, points:[] }>
+ 说明：汇总字段与 readActivityByDay 同形，页面可共用 applyDay 的汇总逻辑；5 分钟逐点（柱状图）
+      在 iOS 上仍走 readActivityByDay（readBasicDataWithDayNumber 分页）。
+      设备不回包时 6 秒看门狗回 code:-1（页面走 catch：单日重试/提示，批量当天记 0 继续）。
+ */
+UNI_EXPORT_METHOD(@selector(readStepDataByDay:callback:))
+- (void)readStepDataByDay:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSInteger day = options[@"day"] ? [options[@"day"] integerValue] : 0;
+    VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSInteger watchDay = model.saveDays > 0 ? model.saveDays : 7;
+    if (day < 0 || day >= watchDay) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = [NSString stringWithFormat:@"该日期超出设备存储范围（可读 0~%ld 天前）", (long)(watchDay - 1)];
+        r[@"day"] = @(day);
+        callback(r, NO);
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        callback(resultWithCode(-1), NO);
+    });
+
+    [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_readStepDataWithDayNumber:day result:^(NSDictionary *stepDict) {
+        if (done) return;
+        done = YES;
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        r[@"day"] = @(day);
+        r[@"date"] = [weakSelf dateStrForDay:day];
+        // 计步字典 key 与库表一致：Step/Dis(km)/Cal(kcal)，兼容小写变体
+        NSInteger step = JoemeInt(JoemeFirstValue(stepDict, @[ @"Step", @"step" ]));
+        double dis = JoemeDouble(JoemeFirstValue(stepDict, @[ @"Dis", @"dis" ]));
+        double cal = JoemeDouble(JoemeFirstValue(stepDict, @[ @"Cal", @"kcal", @"cal" ]));
+        r[@"totalStep"] = @(step);
+        r[@"totalDistance"] = @(round(dis * 1000.0) / 1000.0);
+        r[@"totalCalorie"] = @(round(cal * 1000.0) / 1000.0);
+        r[@"totalSportValue"] = @0;
+        r[@"pointCount"] = @0;
+        r[@"points"] = @[];
+        callback(r, NO);
+    }];
+}
+
+/**
  按天读取睡眠数据。
  iOS SDK：veepooSDK_readSleepDataWithDayNumber:result:（设备读一遍，SDK 落库）→ 归一化回调里的数组。
           精准睡眠（peripheralModel.sleepType==1）走 VPDataBaseOperation 的精准睡眠表。
@@ -5416,63 +5473,135 @@ UNI_EXPORT_METHOD(@selector(readActivityByDay:callback:))
 }
 
 /**
- 读取旧协议血氧历史。
- iOS SDK：veepooSdkStartReadDeviceOxygenData（设备整读，SDK 落库）
-          → veepooSDKGetDeviceOxygenDataWithDate:andTableID:（按天查库，逐分钟点）
+ 读取旧协议血氧历史（iOS 走 SDK 单天直读）。
+ iOS SDK：veepooSDK_readOxygenDataWithDayNumber:maxPackage:（按天直读、分页取包；
+         返回结构同 VPDataBaseOperation 血氧记录：每分钟一字典，键名一致）
  Android：readSpo2hOriginBySetting；JS：joemeWatch.readSpo2hHistory(day)
  事件：on('spo2hHistory') -> { progress } / { data:{day,date,time:{hour,minute},oxygen,heart,
         respiration,apneaResult,isHypoxia,hypoxiaTime,cardiacLoad,hrv} } / { complete:true, day }
- 说明：协议 3/5 的血氧在 readActivityByDay 的 oxygens 上，这里仍可调用但库里有数据才回点。
+                       / { timeout:true, day }
+ 说明：
+   ① day 超设备存储范围（model.saveDays）直接拒绝，与 Android 原生层同口径
+     （页面层虽已挡，原生仍兜底）。
+   ② 分页推进：maxPackage 表示「读到第几包」，先要第 1 包拿总包数，再逐包读取；
+      每包把返回的一分钟血氧字典逐条发 data 事件，当前包 >= 总包数即完成。
+   ③ 30s 看门狗：设备不回包时发 timeout 事件并 reject（页面 .catch 兜底），
+     避免旧整读（veepooSdkStartReadDeviceOxygenData 读所有天）带来的长 loading。
+ 协议 3/5 的血氧在 readActivityByDay 的 oxygens 上，这里仍可调用但设备没数据才回点。
  */
 UNI_EXPORT_METHOD(@selector(readSpo2hHistory:callback:))
 - (void)readSpo2hHistory:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     NSInteger day = options[@"day"] ? [options[@"day"] integerValue] : 0;
-    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
-    VPPeripheralBaseManage *pm = manager.peripheralManage;
-    __weak typeof(self) weakSelf = self;
+    VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSInteger watchDay = model.saveDays > 0 ? model.saveDays : 7;
+    if (day < 0 || day >= watchDay) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = [NSString stringWithFormat:@"该日期超出设备存储范围（可读 0~%ld 天前）", (long)(watchDay - 1)];
+        r[@"day"] = @(day);
+        callback(r, NO);
+        return;
+    }
 
-    [pm veepooSdkStartReadDeviceOxygenData:^(VPReadDeviceBaseDataState state, NSUInteger totalDay,
-                                             NSUInteger currentReadDayNumber, NSUInteger readCurrentDayProgress) {
-        if (state == VPReadDeviceBaseDataReading) {
-            [weakSelf sendEvent:@"spo2hHistory" data:@{ @"progress": @(readCurrentDayProgress / 100.0) }];
+    NSString *date = [self dateStrForDay:day];
+    __weak typeof(self) weakSelf = self;
+    __block BOOL finished = NO;
+    __block NSInteger reads = 0;
+    __block NSInteger count = 0;
+    __block void (^fetchNext)(NSInteger);
+    __block dispatch_block_t watchdogRef = nil;
+
+    void (^finish)(BOOL, NSString *) = ^(BOOL timeout, NSString *message) {
+        if (finished) return;
+        finished = YES;
+        if (watchdogRef) { dispatch_block_cancel(watchdogRef); watchdogRef = nil; }
+
+        if (timeout) {
+            [weakSelf sendEvent:@"spo2hHistory" data:@{ @"timeout": @YES, @"day": @(day) }];
+            NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+            r[@"message"] = message ?: @"读取血氧数据超时";
+            r[@"day"] = @(day);
+            callback(r, NO);
             return;
         }
-        if (state != VPReadDeviceBaseDataComplete) return;
 
-        NSString *date = [weakSelf dateStrForDay:day];
-        NSArray *arr = [VPDataBaseOperation veepooSDKGetDeviceOxygenDataWithDate:date
-                                                                     andTableID:manager.peripheralModel.deviceAddress ?: @""];
-        NSInteger count = 0;
-        for (NSDictionary *d in arr) {
-            if (![d isKindOfClass:[NSDictionary class]]) continue;
-            NSInteger h = 0, m = 0;
-            JoemeTimeOfDict(d, &h, &m);
-            NSMutableDictionary *point = [NSMutableDictionary dictionary];
-            point[@"day"] = @(day);
-            point[@"date"] = date;
-            point[@"time"] = @{ @"hour": @(h), @"minute": @(m) };
-            point[@"oxygen"] = @(JoemeInt(JoemeFirstValue(d, @[ @"OxygenValue", @"oxygenValue", @"oxygen" ])));
-            point[@"heart"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HeartValue", @"heartValue", @"heart" ])));
-            point[@"respiration"] = @(JoemeInt(JoemeFirstValue(d, @[ @"RespirationRate", @"respirationRate" ])));
-            point[@"apneaResult"] = @(JoemeInt(JoemeFirstValue(d, @[ @"ApneaResult", @"apneaResult" ])));
-            point[@"isHypoxia"] = @(JoemeInt(JoemeFirstValue(d, @[ @"IsHypoxia", @"isHypoxia" ])));
-            point[@"hypoxiaTime"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HypoxiaTime", @"hypoxiaTime" ])));
-            point[@"cardiacLoad"] = @(JoemeInt(JoemeFirstValue(d, @[ @"CardiacLoad", @"cardiacLoad" ])));
-            point[@"hrv"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HRV", @"hrv" ])));
-            [weakSelf sendEvent:@"spo2hHistory" data:@{ @"data": point }];
-            count++;
-        }
-        [weakSelf sendEvent:@"spo2hHistory" data:@{ @"complete": @YES, @"day": @(day), @"count": @(count) }];
+        [weakSelf sendEvent:@"spo2hHistory" data:@{
+            @"complete": @YES, @"day": @(day), @"count": @(count)
+        }];
         callback(resultWithCode(200), NO);
-    }];
+    };
+
+    // 30 秒看门狗：每次有回调都会重置（慢设备不会被误判）
+    void (^armWatchdog)(void) = ^{
+        if (watchdogRef) dispatch_block_cancel(watchdogRef);
+        dispatch_block_t blk = dispatch_block_create(0, ^{
+            finish(YES, @"读取血氧数据超时");
+        });
+        watchdogRef = blk;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), blk);
+    };
+
+    // 单天直读：maxPackage 表示「读到第几包」，先要第 1 包拿到总包数，再逐包推进
+    fetchNext = ^(NSInteger maxPackage) {
+        reads++;
+        if (reads > 400) { finish(YES, @"读取血氧数据包数异常"); return; }
+        [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_readOxygenDataWithDayNumber:day maxPackage:maxPackage result:^(NSArray *oneDayOxygenArray, NSInteger totalPackage, NSInteger currentReadPackage) {
+            armWatchdog();
+            for (id it in oneDayOxygenArray) {
+                if (![it isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *d = it;
+                NSInteger h = 0, m = 0;
+                JoemeTimeOfDict(d, &h, &m);
+                NSMutableDictionary *point = [NSMutableDictionary dictionary];
+                point[@"day"] = @(day);
+                point[@"date"] = date;
+                point[@"time"] = @{ @"hour": @(h), @"minute": @(m) };
+                point[@"oxygen"] = @(JoemeInt(JoemeFirstValue(d, @[ @"OxygenValue", @"oxygenValue", @"oxygen" ])));
+                point[@"heart"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HeartValue", @"heartValue", @"heart" ])));
+                point[@"respiration"] = @(JoemeInt(JoemeFirstValue(d, @[ @"RespirationRate", @"respirationRate" ])));
+                point[@"apneaResult"] = @(JoemeInt(JoemeFirstValue(d, @[ @"ApneaResult", @"apneaResult" ])));
+                point[@"isHypoxia"] = @(JoemeInt(JoemeFirstValue(d, @[ @"IsHypoxia", @"isHypoxia" ])));
+                point[@"hypoxiaTime"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HypoxiaTime", @"hypoxiaTime" ])));
+                point[@"cardiacLoad"] = @(JoemeInt(JoemeFirstValue(d, @[ @"CardiacLoad", @"cardiacLoad" ])));
+                point[@"hrv"] = @(JoemeInt(JoemeFirstValue(d, @[ @"HRV", @"hrv" ])));
+                [weakSelf sendEvent:@"spo2hHistory" data:@{ @"data": point }];
+                count++;
+            }
+            [weakSelf sendEvent:@"spo2hHistory" data:@{
+                @"progress": totalPackage > 0 ? @((double)currentReadPackage / (double)totalPackage) : @0
+            }];
+            if (totalPackage <= 0 || currentReadPackage >= totalPackage) {
+                finish(NO, nil);
+                return;
+            }
+            fetchNext(currentReadPackage + 1);
+        }];
+    };
+
+    armWatchdog();
+    fetchNext(1);
 }
 
 /**
- 读取 HRV 历史（旧协议口径）。
- iOS SDK：veepooSdkStartReadDeviceHrvData → veepooSDKGetDeviceHrvDataWithDate:andTableID:
- Android：readHRVOriginBySetting（协议 3/5 走原生数据，iOS 的 HRV 库同样来自整读）
- 事件：on('hrvHistory') -> { progress } / { data:{day,date,time:{hour,minute},hrv} } / { complete:true, day }
+ 读取 HRV 历史。
+ iOS SDK：veepooSdkStartReadDeviceHrvData（设备整读，SDK 落库）
+          → veepooSDKGetDeviceHrvDataWithDate:andTableID:（按天查库，逐分钟点）
+ Android：readHrvHistory（readHRVOriginBySetting；协议 3/5 走 readOriginDataSingleDay）
+ JS：joemeWatch.readHrvHistory(day)
+ 事件：on('hrvHistory') -> { progress } / { data:{day,date,time:{hour,minute},hrv} }
+                       / { complete:true, day } / { timeout:true, day }
+ 说明：
+   ① day 超设备存储范围（model.saveDays）直接拒绝，与 Android 原生层同口径
+      （页面层虽已挡，原生仍兜底，防 func 事件晚到导致的范围误判）。
+   ② 本地库优先：历史天（day>0）是终值，库里已有当天数据直接回，不再触发一次全量整读。
+      页面切日期秒出。iOS 没有可用的按天 HRV 读接口（veepooSDK_readHrvDataWithDayNumber
+      头文件标注不可用），整读是唯一来源，能省则省。
+      今天（day=0）是半成品，数据还在长，必须整读刷新，不走本地库直接回。
+   ③ 整读卡死兜底：30s 看门狗发 timeout 事件（页面已支持该分支），避免一直 loading。
+   评分：iOS SDK 本地库 HRV 无评分字段（VPHRVValueKey/hearts 只有值与 RR 间期，
+      无 onDayHrvScore 等价物），不发 score 事件，页面「心脏健康」占位 --（与 Android
+      协议 3/5 通路行为一致）。
  */
 UNI_EXPORT_METHOD(@selector(readHrvHistory:callback:))
 - (void)readHrvHistory:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -5480,19 +5609,23 @@ UNI_EXPORT_METHOD(@selector(readHrvHistory:callback:))
     NSInteger day = options[@"day"] ? [options[@"day"] integerValue] : 0;
     VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
     VPPeripheralBaseManage *pm = manager.peripheralManage;
+    VPPeripheralModel *model = manager.peripheralModel;
+    NSInteger watchDay = model.saveDays > 0 ? model.saveDays : 7;
+    if (day < 0 || day >= watchDay) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = [NSString stringWithFormat:@"该日期超出设备存储范围（可读 0~%ld 天前）", (long)(watchDay - 1)];
+        r[@"day"] = @(day);
+        callback(r, NO);
+        return;
+    }
+
     __weak typeof(self) weakSelf = self;
+    NSString *date = [weakSelf dateStrForDay:day];
 
-    [pm veepooSdkStartReadDeviceHrvData:^(VPReadDeviceBaseDataState state, NSUInteger totalDay,
-                                          NSUInteger currentReadDayNumber, NSUInteger readCurrentDayProgress) {
-        if (state == VPReadDeviceBaseDataReading) {
-            [weakSelf sendEvent:@"hrvHistory" data:@{ @"progress": @(readCurrentDayProgress / 100.0) }];
-            return;
-        }
-        if (state != VPReadDeviceBaseDataComplete) return;
-
-        NSString *date = [weakSelf dateStrForDay:day];
+    // 查本地库并逐点下发，返回当天有效点数量（hrv>0 才算有效，与 Android 取值同口径）
+    NSInteger (^emitDayFromDB)(void) = ^NSInteger(void) {
         NSArray *arr = [VPDataBaseOperation veepooSDKGetDeviceHrvDataWithDate:date
-                                                                   andTableID:manager.peripheralModel.deviceAddress ?: @""];
+                                                                   andTableID:model.deviceAddress ?: @""];
         NSInteger count = 0;
         for (NSDictionary *d in arr) {
             if (![d isKindOfClass:[NSDictionary class]]) continue;
@@ -5508,6 +5641,39 @@ UNI_EXPORT_METHOD(@selector(readHrvHistory:callback:))
             }}];
             count++;
         }
+        return count;
+    };
+
+    // 历史天（day>0）终值：本地库已有数据直接回，省掉一次全量整读
+    if (day > 0 && emitDayFromDB() > 0) {
+        [weakSelf sendEvent:@"hrvHistory" data:@{ @"complete": @YES, @"day": @(day) }];
+        callback(resultWithCode(200), NO);
+        return;
+    }
+
+    // 今天（day=0）或本地库没有该天数据：走设备整读（SDK 落库后按天查库）
+    __block BOOL done = NO;
+    void (^emitTimeout)(void) = ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"hrvHistory" data:@{ @"timeout": @YES, @"day": @(day) }];
+        callback(resultWithCode(-1), NO);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        emitTimeout();
+    });
+
+    [pm veepooSdkStartReadDeviceHrvData:^(VPReadDeviceBaseDataState state, NSUInteger totalDay,
+                                          NSUInteger currentReadDayNumber, NSUInteger readCurrentDayProgress) {
+        if (state == VPReadDeviceBaseDataReading) {
+            [weakSelf sendEvent:@"hrvHistory" data:@{ @"progress": @(readCurrentDayProgress / 100.0) }];
+            return;
+        }
+        if (state != VPReadDeviceBaseDataComplete || done) return;
+        done = YES;
+        // 整读完成：库里 0 点也照常 complete（该天确实没有 HRV 数据，页面按无数据显示）
+        NSInteger count = emitDayFromDB();
         [weakSelf sendEvent:@"hrvHistory" data:@{ @"complete": @YES, @"day": @(day), @"count": @(count) }];
         callback(resultWithCode(200), NO);
     }];
@@ -6492,18 +6658,25 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
     return nil;
 }
 
-/** 从 options 构造 iOS 文本闹钟模型（增/改/删共用） */
+/**
+ 从 options 构造 iOS 文本闹钟模型（增/改/删共用）。
+ 必须用 init + 直接赋值，不能用 initWithAlarmDict: —— SDK 二进制里同时存在
+ alarmID / alarmId、repeatState / alarmRepeat 两套拼写，initWithAlarmDict: 按
+ 它自己的 key 解析，会把 dict 里传的字段全部漏掉：alarmID 丢失时 SDK 把「改」
+ 当成「增」（分配新 ID，时间 00:00 显示成 12:00），删除时因找不到 ID 而删不掉。
+ */
 - (VPDeviceTextAlarmModel *)textAlarmModelFromOptions:(NSDictionary *)options {
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    dict[@"alarmHour"] = [NSString stringWithFormat:@"%ld", (long)(options[@"hour"] ? [options[@"hour"] integerValue] : 0)];
-    dict[@"alarmMinute"] = [NSString stringWithFormat:@"%ld", (long)(options[@"minute"] ? [options[@"minute"] integerValue] : 0)];
-    dict[@"alarmState"] = [NSString stringWithFormat:@"%d", options[@"enable"] ? ([options[@"enable"] boolValue] ? 1 : 0) : 1];
+    VPDeviceTextAlarmModel *m = [[VPDeviceTextAlarmModel alloc] init];
+    m.alarmHour   = [NSString stringWithFormat:@"%ld", (long)(options[@"hour"] ? [options[@"hour"] integerValue] : 0)];
+    m.alarmMinute = [NSString stringWithFormat:@"%ld", (long)(options[@"minute"] ? [options[@"minute"] integerValue] : 0)];
+    m.alarmState  = [NSString stringWithFormat:@"%d", options[@"enable"] ? ([options[@"enable"] boolValue] ? 1 : 0) : 1];
     id alarmId = options[@"alarmId"] ?: options[@"id"];
-    dict[@"alarmID"] = alarmId ? [NSString stringWithFormat:@"%@", alarmId] : @"1";
-    dict[@"repeatState"] = [self iosRepeatStateFromAndroid:options[@"repeat"]];
-    dict[@"alarmText"] = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
-    dict[@"alarmDate"] = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
-    return [[VPDeviceTextAlarmModel alloc] initWithAlarmDict:dict];
+    if (alarmId) m.alarmID = [NSString stringWithFormat:@"%@", alarmId];
+    // repeat 是 7 位「周日..周一」串，必须换算成 SDK 的 8 位十进制串（与新增同一条路径）
+    m.repeatState = [self iosRepeatStateFromAndroid:options[@"repeat"]];
+    m.alarmText   = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
+    m.alarmDate   = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
+    return m;
 }
 
 /**
