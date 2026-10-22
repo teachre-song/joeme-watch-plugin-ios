@@ -223,6 +223,9 @@
                       pic:(NSDictionary *)pic
                       seq:(NSInteger)seq;
 
+// 翻腕亮屏模型 -> raiseHand/nightRaise 事件载荷（setRaiseHand 与 setNightRaiseHand 共用）
+- (NSDictionary *)raiseHandEventFromModel:(VPDeviceRaiseHandModel *)rm;
+
 @end
 
 /** 分页累计原始点的小容器：同一 (h,m) 合并（分页可能重复回同一包）。
@@ -2403,12 +2406,21 @@ UNI_EXPORT_METHOD(@selector(readWorldClock:callback:))
             callback(r, NO);
             return;
         }
-        // 用设备回包重建缓存（设备才是真源）
-        [weakSelf.worldClockCache removeAllObjects];
+        // SDK 判定「传入缓存与设备一致、无需更新」时回 success=YES + models=nil
+        //（handleReadResponseWithData: 的 b3==0 && b4!=0 分支回 self.models，
+        //   而 setModels: 在整个框架里没有调用者，weak ivar 恒为 nil）。
+        // 此时设备列表 == 传入的本地缓存：沿用缓存返回。
+        // 若照旧先 removeAllObjects 再遍历 nil，缓存被清空、list 回空数组，列表页就白屏。
         NSMutableArray *list = [NSMutableArray array];
-        for (VPWorldClockModel *wc in models) {
-            if (![wc isKindOfClass:[VPWorldClockModel class]]) continue;
-            [weakSelf.worldClockCache addObject:wc];
+        if (models != nil) {
+            // 有设备回包时用它重建缓存（设备才是真源）
+            [weakSelf.worldClockCache removeAllObjects];
+            for (VPWorldClockModel *wc in models) {
+                if (![wc isKindOfClass:[VPWorldClockModel class]]) continue;
+                [weakSelf.worldClockCache addObject:wc];
+            }
+        }
+        for (VPWorldClockModel *wc in weakSelf.worldClockCache) {
             [list addObject:[weakSelf worldClockDict:wc]];
         }
         // 空列表也算「读过了」：设备上 0 个时钟正是第一次添加的场景
@@ -2709,7 +2721,7 @@ UNI_EXPORT_METHOD(@selector(setBright:callback:))
 }
 
 /**
- 设置亮屏时长。options: { sec }（秒）。
+ 设置亮屏时长。options: { seconds }（秒，与 Android/JS 口径一致，兼容旧键名 sec）。
  iOS SDK：veepooSDKSettingScreenDuration:settingMode:successResult:failureResult:
           （VPScreenDurationModel.currentDuration；settingMode 1=设置）
  Android：setScreenLightTime(..., int)；JS：joemeWatch.setScreenDuration(sec)
@@ -2718,7 +2730,10 @@ UNI_EXPORT_METHOD(@selector(setBright:callback:))
 UNI_EXPORT_METHOD(@selector(setScreenDuration:callback:))
 - (void)setScreenDuration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSInteger sec = [options[@"sec"] integerValue];
+    // JS 层统一传 { seconds }（joeme-watch.js setScreenDuration 与 screen.vue 直传），
+    // 兼容旧键名 sec，避免 iOS 上始终读到 0。
+    NSInteger sec = options[@"seconds"] ? [options[@"seconds"] integerValue]
+                                        : [options[@"sec"] integerValue];
     VPScreenDurationModel *m = [[VPScreenDurationModel alloc] init];
     m.currentDuration = sec;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
@@ -2749,28 +2764,57 @@ UNI_EXPORT_METHOD(@selector(setScreenStyle:callback:))
 }
 
 /**
- 设置翻腕亮屏。options: { on, startHour?, startMinute?, endHour?, endMinute? }
+ 设置翻腕亮屏。options: { on, startHour?, startMinute?, endHour?, endMinute?, level? }
  iOS SDK：veepooSDKSettingRaiseHandWithRaiseHandModel:settingMode:successResult:failureResult:
-          （settingMode 0=关 1=开；raiseHandState 0/1）
+          （settingMode 0=关 1=开；raiseHandState 0/1；raiseHandSensitive 灵敏度 1-10）
  Android：settingNightTurnWriste(...)；JS：joemeWatch.setRaiseHand({...})
- 事件：on('raiseHand') -> { ok }
+ 事件：on('raiseHand') -> 完整载荷（对齐 Android nightRaiseData：ok/isOpen/startHour/.../level/...）
+ level 为灵敏度（SDK 范围 1-10）；不传时沿用设备当前值（读取一次后下发），
+ 避免把已有灵敏度覆盖成 0（0 在某些固件上表示「无灵敏度功能」，会写坏）。
  */
 UNI_EXPORT_METHOD(@selector(setRaiseHand:callback:))
 - (void)setRaiseHand:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    BOOL on = [options[@"on"] boolValue];
-    NSUInteger startH = [options[@"startHour"] unsignedIntegerValue];
-    NSUInteger startM = [options[@"startMinute"] unsignedIntegerValue];
-    NSUInteger endH = [options[@"endHour"] unsignedIntegerValue] ?: 23;
-    NSUInteger endM = [options[@"endMinute"] unsignedIntegerValue];
-    VPDeviceRaiseHandModel *m = [[VPDeviceRaiseHandModel alloc] initWithRaiseHandStartHour:startH raiseHandStartMinute:startM raiseHandEndHour:endH raiseHandEndMinute:endM raiseHandState:(on ? 1 : 0) raiseHandSensitive:0];
+    BOOL on = options[@"on"] ? [options[@"on"] boolValue] : YES;
+    NSUInteger startH = options[@"startHour"] ? [options[@"startHour"] unsignedIntegerValue] : 0;
+    NSUInteger startM = options[@"startMinute"] ? [options[@"startMinute"] unsignedIntegerValue] : 0;
+    NSUInteger endH = options[@"endHour"] ? [options[@"endHour"] unsignedIntegerValue] : 23;
+    NSUInteger endM = options[@"endMinute"] ? [options[@"endMinute"] unsignedIntegerValue] : 59;
+    BOOL hasLevel = (options[@"level"] != nil);
+    NSUInteger level = hasLevel ? [options[@"level"] unsignedIntegerValue] : 0;
+
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    [pm veepooSDKSettingRaiseHandWithRaiseHandModel:m settingMode:(on ? 1 : 0) successResult:^(VPDeviceRaiseHandModel *rm) {
-        [self sendEvent:@"raiseHand" data:@{ @"ok": @YES }];
-        callback(resultWithCode(200), NO);
+    __weak typeof(self) weakSelf = self;
+
+    void (^doSet)(NSUInteger) = ^(NSUInteger sensitive) {
+        VPDeviceRaiseHandModel *m = [[VPDeviceRaiseHandModel alloc] initWithRaiseHandStartHour:startH
+                                                                           raiseHandStartMinute:startM
+                                                                             raiseHandEndHour:endH
+                                                                           raiseHandEndMinute:endM
+                                                                               raiseHandState:(on ? 1 : 0)
+                                                                           raiseHandSensitive:sensitive];
+        [pm veepooSDKSettingRaiseHandWithRaiseHandModel:m
+                                            settingMode:(on ? 1 : 0)
+                                          successResult:^(VPDeviceRaiseHandModel *rm) {
+            [weakSelf sendEvent:@"raiseHand" data:[weakSelf raiseHandEventFromModel:rm]];
+            callback(resultWithCode(200), NO);
+        } failureResult:^{
+            [weakSelf sendEvent:@"raiseHand" data:@{ @"ok": @NO }];
+            callback(resultWithCode(-1), NO);
+        }];
+    };
+
+    if (hasLevel) {
+        doSet(level);
+        return;
+    }
+    // 未传 level：先读一次拿当前灵敏度，再按原值下发
+    [pm veepooSDKSettingRaiseHandWithRaiseHandModel:[[VPDeviceRaiseHandModel alloc] init]
+                                        settingMode:2
+                                      successResult:^(VPDeviceRaiseHandModel *rm) {
+        doSet(rm ? rm.sensitive : 0);
     } failureResult:^{
-        [self sendEvent:@"raiseHand" data:@{ @"ok": @NO }];
-        callback(resultWithCode(200), NO);
+        doSet(0);
     }];
 }
 
