@@ -150,6 +150,17 @@
 /** 天气读取进行中的回调队列：SDK 的 readWeatherInfo 无并发保护，同一时刻只允许一次。 */
 @property (nonatomic, strong) NSMutableArray *weatherReadQueue;
 
+/** 本会话内写过的开关状态覆盖表：key = @(VPSettingBaseFunctionSwitchType)，value = @"SUPPORT_OPEN"/@"SUPPORT_CLOSE"。
+    用途：个别开关的读命令恒定回 Failure（实测 VPSettingAutomaticPPGTest），只能靠握手字节表兜底；
+    但字节表是连接时快照，用户改完开关后回读会拿到旧值把界面拨回去。
+    写成功后在这里记一笔，读兜底优先用它；断连时清空（字节表本身也会随重连刷新）。 */
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *switchWriteOverride;
+
+/** 本会话内写过的全天血氧开关（nil = 没写过）。
+    与 switchWriteOverride 同理：oxygenAutoDetectType 是握手快照，
+    写完回读若还读快照会把界面拨回去。 */
+@property (nonatomic, strong) NSNumber *allDayOxygenWritten;
+
 // 相机相关内部方法（第 7 节实现）：显式声明，避免后向调用产生
 // "instance method not found" 告警
 - (void (^)(VPCameraType))cameraMonitorBlock;
@@ -167,6 +178,10 @@
 - (NSString *)functionStateName:(VPSettingFunctionCompleteState)state;
 - (NSString *)unitNameOf:(NSString *)state first:(NSString *)first second:(NSString *)second;
 - (VPSettingBaseFunctionSwitchType)baseFunctionTypeForKey:(NSString *)key;
+/** 从握手缓存推断全天血氧开关（读命令失败时用） */
+- (BOOL)allDayOxygenStateFromModel:(VPPeripheralModel *)model;
+/** 从握手缓存的开关字节表兜底取一个开关（读命令回 Failure 时用） */
+- (NSString *)switchByteStateForType:(VPSettingBaseFunctionSwitchType)type;
 
 // 世界时钟（第 5 节实现）：内部辅助，先声明避免后向调用告警
 - (BOOL)worldClockSupported;
@@ -1644,6 +1659,9 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             [_worldClockCache removeAllObjects];
             self.worldClockRead = NO;
             self.worldClockSubInstalled = NO;
+            // 开关写入覆盖表同理：字节表会随重连刷新，旧覆盖值不能再压着新快照
+            [self.switchWriteOverride removeAllObjects];
+            self.allDayOxygenWritten = nil;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
@@ -1986,6 +2004,9 @@ UNI_EXPORT_METHOD(@selector(setAllDayOxygen:callback:))
         fired = YES;
         BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
                    || state == VPFunctionCompleteComplete);
+        // 写入确认生效后记一笔：oxygenAutoDetectType 是握手快照，
+        // 写完回读若还读快照会把界面拨回去（与 switchWriteOverride 同理）。
+        if (ok) weakSelf.allDayOxygenWritten = @(on);
         NSMutableDictionary *d = [@{ @"ok": @(ok), @"isOpen": @(on) } mutableCopy];
         if (ok) {
             d[@"data"] = [NSString stringWithFormat:
@@ -5973,7 +5994,12 @@ UNI_EXPORT_METHOD(@selector(readSpo2AutoDetect:callback:))
         NSInteger open = -1;
         if (state == VPFunctionCompleteOpen) open = 1;
         else if (state == VPFunctionCompleteClose) open = 0;
-        else if (model.oxygenAutoDetectType > 0) open = (model.oxygenAutoDetectType == 1 ? 1 : 0);
+        // 读失败时退到握手能力位：判据是 oxygenType（有无血氧功能），
+        // 不能再用 oxygenAutoDetectType > 0 —— 关掉血氧时它就是 0，
+        // 会被误判成「读不到」，血氧页开关永远停在初值。
+        else if (model.oxygenType != 0) {
+            open = [weakSelf allDayOxygenStateFromModel:model] ? 1 : 0;
+        }
 
         NSDictionary *d = @{ @"isOpen": @(open), @"openState": @(state), @"ok": @(open >= 0) };
         [weakSelf sendEvent:@"spo2Auto" data:d];
@@ -6012,6 +6038,8 @@ UNI_EXPORT_METHOD(@selector(setSpo2AutoDetect:callback:))
         fired = YES;
         BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
                    || state == VPFunctionCompleteComplete);
+        // 与 setAllDayOxygen 共用同一底层接口，也共用同一份写入覆盖值
+        if (ok) weakSelf.allDayOxygenWritten = @(on);
         NSDictionary *d = @{ @"isOpen": @(on ? 1 : 0), @"openState": @(state), @"ok": @(ok) };
         [weakSelf sendEvent:@"spo2Auto" data:d];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
@@ -6122,9 +6150,14 @@ UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
         emitted = YES;
         BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose);
         BOOL isOpen = (state == VPFunctionCompleteOpen);
-        // 读失败时退回握手拿到能力位（1=开，其它=未知），与 readSpo2AutoDetect 同口径
-        if (!ok && model.oxygenAutoDetectType > 0) {
-            isOpen = (model.oxygenAutoDetectType == 1);
+        // 读命令失败时退到握手能力位。⚠ 判据是 oxygenType（有无血氧功能），
+        // 不是 oxygenAutoDetectType > 0 —— 后者是**开关状态**，关掉时就是 0，
+        // 用 > 0 判断会把「血氧已关闭」误判成「读不到」，页面永远停在「尚未读取到设备设置」。
+        // 官方 Demo VPBaseFunctionRemindController：
+        //   isEnabled = peripheralModel.oxygenType != 0
+        //   isOn      = peripheralModel.oxygenAutoDetectType == 1   // 0/2 都算关
+        if (!ok && model.oxygenType != 0) {
+            isOpen = [self allDayOxygenStateFromModel:model];
             ok = YES;
         }
         NSMutableDictionary *d = [@{ @"ok": @(ok),
@@ -6138,6 +6171,10 @@ UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
                               @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=%d}", isOpen ? 1 : 0];
             d[@"data"] = text;
             d[@"summary"] = text;
+        } else if (state == VPFunctionCompleteUnknown || model.oxygenType == 0) {
+            // 设备明确没有血氧功能：标记 unsupported，页面据此提示「不支持」
+            // 而不是「尚未读取到设备设置」（后者会让用户一直重试）。
+            d[@"unsupported"] = @YES;
         }
         [weakSelf sendEvent:@"allDayOxygen" data:d];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
@@ -6957,8 +6994,16 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
                 // 心率自动检测在 Android toString 里是布尔（不是 EFunctionStatus）
                 if (state == VPFunctionCompleteOpen) v[key] = @"true";
                 else if (state == VPFunctionCompleteClose) v[key] = @"false";
+                else {
+                    NSString *fb = [weakSelf switchByteStateForType:t];
+                    if (fb) v[key] = [fb isEqualToString:@"SUPPORT_OPEN"] ? @"true" : @"false";
+                }
             } else {
                 NSString *name = [weakSelf functionStateName:state];
+                // 读命令回 Failure（部分机型/固件上 PPG 这类开关恒定回 3）时，
+                // 退到握手缓存的开关字节表取值 —— 官方 Demo 根本不用读命令，
+                // 就是直接读 peripheralModel.deviceSwitchData[16]。
+                if (!name) name = [weakSelf switchByteStateForType:t];
                 if (name) v[key] = name;
             }
             next();
@@ -6981,6 +7026,79 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
         case VPFunctionCompleteFailure: return nil;   // 读失败：不写字段，页面保留本地值
         default: return nil;
     }
+}
+
+/**
+ 从握手缓存推断全天血氧自动检测开关。
+ 
+ 官方 Demo VPBaseFunctionRemindController 的血氧那一行：
+     isEnabled = peripheralModel.oxygenType != 0              // 有无血氧功能
+     isOn      = peripheralModel.oxygenAutoDetectType == 1    // 开关状态，0/2 都算关
+ 也就是说 oxygenAutoDetectType 本身就是**开关状态**（1=开，0/2=关），
+ 不能拿它 > 0 当「读到了」的判据 —— 关掉时它就是 0。
+ 
+ 优先级：本会话写入值 > 握手快照。
+ */
+- (BOOL)allDayOxygenStateFromModel:(VPPeripheralModel *)model {
+    if (self.allDayOxygenWritten != nil) return [self.allDayOxygenWritten boolValue];
+    return model.oxygenAutoDetectType == 1;
+}
+
+/**
+ 从握手缓存的开关字节表里取某个开关的状态（读命令回 Failure 时的兜底）。
+ 
+ 为什么需要：部分机型/固件上，个别开关的「读」命令恒定回 VPFunctionCompleteFailure
+ （实测这台设备的 VPSettingAutomaticPPGTest 就是），而设备的真实状态其实在握手时
+ 就随 deviceSwitchData / deviceSwitchTwoData 下发了。官方 Demo
+ VPBaseFunctionRemindController 根本不用读命令，整个「基本开关」页都是直接读这两张表：
+     deviceSwitchData   下标 2 起：公英制/24小时制/心率自动检测/血压自动检测/运动过量提醒/
+                        语音播报/手机查找/秒表/血氧过低通知/LED/HRV/来电免接听/断连提醒/
+                        SOS/PPG自动测量/科学睡眠
+     deviceSwitchTwoData 下标 2 起：长按解锁/消息亮屏/体温自动检测/体温单位/ECG常开/
+                        血糖开关/梅脱/压力/血糖单位/血液成分/尿酸单位/血脂单位/跌倒检测
+ 字节值：0=没有此功能，1=开启，2=关闭。
+ 下标规律（与 VPPublicDefine.h 的枚举值严格对应，改枚举时按公式推即可）：
+   第一包：下标 = 枚举值 - 1   （VPSettingMetric(3) → 2 … VPSettingAccurateSleep(18) → 17）
+   第二包：下标 = 枚举值 - 20  （VPSettingLongpressUnlock(22) → 2 … VPSettingFallDetection(34) → 14）
+ 
+ @return SUPPORT_OPEN / SUPPORT_CLOSE / UNSUPPORT（0 或表不存在），拿不到表时返回 nil
+ */
+- (NSString *)switchByteStateForType:(VPSettingBaseFunctionSwitchType)type {
+    VPPeripheralModel *pm = [VPBleCentralManage sharedBleManager].peripheralModel;
+    if (pm == nil) return nil;
+
+    // 本会话写过的一律以写入值为准：字节表是连接时的快照，
+    // 用户改完开关后回读若还读快照，界面会被拨回旧状态。
+    NSString *written = self.switchWriteOverride[@(type)];
+    if (written != nil) return written;
+
+    // (数据表, 下标) —— 下标口径见 VPPeripheralModel.h 的两段注释
+    NSData *data = nil;
+    NSInteger index = -1;
+    switch (type) {
+        case VPSettingAutomaticHRTest:          data = pm.deviceSwitchData;    index = 4;  break;
+        case VPSettingOxygenLowerRemind:        data = pm.deviceSwitchData;    index = 10; break;
+        case VPSettingAutomaticHRVTest:         data = pm.deviceSwitchData;    index = 12; break;
+        case VPSettingAutomaticPPGTest:         data = pm.deviceSwitchData;    index = 16; break;
+        case VPSettingAccurateSleep:            data = pm.deviceSwitchData;    index = 17; break;
+        case VPSettingAutomaticTemperatureTest: data = pm.deviceSwitchTwoData; index = 4;  break;
+        case VPSettingTemperatureUnit:          data = pm.deviceSwitchTwoData; index = 5;  break;
+        case VPSettingAutomaticBloodGlucoseTest:data = pm.deviceSwitchTwoData; index = 7;  break;
+        case VPSettingStress:                   data = pm.deviceSwitchTwoData; index = 9;  break;
+        case VPSettingBloodGlucoseUnit:         data = pm.deviceSwitchTwoData; index = 10; break;
+        case VPSettingAutomaticBloodCompTest:   data = pm.deviceSwitchTwoData; index = 11; break;
+        case VPSettingUricAcidUnit:             data = pm.deviceSwitchTwoData; index = 12; break;
+        case VPSettingLipidUnit:                data = pm.deviceSwitchTwoData; index = 13; break;
+        case VPSettingFallDetection:            data = pm.deviceSwitchTwoData; index = 14; break;
+        default: return nil;   // 其余开关（公制/抬手等）页面没用到，不做兜底
+    }
+    if (![data isKindOfClass:[NSData class]] || index < 0) return nil;
+    if ((NSUInteger)index >= data.length) return nil;
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    uint8_t v = bytes[index];
+    if (v == 1) return @"SUPPORT_OPEN";
+    if (v == 2) return @"SUPPORT_CLOSE";
+    return @"UNSUPPORT";       // 0 = 设备没有此功能
 }
 
 /**
@@ -7083,16 +7201,22 @@ UNI_EXPORT_METHOD(@selector(changeCustomSetting:callback:))
         // 单条命令的设备回包兜底：某条不回包时不能把整条链卡死，
         // 否则 JS 侧 Promise 永远 pending、页面开关一直转圈。
         __block BOOL stepped = NO;
-        void (^step)(void) = ^{
+        void (^step)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState s) {
             if (stepped) return;
             stepped = YES;
+            // 只有设备确认生效才记覆盖值；Failure/Unknown 不记（否则回读会拿一个没生效的值）
+            if (s == VPFunctionCompleteOpen || s == VPFunctionCompleteClose
+                || s == VPFunctionCompleteComplete) {
+                weakSelf.switchWriteOverride[@(type)] =
+                    (state == VPSettingFunctionOpen) ? @"SUPPORT_OPEN" : @"SUPPORT_CLOSE";
+            }
             next();
         };
         [pm veepooSDKSettingBaseFunctionType:type settingState:state completeBlock:^(VPSettingFunctionCompleteState s) {
-            step();
+            step(s);
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ step(); });
+                       dispatch_get_main_queue(), ^{ step(VPFunctionCompleteFailure); });
     };
     next();
 }
