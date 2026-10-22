@@ -107,6 +107,15 @@
 /** 最近一次拿到的文本闹钟整表（新增时用它挑空闲 alarmId，避免覆盖已有闹钟） */
 @property (nonatomic, strong) NSArray<NSDictionary *> *lastTextAlarms;
 
+/** 世界时钟本地缓存（对齐 Android mWorldClockCache）：add 挑空闲 id、delete/move 校验用。
+    懒加载 getter 在 @implementation 里手写，所以这里只声明，不自动合成。 */
+- (NSMutableArray<VPWorldClockModel *> *)worldClockCache;
+/** 是否成功读过一次世界时钟列表。用标志而不是 cache.isEmpty ——
+    设备上 0 个时钟时读成功缓存也是空的，按 isEmpty 判断会让第一次添加永远走不下去。 */
+@property (nonatomic, assign) BOOL worldClockRead;
+/** 设备端删除订阅是否已安装（断连后 SDK 槽位会丢，重连要重装） */
+@property (nonatomic, assign) BOOL worldClockSubInstalled;
+
 /** 相机遥控是否已进入（避免重复下发 Enter/Exit 让手表闪屏） */
 @property (nonatomic, assign) BOOL cameraEntered;
 /** listenCamera 是否已注册常驻相机 block（SDK 只有一个槽位，装一次即可） */
@@ -117,6 +126,29 @@
 @property (nonatomic, assign) NSInteger pendingSelfExit;
 /** 最近一次主动下发 Exit 的时间；超出窗口就认为对端没回包，不再过滤 */
 @property (nonatomic, assign) NSTimeInterval pendingSelfExitAt;
+
+/** 表盘列表会话号：每次 dialList 自增，迟到的 BLE 回调与看门狗按它丢弃 */
+@property (nonatomic, assign) NSInteger dialSeq;
+/** 表盘切换/传输会话号：每次推送自增，用于「完成回调」与「看门狗」互斥 */
+@property (nonatomic, assign) NSInteger dialSwitchSeq;
+/** JL 表盘缓存：[{name, group:'sys'|'server'|'pic', index?}]。
+    页面切盘只回传设备路径（/WATCH026），靠它反查分组与系统表盘序号。 */
+@property (nonatomic, strong) NSArray<NSDictionary *> *jlDialCache;
+/** 设备当前照片表盘文件名（由 describe 元数据读回，切 kind:'pic' 时用） */
+@property (nonatomic, copy) NSString *jlCurrentPicName;
+/** 非 JL：最近一次读到的设备侧市场表盘信息（imageId/address/length…）。
+    下载 bin 时 SDK 要用它做 CRC 校验与容量判断，页面拿不到这些字段，只能由原生缓存。 */
+@property (nonatomic, strong) VPDeviceMarketDialModel *dialDeviceInfo;
+
+/** 最近一次**实时读成功**的天气状态（isOpen / unit / crc）。
+    用途有两个：
+      1) 页面没读到状态时 setWeatherStatus 靠它保住设备原开关；
+      2) 下发设置时带上设备回过的 crc（官方 Demo WeatherActivity 就是
+         `setting.crc = crc`，crc 来自上一次读回；iOS SDK 的模型里也有 crc 字段）。
+    只在读到真模型时更新，写回执不写这里 —— 否则回读验证会自己证明自己成功。 */
+@property (nonatomic, strong) NSDictionary *lastWeatherStatus;
+/** 天气读取进行中的回调队列：SDK 的 readWeatherInfo 无并发保护，同一时刻只允许一次。 */
+@property (nonatomic, strong) NSMutableArray *weatherReadQueue;
 
 // 相机相关内部方法（第 7 节实现）：显式声明，避免后向调用产生
 // "instance method not found" 告警
@@ -135,6 +167,46 @@
 - (NSString *)functionStateName:(VPSettingFunctionCompleteState)state;
 - (NSString *)unitNameOf:(NSString *)state first:(NSString *)first second:(NSString *)second;
 - (VPSettingBaseFunctionSwitchType)baseFunctionTypeForKey:(NSString *)key;
+
+// 世界时钟（第 5 节实现）：内部辅助，先声明避免后向调用告警
+- (BOOL)worldClockSupported;
+- (uint8_t)nextWorldClockId;
+- (NSDictionary *)worldClockDict:(VPWorldClockModel *)wc;
+- (void)installWorldClockDeleteSubIfNeeded;
+- (void)removeCachedWorldClock:(uint8_t)clockID;
+- (VPWorldClockModel *)cachedWorldClockWithID:(uint8_t)clockID;
+- (void)deleteWorldClockIDs:(NSArray<NSNumber *> *)ids
+                      index:(NSUInteger)index
+                      state:(NSMutableDictionary *)state
+                       done:(void (^)(void))done;
+
+// 文本闹钟能力位（funcSupport 用）：读 deviceFuctionData[17]
+- (NSString *)textAlarmCapabilityName;
+
+// 表盘（第 7 节实现）：内部拆分较多，先声明避免后向调用告警
+- (BOOL)isJLDevice;                                       // 平台判定（CPUType == 1）
+- (NSString *)dialPlatformName;                            // jl / zk / nordic
+- (void)dialListJL:(NSInteger)seq;                         // JL：打开文件系统 → 三组表盘
+- (void)dialListNordic:(NSInteger)seq;                     // 非 JL：默认表盘 + 屏幕样式
+- (void)readScreenStyleEvent:(NSInteger)seq;               // 非 JL：读当前屏幕样式 → on('dial')
+- (void)setDialDefault:(NSInteger)index;                   // 非 JL：按序号切默认表盘
+- (void)switchJLSystemDialAtIndex:(NSInteger)index;        // JL：按 sys 组序号切盘
+- (void)switchJLDialByName:(NSString *)name;               // JL：按文件名切盘
+- (void)setDialFile:(NSString *)filePath;                  // 非 JL：推送本地表盘文件
+- (void)pushDialFileAndActivate:(NSURL *)filePath name:(NSString *)name;  // 下载后的 bin 推送 + 切盘
+- (void)emitDialFail:(NSString *)code;                     // 统一的失败事件
+- (NSArray<NSString *> *)watchNamesFromFileNames:(NSArray *)names;
+- (void)classifyJLDialNames:(NSArray<NSString *> *)names
+                      index:(NSInteger)index
+                     result:(NSMutableDictionary *)result
+                        seq:(NSInteger)seq;
+- (void)finishJLClassification:(NSArray<NSString *> *)names
+                        result:(NSMutableDictionary *)result
+                           seq:(NSInteger)seq;
+- (void)emitJLListWithSys:(NSArray *)sys
+                   server:(NSArray *)server
+                      pic:(NSDictionary *)pic
+                      seq:(NSInteger)seq;
 
 @end
 
@@ -172,7 +244,36 @@
 }
 @end
 
-@implementation JoemeWatchModule
+// ==================== 表盘：SDK 未公开类的声明 ====================
+// 表盘能力分散在几个 SDK 内部类里：
+//   VPMarketDialManager  —— 有公开头文件（列表/下载/传输/JL 文件系统开关都在它上面）
+//   VPDialTransformManager —— 无公开头文件，只有二进制符号 + DWARF 里的方法类型编码
+//   VPJLFileSystemManager  —— 同上
+// 下面只补真正需要、且公开头文件里没有的那两个方法；其余一律走 VPMarketDialManager。
+// ⚠ 若日后厂商把头文件公开出来，删掉本节即可（重复声明会编译报错）。
+@interface VPDialTransformManager : NSObject
++ (instancetype)share;                                            // @16@0:8
+/** 切换表盘（内部 = cmdWatchFlashPath:Flag:1，路径自动补 "/"）。block 均无参:
+    v32@0:8@16@?24@?32 */
+- (void)switchToCustomWatchWithName:(NSString *)name
+                            success:(void (^)(void))success
+                            failure:(void (^)(void))failure;
+@end
+
+@interface VPJLFileSystemManager : NSObject
++ (instancetype)shareInstance;                                   // @16@0:8
+/** 读单个表盘文件的元数据（cmdWatchFlashPath:Flag:3）。
+    action: v32@0:8@16@?24 —— 两个参数只会有一个非 nil：
+      照片表盘 → (文件名, nil)；市场表盘 → (nil, 文件名)；其余（内置表盘）→ (nil, nil) */
+- (void)getWatchFaceWithAssist:(id)assist
+                     watchName:(NSString *)watchName
+                        action:(void (^)(NSString *photoWatchName, NSString *marketWatchName))action;
+@end
+
+@implementation JoemeWatchModule {
+    // 世界时钟缓存：getter 在下面手写（懒加载），ivar 必须显式声明
+    NSMutableArray<VPWorldClockModel *> *_worldClockCache;
+}
 
 // ==================== 事件下发 ====================
 
@@ -1539,6 +1640,10 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.pendingSelfExit = 0;
             // 重连后要重新装一次监听：SDK 的 block 槽位可能随连接重建被清掉
             self.cameraMonitorInstalled = NO;
+            // 世界时钟缓存属于「上一台设备」，断连即失效；重连后要重新读一次再增删
+            [_worldClockCache removeAllObjects];
+            self.worldClockRead = NO;
+            self.worldClockSubInstalled = NO;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
@@ -1631,9 +1736,31 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         @"bp": @(pm.bloodPressureType != 0 || pm.isSupportBPTest),
         @"heartRate": @(pm.heartRateType != 0),
         @"worldClock": @(pm.worldClockType != 0),
+        // 文本闹钟（带标签）能力位：iOS 的 VPPeripheralModel 没有独立属性，
+        // 只能按 Demo 的做法读 deviceFuctionData[17]（「新的闹钟功能」字节）：
+        //   0xFE  → 手环彻底没有闹钟功能
+        //   <0x05 → 没有文字闹钟功能
+        // 缺失该字节时给 'unknown'，不臆断为「不支持」（页面按 unknown 走普通超时文案）。
+        @"textAlarm": [self textAlarmCapabilityName],
         // 没有 summary 文本：页面遇到 iOS 只会走结构化字段分支
         @"summary": @""
     }];
+}
+
+/**
+ 文本闹钟能力位（对齐 iOS Demo VPTextAlarmClockSettingController 的判定）：
+ 返回 'support' / 'unsupport' / 'unknown'，与 Android funcSupport 里 textAlarm 的取值同名。
+ */
+- (NSString *)textAlarmCapabilityName {
+    VPPeripheralModel *pm = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSData *data = pm.deviceFuctionData;
+    // 功能字节表：下标 1=血压 … 17=新的闹钟功能（见 VPPeripheralModel.h 的注释）
+    if (![data isKindOfClass:[NSData class]] || data.length <= 17) return @"unknown";
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    uint8_t v = bytes[17];
+    if (v == 0xFE) return @"unsupport";   // 彻底没有闹钟功能
+    if (v < 0x05) return @"unsupport";    // 没有文字闹钟功能
+    return @"support";
 }
 
 // ==================== 全量桥接（契约第 1~13 节） ====================
@@ -1843,18 +1970,38 @@ UNI_EXPORT_METHOD(@selector(setAutoMonitor:callback:))
  24 小时血氧自动检测开关。options: { on: bool }。
  iOS SDK：veepooSDKSettingAllDayOxygenTest:result:（VPSettingFunctionState：1=开 2=关）
  Android：settingSpo2hAutoDetect(...)；JS：joemeWatch.setAllDayOxygen(on)
- 事件：on('allDayOxygen') -> { ok }
+ 事件：on('allDayOxygen') -> { ok, isOpen, data }
+ 说明：关闭时设备回的是 VPFunctionCompleteClose，不能只认 Open/Complete 判成功
+      （否则关血氧永远被当成失败）。
  */
 UNI_EXPORT_METHOD(@selector(setAllDayOxygen:callback:))
 - (void)setAllDayOxygen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     BOOL on = [options[@"on"] boolValue];
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL fired = NO;
+    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+        if (fired) return;
+        fired = YES;
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
+                   || state == VPFunctionCompleteComplete);
+        NSMutableDictionary *d = [@{ @"ok": @(ok), @"isOpen": @(on) } mutableCopy];
+        if (ok) {
+            d[@"data"] = [NSString stringWithFormat:
+                          @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=%d}", on ? 1 : 0];
+        }
+        [weakSelf sendEvent:@"allDayOxygen" data:d];
+        // 设备拒绝/不支持时回 -1，页面 onSwitchChange 的 catch 会回滚开关并提示
+        callback(resultWithCode(ok ? 200 : -1), NO);
+    };
     [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose) result:^(VPSettingFunctionCompleteState state) {
-        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteComplete);
-        [self sendEvent:@"allDayOxygen" data:@{ @"ok": @(ok) }];
-        callback(resultWithCode(200), NO);
+        finish(state);
     }];
+
+    // 设备不回包时 6 秒兜底：否则页面开关一直停在忙碌态（Promise 永不结束）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
 }
 
 /**
@@ -2038,22 +2185,47 @@ UNI_EXPORT_METHOD(@selector(setNewAlarm:callback:))
           （settingMode=VPDeviceTextAlarmSettingModelAddOrChange(2)；alarmText 最长 60 字节）
  Android：addTextAlarm(...)；JS：joemeWatch.setTextAlarm(model)
  事件：on('textAlarm') -> { ok, oprate, list }（与 Android 一致，成功时回整表）
+
+ 关于 alarmID（之前固定传 1 会把设备上已有的 1 号闹钟静默覆盖）：
+   ① 调用方显式给了 id → 用它（改单条复用不到这条路径，但保留兼容）。
+   ② 已读过整表 → 取最小空闲 ID；一个空位都没有时明确回 ALARM_FULL。
+   ③ 从没读过整表（列表页读取超时等）→ 不写 alarmID，让 SDK 用它自己的
+      已存列表（VPDeviceTextAlarmModel init 里就调 getMinimumAlarmID）分配，
+      这跟官方 Demo 新增闹钟的做法一致，不会瞎猜。
  */
 UNI_EXPORT_METHOD(@selector(setTextAlarm:callback:))
 - (void)setTextAlarm:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    id alarmId = options[@"id"] ?: options[@"alarmID"];
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    dict[@"alarmHour"]    = [NSString stringWithFormat:@"%ld", (long)(options[@"hour"] ? [options[@"hour"] integerValue] : 0)];
-    dict[@"alarmMinute"]  = [NSString stringWithFormat:@"%ld", (long)(options[@"minute"] ? [options[@"minute"] integerValue] : 0)];
-    dict[@"alarmState"]   = [NSString stringWithFormat:@"%d", options[@"enable"] ? ([options[@"enable"] boolValue] ? 1 : 0) : 1];
-    // 新增必须用空闲 ID：固定传 1 会把设备上已有的 1 号闹钟覆盖掉
-    dict[@"alarmID"]      = alarmId ? [NSString stringWithFormat:@"%@", alarmId] : [self nextTextAlarmId];
+    NSString *alarmId = nil;
+    id given = options[@"id"] ?: options[@"alarmID"];
+    if (given) {
+        alarmId = [NSString stringWithFormat:@"%@", given];
+    } else if (self.lastTextAlarms) {
+        alarmId = [self nextTextAlarmId];
+        if (!alarmId) {
+            NSDictionary *d = @{
+                @"ok": @NO, @"oprate": @"ALARM_FULL",
+                @"list": self.lastTextAlarms,
+                @"message": @"闹钟已满（最多添加十个）"
+            };
+            [self sendEvent:@"textAlarm" data:d];
+            NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+            [r addEntriesFromDictionary:d];
+            callback(r, NO);
+            return;
+        }
+    }
+    // 用 init 而不是 initWithAlarmDict：只有 init 会走 SDK 的默认 ID 分配，
+    // 也避免字典缺字段时把属性刷成 nil。
+    VPDeviceTextAlarmModel *m = [[VPDeviceTextAlarmModel alloc] init];
+    m.alarmHour   = [NSString stringWithFormat:@"%ld", (long)(options[@"hour"] ? [options[@"hour"] integerValue] : 0)];
+    m.alarmMinute = [NSString stringWithFormat:@"%ld", (long)(options[@"minute"] ? [options[@"minute"] integerValue] : 0)];
+    m.alarmState  = [NSString stringWithFormat:@"%d", options[@"enable"] ? ([options[@"enable"] boolValue] ? 1 : 0) : 1];
+    if (alarmId) m.alarmID = alarmId;
     // repeat 是 7 位「周日..周一」串，必须换算成 SDK 的 8 位十进制串（与 modify 同一条路径）
-    dict[@"repeatState"]  = [self iosRepeatStateFromAndroid:options[@"repeat"]];
-    dict[@"alarmText"]    = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
-    dict[@"alarmDate"]    = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
-    VPDeviceTextAlarmModel *m = [[VPDeviceTextAlarmModel alloc] initWithAlarmDict:dict];
+    m.repeatState = [self iosRepeatStateFromAndroid:options[@"repeat"]];
+    m.alarmText   = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
+    m.alarmDate   = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
     [pm veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:m settingMode:VPDeviceTextAlarmSettingModelAddOrChange successResult:^(NSArray *alarmArray) {
@@ -2072,55 +2244,238 @@ UNI_EXPORT_METHOD(@selector(setTextAlarm:callback:))
     }];
 }
 
+/** 世界时钟上限（SDK 协议 dataID 1~10） */
+static const NSInteger kWorldClockMax = 10;
+
+/** 世界时钟本地缓存（懒加载；断连时清空，避免拿旧设备的列表当依据） */
+- (NSMutableArray<VPWorldClockModel *> *)worldClockCache {
+    if (!_worldClockCache) _worldClockCache = [NSMutableArray array];
+    return _worldClockCache;
+}
+
+/** 世界时钟能力位：VPPeripheralModel.worldClockType 非 0 才支持（头文件明写 0 表示不支持） */
+- (BOOL)worldClockSupported {
+    VPPeripheralModel *pm = [VPBleCentralManage sharedBleManager].peripheralModel;
+    return pm != nil && pm.worldClockType != 0;
+}
+
+/** 挑最小空闲 dataID（1~10），对齐 Demo WorldClockActivity.genNewId；满了返回 0 */
+- (uint8_t)nextWorldClockId {
+    for (uint8_t i = 1; i <= kWorldClockMax; i++) {
+        BOOL used = NO;
+        for (VPWorldClockModel *wc in self.worldClockCache) {
+            if (wc.dataID == i) { used = YES; break; }
+        }
+        if (!used) return i;
+    }
+    return 0;
+}
+
+/** 世界时钟模型 -> JS 事件项（字段与 Android buildWorldClockList 一致） */
+- (NSDictionary *)worldClockDict:(VPWorldClockModel *)wc {
+    return @{
+        @"id": @(wc.dataID),
+        @"timeZone": wc.standardTimeZoneDiffer ?: @0,
+        @"timeZoneName": wc.cityName ?: @"",
+        // iOS 模型没有「时区名称」字段，保持空串与 Android 字段对齐（页面用本地城市表补）
+        @"genericTimeZoneName": @"",
+        @"open": @YES
+    };
+}
+
+/**
+ 安装「设备端删除世界时钟」订阅（用户在手表上删掉时钟时通知 JS）。
+ SDK 只存一个槽位，断连后可能被清掉，所以按标志重装。
+ */
+- (void)installWorldClockDeleteSubIfNeeded {
+    if (self.worldClockSubInstalled) return;
+    self.worldClockSubInstalled = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSDKWorldClockDeviceDeleteSubscribe:^(uint8_t deleteID) {
+        // 设备端删除：同步本地缓存，并把新列表发给页面（页面收到 deleteByDevice 会重读）
+        [weakSelf removeCachedWorldClock:deleteID];
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @YES, @"op": @"deleteByDevice", @"id": @(deleteID)
+        }];
+    }];
+}
+
+/** 从本地缓存移除一条（按 dataID） */
+- (void)removeCachedWorldClock:(uint8_t)clockID {
+    for (NSInteger i = (NSInteger)self.worldClockCache.count - 1; i >= 0; i--) {
+        if (self.worldClockCache[(NSUInteger)i].dataID == clockID) {
+            [self.worldClockCache removeObjectAtIndex:(NSUInteger)i];
+        }
+    }
+}
+
+/**
+ 逐条串行删除世界时钟（clearWorldClocks 用）。
+ SDK 内部本身就是 30ms 间隔串行下发，这里保证「上一条回包后再发下一条」，
+ 避免并发把协议打乱；失败条数记在 state[@"failed"] 里，删完调 done。
+ */
+- (void)deleteWorldClockIDs:(NSArray<NSNumber *> *)ids
+                      index:(NSUInteger)index
+                      state:(NSMutableDictionary *)state
+                       done:(void (^)(void))done {
+    if (index >= ids.count) { done(); return; }
+    uint8_t delID = (uint8_t)[ids[index] integerValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    [pm veepooSDKWorldClockDeleteWithID:delID result:^(BOOL success) {
+        if (!success) state[@"failed"] = @([state[@"failed"] integerValue] + 1);
+        [weakSelf removeCachedWorldClock:delID];
+        [weakSelf deleteWorldClockIDs:ids index:index + 1 state:state done:done];
+    }];
+}
+
+/** 按 dataID 找缓存里的完整模型（删除时 SDK 需要整条，Android 侧同样做法） */
+- (VPWorldClockModel *)cachedWorldClockWithID:(uint8_t)clockID {
+    for (VPWorldClockModel *wc in self.worldClockCache) {
+        if (wc.dataID == clockID) return wc;
+    }
+    return nil;
+}
+
 /**
  读取世界时钟。一次性读取：callback 与事件都带 list。
- iOS SDK：veepooSDKWorldClockReadWithModels:result:（models 传本地缓存，首次传 @[]）
+ iOS SDK：veepooSDKWorldClockReadWithModels:result:
+          models 传本地缓存，SDK 内部会校验缓存是否需要更新（避免重复读取）
           VPWorldClockModel：dataID(1-10)、cityName、standardTimeZoneDiffer(相对 GMT 的 15 分钟数)
- Android：readWorldClock(...)；JS：joemeWatch.readWorldClock() -> resolve { list, count }
+ Android：readWorldClock(...)；JS：joemeWatch.readWorldClock() -> resolve { list, count, supported }
  事件：on('worldClock') -> { list, count }
+ 超时：设备不回包时 10 秒兜底，reject 带 message（页面用空态里的「重新读取」兜）
  */
 UNI_EXPORT_METHOD(@selector(readWorldClock:callback:))
 - (void)readWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    BOOL supported = [self worldClockSupported];
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    [pm veepooSDKWorldClockReadWithModels:@[] result:^(BOOL success, NSArray<VPWorldClockModel *> *models) {
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+
+    // 看门狗：不支持世界时钟的机型上 SDK 可能静默 return，不能让页面干等
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = supported ? @"读取世界时钟超时，请靠近手表重试"
+                                  : @"该手表不支持世界时钟";
+        r[@"supported"] = @(supported);
+        r[@"list"] = @[];
+        r[@"count"] = @0;
+        callback(r, NO);
+    });
+
+    // 传副本：回调里会 rebuild 这个缓存，直接传同一个可变数组等于边读边改
+    [pm veepooSDKWorldClockReadWithModels:[self.worldClockCache copy] result:^(BOOL success, NSArray<VPWorldClockModel *> *models) {
+        if (done) return;
+        done = YES;
+        if (!success) {
+            NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+            r[@"message"] = @"读取世界时钟失败";
+            r[@"supported"] = @(supported);
+            r[@"list"] = @[];
+            r[@"count"] = @0;
+            callback(r, NO);
+            return;
+        }
+        // 用设备回包重建缓存（设备才是真源）
+        [weakSelf.worldClockCache removeAllObjects];
         NSMutableArray *list = [NSMutableArray array];
         for (VPWorldClockModel *wc in models) {
-            [list addObject:@{
-                @"id": @(wc.dataID),
-                @"timeZone": wc.standardTimeZoneDiffer ?: @0,
-                @"timeZoneName": wc.cityName ?: @"",
-                // iOS 模型没有「时区名称」字段，保持空串与 Android 字段对齐
-                @"genericTimeZoneName": @"",
-                @"open": @YES
-            }];
+            if (![wc isKindOfClass:[VPWorldClockModel class]]) continue;
+            [weakSelf.worldClockCache addObject:wc];
+            [list addObject:[weakSelf worldClockDict:wc]];
         }
+        // 空列表也算「读过了」：设备上 0 个时钟正是第一次添加的场景
+        weakSelf.worldClockRead = YES;
+        [weakSelf installWorldClockDeleteSubIfNeeded];
+
         NSDictionary *d = @{ @"list": list, @"count": @(list.count) };
-        [self sendEvent:@"worldClock" data:d];
-        NSMutableDictionary *res = [resultWithCode(success ? 200 : -1) mutableCopy];
+        [weakSelf sendEvent:@"worldClock" data:d];
+        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
         [res addEntriesFromDictionary:d];
+        res[@"supported"] = @(supported);
         callback(res, NO);
     }];
 }
 
 /**
- 新增世界时钟。options: { timeZone | offset, timeZoneName | city, id? }
+ 新增世界时钟。options: { timeZone, timeZoneName, genericTimeZoneName?, id? }
  iOS SDK：veepooSDKWorldClockAddWithModel:result:
  Android：addWorldClock(...)；JS：joemeWatch.addWorldClock({...})
- 事件：on('worldClockOp') -> { ok, op:'add', id }
- id 不传时由 iOS 侧不写 dataID（0），由设备分配；Android 侧会补最小空闲 id。
+ 事件：on('worldClockOp') -> { ok, op:'add', count, id }
+ id 不传时按「当前缓存里的占用情况」取最小空闲 id（对齐 Demo genNewId）。
+ 未读过列表时回 needRead，由页面补一次读取再重试（与 Android 同口径）。
  */
 UNI_EXPORT_METHOD(@selector(addWorldClock:callback:))
 - (void)addWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    id tz = options[@"timeZone"] ?: options[@"offset"];
+    if (tz == nil) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"需要 timeZone（15 分钟为单位的时区偏移）";
+        callback(r, NO);
+        return;
+    }
+    // id 显式给的才用它；传 0 / 负数等同于没传（页面重试时可能算不出来传 0）
+    NSInteger explicitID = options[@"id"] ? [options[@"id"] integerValue] : 0;
+    // 没显式给 id 时必须先读过列表：否则生成的 id 可能和手表上已有的时钟冲突
+    if (explicitID <= 0 && !self.worldClockRead) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"请先读取一次世界时钟列表，再添加";
+        r[@"needRead"] = @YES;
+        callback(r, NO);
+        return;
+    }
+    uint8_t clockID = explicitID > 0 ? (uint8_t)explicitID : [self nextWorldClockId];
+    if (clockID < 1 || clockID > kWorldClockMax) {
+        NSMutableDictionary *r = [resultWithCode(-2) mutableCopy];
+        r[@"message"] = [NSString stringWithFormat:@"世界时钟已满（最多 %ld 个）", (long)kWorldClockMax];
+        callback(r, NO);
+        return;
+    }
+
     VPWorldClockModel *m = [[VPWorldClockModel alloc] init];
+    m.dataID = clockID;
     m.cityName = options[@"timeZoneName"] ?: options[@"city"] ?: @"";
-    m.dataID = [options[@"id"] unsignedCharValue];
-    m.standardTimeZoneDiffer = options[@"timeZone"] ?: options[@"offset"] ?: @0;
+    // SDK 属性是 NSNumber；JS 侧可能传来字符串（如从 query 带过来），统一转成数值
+    m.standardTimeZoneDiffer = [tz isKindOfClass:[NSNumber class]] ? tz : @([tz integerValue]);
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"worldClockOp" data:@{ @"ok": @NO, @"op": @"add", @"id": @(clockID) }];
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"添加世界时钟超时，请重试";
+        r[@"id"] = @(clockID);
+        callback(r, NO);
+    });
+
     [pm veepooSDKWorldClockAddWithModel:m result:^(BOOL success) {
-        [self sendEvent:@"worldClockOp" data:@{ @"ok": @(success), @"op": @"add", @"id": @(m.dataID) }];
-        callback(resultWithCode(success ? 200 : -1), NO);
+        if (done) return;
+        done = YES;
+        if (success) {
+            // SDK 缓存里没有名称，手动补进本地缓存，供后续挑空闲 id 判断占用
+            if (![weakSelf cachedWorldClockWithID:clockID]) {
+                [weakSelf.worldClockCache addObject:m];
+            }
+        }
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @(success), @"op": @"add", @"count": @(weakSelf.worldClockCache.count), @"id": @(clockID)
+        }];
+        NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
+        r[@"id"] = @(clockID);
+        r[@"op"] = @"add";
+        if (!success) r[@"message"] = @"新增世界时钟失败";
+        callback(r, NO);
     }];
 }
 
@@ -2128,80 +2483,178 @@ UNI_EXPORT_METHOD(@selector(addWorldClock:callback:))
  删除世界时钟。options: { id }（dataID，1 起）。
  iOS SDK：veepooSDKWorldClockDeleteWithID:result:
  Android：deleteWorldClock(...)；JS：joemeWatch.deleteWorldClock({ id })
- 事件：on('worldClockOp') -> { ok, op:'delete', id }
+ 事件：on('worldClockOp') -> { ok, op:'delete', count, id }
  */
 UNI_EXPORT_METHOD(@selector(deleteWorldClock:callback:))
 - (void)deleteWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    uint8_t delID = [options[@"id"] unsignedCharValue];
+    NSInteger rawID = options[@"id"] ? [options[@"id"] integerValue] : 0;
+    if (rawID < 1 || rawID > kWorldClockMax) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = [NSString stringWithFormat:@"需要 id（1~%ld）", (long)kWorldClockMax];
+        callback(r, NO);
+        return;
+    }
+    uint8_t delID = (uint8_t)rawID;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"worldClockOp" data:@{ @"ok": @NO, @"op": @"delete", @"id": @(delID) }];
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"删除世界时钟超时，请重试";
+        r[@"id"] = @(delID);
+        callback(r, NO);
+    });
+
     [pm veepooSDKWorldClockDeleteWithID:delID result:^(BOOL success) {
-        [self sendEvent:@"worldClockOp" data:@{ @"ok": @(success), @"op": @"delete", @"id": @(delID) }];
-        callback(resultWithCode(success ? 200 : -1), NO);
+        if (done) return;
+        done = YES;
+        if (success) [weakSelf removeCachedWorldClock:delID];
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @(success), @"op": @"delete", @"count": @(weakSelf.worldClockCache.count), @"id": @(delID)
+        }];
+        NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
+        r[@"id"] = @(delID);
+        r[@"op"] = @"delete";
+        if (!success) r[@"message"] = @"删除世界时钟失败";
+        callback(r, NO);
     }];
 }
 
 /**
- 清空世界时钟。iOS SDK 没有「批量删除」接口，这里按 options.list 逐条删除。
- options: { list: [{ id }] }（不传时返回 -1，由页面先 readWorldClock 再传回来）
+ 清空世界时钟。iOS SDK 没有「批量删除」接口，这里按 list 逐条串行删除。
+ options: { list?: [{ id }] }（不传时用本地缓存；都没有则回 -1）
  Android：clearWorldClocks(...)；JS：joemeWatch.clearWorldClocks()
- 事件：on('worldClockOp') -> { ok, op:'deleteAll', count }
+ 事件：on('worldClockOp') -> { ok, op:'deleteAll', count, failed }
+ 注意：逐条串行下发（上一条回包后再发下一条），SDK 内部本身也是间隔 30ms 串行。
  */
 UNI_EXPORT_METHOD(@selector(clearWorldClocks:callback:))
 - (void)clearWorldClocks:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    // 优先用页面传来的 list（缓存丢失时兜底），否则用本地缓存
+    NSMutableArray<NSNumber *> *ids = [NSMutableArray array];
     NSArray *list = options[@"list"];
-    if (![list isKindOfClass:[NSArray class]] || list.count == 0) {
-        callback(resultWithCode(-1), NO);
+    if ([list isKindOfClass:[NSArray class]] && list.count > 0) {
+        for (NSDictionary *item in list) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSInteger v = [item[@"id"] integerValue];
+            if (v >= 1 && v <= kWorldClockMax) [ids addObject:@(v)];
+        }
+    } else {
+        for (VPWorldClockModel *wc in self.worldClockCache) {
+            [ids addObject:@(wc.dataID)];
+        }
+    }
+    if (ids.count == 0) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"列表为空，请先读取世界时钟";
+        callback(r, NO);
         return;
     }
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    __block NSInteger remain = list.count;
-    __block BOOL allOk = YES;
-    for (NSDictionary *item in list) {
-        uint8_t delID = [item[@"id"] unsignedCharValue];
-        [pm veepooSDKWorldClockDeleteWithID:delID result:^(BOOL success) {
-            if (!success) allOk = NO;
-            remain--;
-            if (remain <= 0) {
-                [self sendEvent:@"worldClockOp" data:@{
-                    @"ok": @(allOk), @"op": @"deleteAll", @"count": @(list.count)
-                }];
-                callback(resultWithCode(allOk ? 200 : -1), NO);
-            }
+
+    __weak typeof(self) weakSelf = self;
+    NSInteger total = (NSInteger)ids.count;
+    // 用可变字典做计数盒：block 会持有它，不存在栈指针悬空/block 自持循环
+    NSMutableDictionary *state = [NSMutableDictionary dictionary];
+    state[@"failed"] = @0;
+    __block BOOL finished = NO;
+
+    void (^finish)(void) = ^{
+        if (finished) return;
+        finished = YES;
+        NSInteger failed = [state[@"failed"] integerValue];
+        BOOL allOk = (failed == 0);
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @(allOk), @"op": @"deleteAll",
+            @"count": @(total), @"failed": @(failed)
         }];
-    }
+        NSMutableDictionary *r = [resultWithCode(allOk ? 200 : -1) mutableCopy];
+        r[@"op"] = @"deleteAll";
+        r[@"count"] = @(total);
+        r[@"failed"] = @(failed);
+        if (!allOk) r[@"message"] = [NSString stringWithFormat:@"有 %ld 个删除失败", (long)failed];
+        callback(r, NO);
+    };
+
+    [self deleteWorldClockIDs:ids index:0 state:state done:finish];
+
+    // 看门狗：每条按 5 秒估，至少 10 秒
+    NSTimeInterval wait = MAX(10.0, 5.0 * (double)total);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (finished) return;
+        finished = YES;
+        NSInteger failed = [state[@"failed"] integerValue];
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @NO, @"op": @"deleteAll", @"count": @(total), @"failed": @(failed)
+        }];
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"清空世界时钟超时，请重试";
+        r[@"failed"] = @(failed);
+        callback(r, NO);
+    });
 }
 
 /**
- 调整世界时钟顺序。
+ 调整世界时钟顺序（SDK 语义是「交换两个位置」，不是插入）。
  options: { from, to } 1-based（同 Android）或 { fromIndex, toIndex } 0-based。
  iOS SDK：veepooSDKWorldClockAdjustOrderFromArrIndex:toArrIndex:result:（内部按 0-based 数组下标）
  Android：moveWorldClock(...)；JS：joemeWatch.moveWorldClock({...})
- 事件：on('worldClockOp') -> { ok, op:'move' }
+ 事件：on('worldClockOp') -> { ok, op:'move', count }
  */
 UNI_EXPORT_METHOD(@selector(moveWorldClock:callback:))
 - (void)moveWorldClock:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSInteger from = options[@"from"] ? [options[@"from"] integerValue]
-                                     : [options[@"fromIndex"] integerValue];
-    NSInteger to = options[@"to"] ? [options[@"to"] integerValue]
-                                  : [options[@"toIndex"] integerValue];
-    // from/to 传的是 1-based 时转成 0-based；fromIndex/toIndex 已经是 0-based
-    if (options[@"from"] || options[@"to"]) {
-        if (from > 0) from -= 1;
-        if (to > 0) to -= 1;
-    }
-    if (from < 0 || to < 0) {
-        callback(resultWithCode(-1), NO);
+    // from/to 是 1-based；fromIndex/toIndex 是 0-based。缺省一律按 0-based 处理，
+    // 不能先赋 0 再判断（0 是合法下标，会被误当成「没传」）。
+    BOOL oneBased = (options[@"from"] != nil || options[@"to"] != nil);
+    NSInteger from = oneBased ? [options[@"from"] integerValue] - 1
+                              : [options[@"fromIndex"] integerValue];
+    NSInteger to = oneBased ? [options[@"to"] integerValue] - 1
+                            : [options[@"toIndex"] integerValue];
+    NSInteger size = (NSInteger)self.worldClockCache.count;
+    if (size < 2 || from < 0 || to < 0 || from >= size || to >= size) {
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"顺序参数越界（需先读取列表，from/to 从 1 开始）";
+        callback(r, NO);
         return;
     }
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"worldClockOp" data:@{ @"ok": @NO, @"op": @"move" }];
+        NSMutableDictionary *r = [resultWithCode(-1) mutableCopy];
+        r[@"message"] = @"调整顺序超时，请重试";
+        callback(r, NO);
+    });
+
     [pm veepooSDKWorldClockAdjustOrderFromArrIndex:(uint8_t)from
                                         toArrIndex:(uint8_t)to
                                             result:^(BOOL success) {
-        [self sendEvent:@"worldClockOp" data:@{ @"ok": @(success), @"op": @"move" }];
-        callback(resultWithCode(success ? 200 : -1), NO);
+        if (done) return;
+        done = YES;
+        if (success && from != to) {
+            // 同步本地缓存顺序，后续 move 的下标才对得上
+            [weakSelf.worldClockCache exchangeObjectAtIndex:(NSUInteger)from
+                                          withObjectAtIndex:(NSUInteger)to];
+        }
+        [weakSelf sendEvent:@"worldClockOp" data:@{
+            @"ok": @(success), @"op": @"move", @"count": @(weakSelf.worldClockCache.count)
+        }];
+        NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
+        r[@"op"] = @"move";
+        if (!success) r[@"message"] = @"调整顺序失败";
+        callback(r, NO);
     }];
 }
 
@@ -3409,13 +3862,25 @@ UNI_EXPORT_METHOD(@selector(setHeartAlarm:callback:))
     BOOL on = [options[@"on"] boolValue];
     VPDeviceHeartAlarmModel *m = [[VPDeviceHeartAlarmModel alloc] initWithHeartMaxValue:high heartMinValue:low openState:on];
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL fired = NO;
+    void (^finish)(BOOL) = ^(BOOL ok) {
+        if (fired) return;
+        fired = YES;
+        [weakSelf sendEvent:@"heartAlarm" data:@{ @"ok": @(ok) }];
+        // 负向回 -1：页面（monitor.vue / heart.vue）靠 catch 回滚界面并提示，
+        // 回 200 会让「保存失败」也弹「已保存」。
+        callback(resultWithCode(ok ? 200 : -1), NO);
+    };
     [pm veepooSDKSettingDeviceHeartAlarmWithHeartAlarmModel:m settingMode:(on ? 1 : 0) successResult:^(VPDeviceHeartAlarmModel *hm) {
-        [self sendEvent:@"heartAlarm" data:@{ @"ok": @YES }];
-        callback(resultWithCode(200), NO);
+        finish(YES);
     } failureResult:^{
-        [self sendEvent:@"heartAlarm" data:@{ @"ok": @NO }];
-        callback(resultWithCode(200), NO);
+        finish(NO);
     }];
+
+    // 设备不回包时 6 秒兜底：否则 onSaveHighHr 的 await 永远不返回，弹窗关掉后没有任何提示
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(NO); });
 }
 
 /**
@@ -4070,49 +4535,9 @@ UNI_EXPORT_METHOD(@selector(bind4GAccount:callback:))
     }];
 }
 
-/**
- 读取当前表盘列表/信息。
- iOS SDK：veepooSDK_dialChannelWithChannelModel:dialType:photoDialModel:result:transformProgress:
-          （VPDialChannelModelRead；需 JL 系设备）
- Android：listJLWatchList(...)；JS：joemeWatch.dialList() -> resolve { list }
- 事件：on('dial') -> { list }
- 注：返回 VPDeviceMarketDialModel.imageId（当前市场表盘图片 ID）；完整表盘下载列表需厂商联调。
- */
-UNI_EXPORT_METHOD(@selector(dialList:callback:))
-- (void)dialList:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if (![self checkReady:callback]) return;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelRead dialType:VPDeviceDialTypeMarket photoDialModel:nil result:^(VPPhotoDialModel *photoDialModel, VPDeviceMarketDialModel *deviceMarketDialModel, NSError *error) {
-        NSMutableArray *list = [NSMutableArray array];
-        if (deviceMarketDialModel) {
-            [list addObject:@{ @"imageId": @(deviceMarketDialModel.imageId) }];
-        }
-        NSDictionary *d = @{ @"list": list };
-        [self sendEvent:@"dial" data:d];
-        NSMutableDictionary *res = [resultWithCode(200) mutableCopy];
-        [res addEntriesFromDictionary:d];
-        callback(res, NO);
-    } transformProgress:^(double progress) {}];
-}
-
-/**
- 设置表盘。options: { dialId }。
- iOS SDK：veepooSDK_dialChannelWithChannelModel:...（Setup 模式；需 JL 系设备，市场表盘 bin 需先下载再流式传输）
- Android：setJLWatchDial / setJLWatchPhotoDial；JS：joemeWatch.setDial(dialId)
- 事件：on('dial') -> { ok }
- 注：iOS 端完整换表盘需 bin 文件流式下发，本桥接仅触发通道建立；dialId 到 bin 的映射待厂商/真机确认。
- */
-UNI_EXPORT_METHOD(@selector(setDial:callback:))
-- (void)setDial:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if (![self checkReady:callback]) return;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelSetup dialType:VPDeviceDialTypeMarket photoDialModel:nil result:^(VPPhotoDialModel *photoDialModel, VPDeviceMarketDialModel *deviceMarketDialModel, NSError *error) {
-        [self sendEvent:@"dial" data:@{ @"ok": @(error == nil) }];
-        callback(resultWithCode(200), NO);
-    } transformProgress:^(double progress) {
-        [self sendEvent:@"dial" data:@{ @"progress": @(progress) }];
-    }];
-}
+// 注：dialList / setDial 的实现放在「批次 7：表盘」里（与 dialCapability / dialOnline /
+// downloadDial 相邻）。UNI_EXPORT_METHOD 重复注册同一个 selector 会互相覆盖，
+// 所以这里只留一行说明，不要再补一份实现。
 
 /**
  打开设备经典蓝牙开关。options: { on }（iOS 仅有"打开"命令）。
@@ -5540,9 +5965,11 @@ UNI_EXPORT_METHOD(@selector(readSpo2AutoDetect:callback:))
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
-                            settingState:VPReadFunctionState
-                           completeBlock:^(VPSettingFunctionCompleteState state) {
+
+    __block BOOL emitted = NO;
+    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+        if (emitted) return;
+        emitted = YES;
         NSInteger open = -1;
         if (state == VPFunctionCompleteOpen) open = 1;
         else if (state == VPFunctionCompleteClose) open = 0;
@@ -5553,7 +5980,18 @@ UNI_EXPORT_METHOD(@selector(readSpo2AutoDetect:callback:))
         NSMutableDictionary *r = [resultWithCode(open >= 0 ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+
+    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
+                            settingState:VPReadFunctionState
+                           completeBlock:^(VPSettingFunctionCompleteState state) {
+        finish(state);
     }];
+
+    // 设备不回包时 6 秒兜底：否则页面 readAutoMonitor 的 Promise 永久 pending，
+    // 血氧页开关一直停在初值。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
 }
 
 /**
@@ -5568,8 +6006,10 @@ UNI_EXPORT_METHOD(@selector(setSpo2AutoDetect:callback:))
     BOOL on = options[@"on"] ? [options[@"on"] boolValue] : YES;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose)
-                                  result:^(VPSettingFunctionCompleteState state) {
+    __block BOOL fired = NO;
+    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+        if (fired) return;
+        fired = YES;
         BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
                    || state == VPFunctionCompleteComplete);
         NSDictionary *d = @{ @"isOpen": @(on ? 1 : 0), @"openState": @(state), @"ok": @(ok) };
@@ -5577,7 +6017,15 @@ UNI_EXPORT_METHOD(@selector(setSpo2AutoDetect:callback:))
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+    [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose)
+                                  result:^(VPSettingFunctionCompleteState state) {
+        finish(state);
     }];
+
+    // 设备不回包时 6 秒兜底：否则血氧页开关一直停在 busy 态（Promise 永不结束）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
 }
 
 /**
@@ -5594,7 +6042,11 @@ UNI_EXPORT_METHOD(@selector(readAutoMeasureSetting:callback:))
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKReadAutoMonitSwitchInfo:^(NSArray<VPAutoMonitTestModel *> *models) {
+
+    __block BOOL fired = NO;
+    void (^finish)(NSArray<VPAutoMonitTestModel *> *) = ^(NSArray<VPAutoMonitTestModel *> *models) {
+        if (fired) return;
+        fired = YES;
         NSMutableArray *items = [NSMutableArray array];
         NSMutableString *text = [NSMutableString string];
         for (VPAutoMonitTestModel *m in models) {
@@ -5619,7 +6071,16 @@ UNI_EXPORT_METHOD(@selector(readAutoMeasureSetting:callback:))
         NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+
+    [pm veepooSDKReadAutoMonitSwitchInfo:^(NSArray<VPAutoMonitTestModel *> *models) {
+        finish(models);
     }];
+
+    // 设备不回包时 6 秒兜底：heart.vue 进页面就 await 它，不兜底会一直挂在 pending。
+    // 回空列表（不发事件）：页面按「没读到」处理，保留本地值而不是把开关翻成关。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(@[]); });
 }
 
 /** VPAutoMonitTestType -> Android AutoMeasureData 的 funType 名（页面按这个字符串匹配） */
@@ -5640,9 +6101,13 @@ UNI_EXPORT_METHOD(@selector(readAutoMeasureSetting:callback:))
 
 /**
  读取全天血氧自动检测开关（AllSetSetting 通道）。
- JS：joemeWatch.readAllDayOxygen() -> resolve + on('allDayOxygen') { ok, isOpen, openState }
+ JS：joemeWatch.readAllDayOxygen() -> resolve + on('allDayOxygen')
+   { ok, isOpen, openState, data: "AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=1}" }
  说明：iOS 没有 AllSetData 回包，这里读基本开关 VPSettingAutomaticOxygenTest，
       与 readSpo2AutoDetect 共用同一能力位（只是事件名不同，页面各自监听）。
+      **data 必须给**：monitor.vue 的 applyAllDayOxygen 先找 'AllSetData' 前缀，
+      找不到直接 return，allDayOxygenLoaded 永远为 false，血氧自动监测开关就一直是灰的。
+      读取失败（无回包/设备不支持）时故意不带 data，让页面保持「未读到」而不是显示成「关」。
  */
 UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
 - (void)readAllDayOxygen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -5650,21 +6115,45 @@ UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
-                            settingState:VPReadFunctionState
-                           completeBlock:^(VPSettingFunctionCompleteState state) {
+
+    __block BOOL emitted = NO;
+    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+        if (emitted) return;
+        emitted = YES;
         BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose);
         BOOL isOpen = (state == VPFunctionCompleteOpen);
+        // 读失败时退回握手拿到能力位（1=开，其它=未知），与 readSpo2AutoDetect 同口径
         if (!ok && model.oxygenAutoDetectType > 0) {
             isOpen = (model.oxygenAutoDetectType == 1);
             ok = YES;
         }
-        NSDictionary *d = @{ @"ok": @(ok), @"isOpen": @(isOpen), @"openState": @(state) };
+        NSMutableDictionary *d = [@{ @"ok": @(ok),
+                                     @"isOpen": @(isOpen),
+                                     @"openState": @(state) } mutableCopy];
+        if (ok) {
+            // Android AllSetData.toString() 同形：页面按 isOpen=1/0 判断开/关。
+            // 同时给 data 与 summary：Android 的读接口用的是 summary 键，
+            // 页面的 _payload 对两者都能兜住。
+            NSString *text = [NSString stringWithFormat:
+                              @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=%d}", isOpen ? 1 : 0];
+            d[@"data"] = text;
+            d[@"summary"] = text;
+        }
         [weakSelf sendEvent:@"allDayOxygen" data:d];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+
+    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
+                            settingState:VPReadFunctionState
+                           completeBlock:^(VPSettingFunctionCompleteState state) {
+        finish(state);
     }];
+
+    // 设备不回包时 6 秒兜底：否则 JS Promise 永久 pending，页面开关一直是灰的
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
 }
 
 // ==================== 批次 4：通知 / 通讯录 / SOS ====================
@@ -5906,8 +6395,9 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
 }
 
 /**
- 下一个可用的闹钟 ID：取已用 ID 里最小的空缺（1~10），都占满时返回 1。
+ 下一个可用的闹钟 ID：取已用 ID 里最小的空缺（1~10）；一个空位都没有时返回 nil。
  设备侧 ID 范围是 1-10（ALARM_FULL），所以按这个区间找空位。
+ 返回 nil 而不是「退回 1」：满了还传 1 会覆盖已存在的闹钟。
  */
 - (NSString *)nextTextAlarmId {
     NSMutableSet<NSNumber *> *used = [NSMutableSet set];
@@ -5918,7 +6408,7 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
     for (NSInteger i = 1; i <= 10; i++) {
         if (![used containsObject:@(i)]) return [NSString stringWithFormat:@"%ld", (long)i];
     }
-    return @"1";
+    return nil;
 }
 
 /** 从 options 构造 iOS 文本闹钟模型（增/改/删共用） */
@@ -6101,9 +6591,19 @@ UNI_EXPORT_METHOD(@selector(readHeartAlarm:callback:))
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
+    // successResult / failureResult / 超时兜底三选一，避免回调重入
+    __block BOOL fired = NO;
+    void (^fail)(void) = ^{
+        if (fired) return;
+        fired = YES;
+        [weakSelf sendEvent:@"heartAlarm" data:@{ @"ok": @NO }];
+        callback(resultWithCode(-1), NO);
+    };
     [pm veepooSDKSettingDeviceHeartAlarmWithHeartAlarmModel:[[VPDeviceHeartAlarmModel alloc] init]
                                                 settingMode:2
                                               successResult:^(VPDeviceHeartAlarmModel *hm) {
+        if (fired) return;
+        fired = YES;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(hm != nil);
         if (hm) {
@@ -6119,9 +6619,12 @@ UNI_EXPORT_METHOD(@selector(readHeartAlarm:callback:))
         [r addEntriesFromDictionary:d];
         callback(r, NO);
     } failureResult:^{
-        [weakSelf sendEvent:@"heartAlarm" data:@{ @"ok": @NO }];
-        callback(resultWithCode(-1), NO);
+        fail();
     }];
+
+    // 设备不回包时 6 秒兜底，否则 JS Promise 永久 pending
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ fail(); });
 }
 
 /**
@@ -6369,8 +6872,11 @@ UNI_EXPORT_METHOD(@selector(readFindDeviceSetting:callback:))
  说明：Android 页面正则按英文/中文混合键取值，这里的键名与 SDK 的 toString 完全一致：
    isOpenAutoHeartDetect  心率自动检测（bool）
    自动检测HRV / 低氧报警 / 体温自动检测 / 血糖监测 / 压力 / 血液成分开关 / 跌倒检测（EFunctionStatus 名）
-   血糖单位 / 尿 酸单位 / 血脂单位（枚举名）
+   ppg                    科学睡眠（Android toString 键名就是 ppg，对应 CustomSettingData.ppg）
+   血糖单位 / 尿酸单位 / 血脂单位（枚举名）
  各字段是串行读取（SDK 不支持并发命令），全部读完才发一次事件。
+ 11+1 条命令串行下发，任一命令无回包会把整条链卡死、页面永远「未读到设备设置」，
+ 所以有 10 秒看门狗：到点就把已读到的字段先发出去。
  */
 UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
 - (void)readCustomSetting:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -6390,6 +6896,7 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
         @(VPSettingStress),                   // 压力
         @(VPSettingAutomaticBloodCompTest),   // 血液成分开关
         @(VPSettingFallDetection),            // 跌倒检测
+        @(VPSettingAutomaticPPGTest),         // 科学睡眠（头文件：精准睡眠由 PPG 控制）
         @(VPSettingBloodGlucoseUnit),         // 血糖单位
         @(VPSettingUricAcidUnit),             // 尿酸单位
         @(VPSettingLipidUnit)                 // 血脂单位
@@ -6397,13 +6904,23 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
     NSArray<NSString *> *keys = @[
         @"isOpenAutoHeartDetect", @"自动检测HRV", @"低氧报警", @"体温自动检测",
         @"血糖监测", @"压力", @"血液成分开关", @"跌倒检测",
+        @"ppg",
         @"血糖单位", @"尿酸单位", @"血脂单位"
     ];
 
     __block NSUInteger idx = 0;
+    __block BOOL emitted = NO;
     __block void (^next)(void);
 
     void (^emit)(void) = ^{
+        if (emitted) return;
+        emitted = YES;
+        if (v.count == 0) {
+            // 一个字段都没读到（设备未连接/全部超时）：不发 customSettingRead，
+            // 页面就不会把 customSettingLoaded 置 true，也就不会拿界面默认值去写设备。
+            callback(resultWithCode(-1), NO);
+            return;
+        }
         NSMutableString *text = [NSMutableString stringWithString:@"CustomSettingData{"];
         NSUInteger n = 0;
         for (NSString *key in keys) {
@@ -6420,11 +6937,21 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
         callback(r, NO);
     };
 
+    // 看门狗：12 条命令串行，单条无回包会卡死整条链（页面据此判定「已读到」，
+    // 卡住就永远不允许改开关）。10 秒到点先发已读到的部分，字段缺失的开关页面保留原值。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ emit(); });
+
     next = ^{
-        if (idx >= types.count) { emit(); return; }
+        // 看门狗已经发过结果就不再继续下发命令，省掉无意义的 BLE 往返
+        if (emitted || idx >= types.count) { emit(); return; }
         NSUInteger i = idx++;
         VPSettingBaseFunctionSwitchType t = (VPSettingBaseFunctionSwitchType)[types[i] integerValue];
-        [weakSelf readBaseSwitch:t done:^(VPSettingFunctionCompleteState state) {
+        // 单条命令 3 秒不回包就跳过：否则一条卡住会把后面所有开关都拖成「未读到」
+        __block BOOL stepped = NO;
+        void (^step)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+            if (stepped) return;
+            stepped = YES;
             NSString *key = keys[i];
             if ([key isEqualToString:@"isOpenAutoHeartDetect"]) {
                 // 心率自动检测在 Android toString 里是布尔（不是 EFunctionStatus）
@@ -6435,7 +6962,12 @@ UNI_EXPORT_METHOD(@selector(readCustomSetting:callback:))
                 if (name) v[key] = name;
             }
             next();
+        };
+        [weakSelf readBaseSwitch:t done:^(VPSettingFunctionCompleteState state) {
+            step(state);
         }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ step(VPFunctionCompleteFailure); });
     };
     next();
 }
@@ -6524,8 +7056,20 @@ UNI_EXPORT_METHOD(@selector(changeCustomSetting:callback:))
     __block void (^next)(void);
     next = ^{
         if (idx >= cmds.count) {
-            // 写完回读一次，页面靠 customSettingRead 回显（与 Android echo 同口径）
-            [weakSelf readCustomSetting:@{} callback:callback];
+            // 写完回读一次，页面靠 customSettingRead 回显（与 Android echo 同口径）。
+            // ⚠ 回读失败不能当成写入失败：命令已经下发到设备了，回 -1 会让页面把开关回滚，
+            // 界面和设备反而对不上。所以回读失败时改回 200 + echoFailed。
+            [weakSelf readCustomSetting:@{} callback:^(id res, BOOL keepAlive) {
+                NSDictionary *rr = [res isKindOfClass:[NSDictionary class]] ? res : @{};
+                if ([rr[@"code"] integerValue] == 200) {
+                    callback(res, NO);
+                } else {
+                    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+                    r[@"ok"] = @YES;
+                    r[@"echoFailed"] = @YES;
+                    callback(r, NO);
+                }
+            }];
             return;
         }
         NSDictionary *cmd = cmds[idx++];
@@ -6536,9 +7080,19 @@ UNI_EXPORT_METHOD(@selector(changeCustomSetting:callback:))
             type = [weakSelf baseFunctionTypeForKey:cmd[@"key"]];
         }
         VPSettingFunctionState state = (VPSettingFunctionState)[cmd[@"state"] integerValue];
-        [pm veepooSDKSettingBaseFunctionType:type settingState:state completeBlock:^(VPSettingFunctionCompleteState s) {
+        // 单条命令的设备回包兜底：某条不回包时不能把整条链卡死，
+        // 否则 JS 侧 Promise 永远 pending、页面开关一直转圈。
+        __block BOOL stepped = NO;
+        void (^step)(void) = ^{
+            if (stepped) return;
+            stepped = YES;
             next();
+        };
+        [pm veepooSDKSettingBaseFunctionType:type settingState:state completeBlock:^(VPSettingFunctionCompleteState s) {
+            step();
         }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ step(); });
     };
     next();
 }
@@ -6664,25 +7218,47 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
     if (![self checkReady:callback]) return;
     __weak typeof(self) weakSelf = self;
     [[VPWeatherHandle share] readWeatherInfo:^(VPWeatherSettingState state, VPWeatherConfigModel *cfg) {
-        BOOL ok = (state == VPWeatherSettingStateSuccess) && cfg != nil;
+        // live = 这次回调真的带了模型。注意必须在用缓存兜底**之前**判断，
+        // 否则「state=Success + 只有缓存」会被误当成实时读到 → 保存后的回读
+        // 用缓存证明缓存（真机上就是「提示已保存、实际没写进设备」的来源）。
+        BOOL live = (state == VPWeatherSettingStateSuccess) && cfg != nil;
+        // 兜底：SDK 自己的缓存（VPWeatherHandle 会保留上次读写的 cofigModel）
+        if (!cfg) cfg = [VPWeatherHandle share].cofigModel;
+
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        d[@"ok"] = @(ok);
-        // oprate：与 Android 同口径（READ_SUCCESS / READ_FAIL / UNKONW）。
-        // 页面靠它区分「状态回包」和「写回执」，也靠 FAIL 丢弃无效状态。
-        d[@"oprate"] = ok ? @"READ_SUCCESS"
-                          : (state == VPWeatherSettingStateNone ? @"UNKONW" : @"READ_FAIL");
         if (cfg) {
             d[@"isOpen"] = @(cfg.switchState == 1);
             d[@"weatherType"] = (cfg.weatherUnit == 1) ? @"F" : @"C";
+            d[@"crc"] = @(cfg.crc);
+            d[@"ok"] = @YES;
+            d[@"oprate"] = @"READ_SUCCESS";
+            if (!live) d[@"cached"] = @YES;   // 来自缓存而非本次实时读
             d[@"raw"] = [NSString stringWithFormat:@"WeatherStatusData{isOpen=%@, weatherType=%@}",
                          cfg.switchState == 1 ? @"true" : @"false", d[@"weatherType"]];
+            // 只有实时读到的才更新快照；缓存帧不能再写回快照（否则缓存自我延续）
+            if (live) {
+                weakSelf.lastWeatherStatus = @{
+                    @"isOpen": @(cfg.switchState == 1),
+                    @"weatherType": d[@"weatherType"],
+                    @"crc": @(cfg.crc)
+                };
+            }
+        } else if (weakSelf.lastWeatherStatus) {
+            d[@"isOpen"] = weakSelf.lastWeatherStatus[@"isOpen"];
+            d[@"weatherType"] = weakSelf.lastWeatherStatus[@"weatherType"];
+            if (weakSelf.lastWeatherStatus[@"crc"]) d[@"crc"] = weakSelf.lastWeatherStatus[@"crc"];
+            d[@"ok"] = @YES;
+            d[@"oprate"] = @"READ_SUCCESS";
+            d[@"cached"] = @YES;
         } else {
-            // 拿不到模型：不给 isOpen，避免页面把开关误翻成「关」
+            // 真的没有状态：不给 isOpen，避免页面把开关误翻成「关」
+            d[@"ok"] = @NO;
+            d[@"oprate"] = (state == VPWeatherSettingStateNone) ? @"UNKONW" : @"READ_FAIL";
             d[@"noData"] = @YES;
             d[@"message"] = @"设备不支持天气或读取失败";
         }
         [weakSelf sendEvent:@"weather" data:d];
-        NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
+        NSMutableDictionary *r = [resultWithCode([d[@"ok"] boolValue] ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
     }];
@@ -6698,7 +7274,17 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
 UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
 - (void)setWeatherStatus:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    BOOL open = options[@"isOpen"] ? [options[@"isOpen"] boolValue] : YES;
+    // isOpen 不传 = 保持设备当前开关不动（用上次读到的状态，拿不到就当开启）。
+    // 页面在「没读到天气状态」时只传 unit，靠这条分支保住设备原开关，
+    // 而不是因为读不到状态就整段跳过单位写入。
+    BOOL open;
+    if (options[@"isOpen"] != nil) {
+        open = [options[@"isOpen"] boolValue];
+    } else if (self.lastWeatherStatus[@"isOpen"] != nil) {
+        open = [self.lastWeatherStatus[@"isOpen"] boolValue];
+    } else {
+        open = YES;
+    }
     NSString *u = options[@"unit"];
     BOOL celsius = !([u isKindOfClass:[NSString class]]
                      && ([u caseInsensitiveCompare:@"F"] == NSOrderedSame
@@ -6706,6 +7292,11 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
     VPWeatherConfigModel *cfg = [[VPWeatherConfigModel alloc] init];
     cfg.switchState = open ? 1 : 0;
     cfg.weatherUnit = celsius ? 0 : 1;
+    // crc：官方 Demo WeatherActivity 下发前是 `setting.crc = crc`（crc 来自上一次读回）。
+    // 不带 crc 时部分固件会把这条设置当成「版本不匹配」而静默丢弃 ——
+    // 表现就是 App 说已保存、手表上单位没变。
+    id crcVal = options[@"crc"] ?: self.lastWeatherStatus[@"crc"];
+    if (crcVal != nil) cfg.crc = (uint16_t)[crcVal unsignedIntValue];
     __weak typeof(self) weakSelf = self;
     [[VPWeatherHandle share] settingWeatherInfo:cfg result:^(VPWeatherSettingState state) {
         BOOL ok = (state == VPWeatherSettingStateSuccess);
@@ -6715,6 +7306,10 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
             @"isOpen": @(open),
             @"weatherType": celsius ? @"C" : @"F"
         };
+        // 写回执只代表「设备收到了这条设置命令」，不代表值已经落盘。
+        // 这里**不**更新 lastWeatherStatus：否则保存后的回读验证会读到刚写进来的
+        // 缓存值，自己证明自己成功（真机上就是这样谎报成功的）。
+        // 快照只由真实读成功（readWeatherInfo 拿到 configModel）更新。
         [weakSelf sendEvent:@"weather" data:d];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
@@ -6802,9 +7397,480 @@ UNI_EXPORT_METHOD(@selector(musicControl:callback:))
 }
 
 // ==================== 批次 7：表盘 / 相机 / 其它 ====================
-// 对应 Android 的 dialCapability / dialOnline / downloadDial / openCameraScreen /
-// closeCameraScreen / setReportGps / modifyPwd / bleRename / pushTextImage /
-// magneticTherapy / read4gServerInfo / readProductionInfo。
+// 对应 Android 的 dialList / setDial / dialCapability / dialOnline / downloadDial /
+// openCameraScreen / closeCameraScreen / setReportGps / modifyPwd / bleRename /
+// pushTextImage / magneticTherapy / read4gServerInfo / readProductionInfo。
+//
+// 表盘有两条完全独立的链路，平台由 peripheralModel.CPUType 判定（1=杰理 K 系）：
+//   JL：设备 fatfs 里的表盘文件，读列表 = 开文件系统 + 遍历文件名，
+//       切盘 = VPDialTransformManager.switchToCustomWatchWithName（内部 cmdWatchFlashPath Flag:1）
+//   非 JL：设备内置默认表盘（按序号切）+ HTTP 市场（下载 bin 后 startTransferWithFilePath）
+// 两套的 path 语义不同：JL 是**设备上的文件名**，非 JL 是**手机本地文件路径**。
+
+/**
+ 判断是否杰理（JL）平台。
+ iOS 没有 Android 的 isJLDevice()，但 SDK 内部（VPDialTransformManager.isJLAC7013）
+ 用的就是 CPUType == 1 这一条判据，这里保持一致。
+ */
+- (BOOL)isJLDevice {
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    return m != nil && (NSInteger)m.CPUType == 1;
+}
+
+/** 表盘链路名：jl / zk / nordic。zk（中科）与 nordic 走同一条非 JL 链路，
+    但事件里如实上报，免得页面日志/统计把中科设备记成 nordic。 */
+- (NSString *)dialPlatformName {
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSInteger cpu = m ? (NSInteger)m.CPUType : 0;
+    if (cpu == 1) return @"jl";
+    if (cpu == 3 || cpu == 4) return @"zk";
+    return @"nordic";
+}
+
+/** 统一的表盘失败事件：设备侧 notify 走这里，页面靠 fail:YES 结束 loading */
+- (void)emitDialFail:(NSString *)code {
+    [self sendEvent:@"dial" data:@{ @"ok": @NO, @"fail": @YES, @"message": code ?: @"unknown" }];
+}
+
+/**
+ 读取表盘列表。
+ JL：打开文件系统 → 取 WATCH* 文件名 → 逐个读 describe 元数据分类 → 三组下发
+     事件 on('dial')：{ platform:'jl', init } → { platform:'jl', ok, sys, server, pic?, list,
+                      currentServerName, currentPicName }
+ 非 JL：能力头 → 设备内置默认表盘 → 当前屏幕样式
+     事件 on('dial')：{ platform:'nordic', ok, serverUi, customUi, serverCount, customCount }
+                    → { kind:'default', defaultCount, list:[{index,name,kind}] }
+                    → { screenType, screenIndex, style, dialType, ok }
+ 与 Android 一致：方法本身立即回 200，结果全部走事件（页面已按事件驱动）。
+ */
+UNI_EXPORT_METHOD(@selector(dialList:callback:))
+- (void)dialList:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    callback(resultWithCode(200), NO);
+    self.dialSeq++;
+    if ([self isJLDevice]) {
+        [self dialListJL:self.dialSeq];
+    } else {
+        [self dialListNordic:self.dialSeq];
+    }
+}
+
+// ---------- 表盘列表：JL ----------
+
+- (void)dialListJL:(NSInteger)seq {
+    __weak typeof(self) weakSelf = self;
+    // 开文件系统要先做 rcsp 认证 + 遍历 fatfs，几秒起步；先给页面一个可读状态
+    [self sendEvent:@"dial" data:@{ @"platform": @"jl", @"init": @YES }];
+
+    // 开文件系统没有超时回调（SDK 只给 BOOL success），认证卡住时整页会一直转。
+    // 45s 上限 + seq/settled 判重：真拿到结果后这条不会再把页面拉回失败态。
+    __block BOOL settled = NO;
+    void (^failOnce)(NSString *) = ^(NSString *code) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        if (settled) return;
+        settled = YES;
+        [self emitDialFail:code];
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        failOnce(@"timeout");
+    });
+
+    // 这两个接口 VPMarketDialManager 有公开声明（内部只是转发给 VPDialTransformManager），
+    // 走公开层可以少依赖一个未公开类；getWatchNames 未过滤，WATCH 前缀由下面自己筛。
+    VPMarketDialManager *mgr = [VPMarketDialManager share];
+    [mgr openJLDialFileSystemWithAction:^(BOOL success) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        if (!success) {
+            failOnce(@"jlFileSystemFail");
+            return;
+        }
+        [mgr getJLWatchNamesWithAction:^(NSArray<NSString *> *names) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || seq != self.dialSeq) return;
+            settled = YES;   // 拿到清单就不再让看门狗报错（后续逐文件分类有自己的超时）
+            NSArray<NSString *> *watchNames = [self watchNamesFromFileNames:names];
+            if (watchNames.count == 0) {
+                // 文件系统里一个 WATCH* 都没有：要么设备固件把表盘烧在代码区，
+                // 要么还没装过市场/照片表盘。给空态而不是错误，页面显示「暂无表盘」。
+                [self emitJLListWithSys:@[] server:@[] pic:nil seq:seq];
+                return;
+            }
+            [self classifyJLDialNames:watchNames
+                                index:0
+                               result:[NSMutableDictionary dictionary]
+                                  seq:seq];
+        }];
+    }];
+}
+
+/** 从文件系统清单里挑表盘文件：杰理的约定是 WATCH 前缀（大小写不敏感） */
+- (NSArray<NSString *> *)watchNamesFromFileNames:(NSArray *)names {
+    NSMutableArray *out = [NSMutableArray array];
+    for (id n in names) {
+        if (![n isKindOfClass:[NSString class]]) continue;
+        NSString *name = [(NSString *)n lastPathComponent];
+        if (name.length == 0) continue;
+        if ([[name uppercaseString] hasPrefix:@"WATCH"]) [out addObject:name];
+    }
+    return out;
+}
+
+/**
+ 逐个文件读 describe 元数据，判断它是照片表盘 / 市场表盘 / 内置表盘。
+
+ SDK 的 VPJLFileSystemManager.getWatchFaceWithAssist:watchName:action: 每次命令会回调
+ **两次**（cmdWatchFlashPath 的「开始」包 + 「结束」包），这一点是从二进制反汇编确认的：
+   开始包（flag != 0）→ action(nil, nil)
+   结束包（flag == 0）→ 把 describe 按 "," 切开，比对第 2 段的 UUID：
+        "1111-..." → action(文件名, nil)   照片表盘
+        "2222-..." → action(nil, 文件名)   市场表盘
+        都不是      → action(nil, nil)     内置（系统）表盘
+ 所以「(nil,nil)」既可能是开始包也可能是系统表盘，**不能**一收到就往下走：
+ 这里对非 nil 结果立即前进，对 (nil,nil) 先静默 0.7s（等结束包），
+ 期间要是来了非 nil 结果就作废重来；每个文件另有 4s 硬上限。
+ */
+- (void)classifyJLDialNames:(NSArray<NSString *> *)names
+                      index:(NSInteger)index
+                     result:(NSMutableDictionary *)result
+                        seq:(NSInteger)seq {
+    __weak typeof(self) weakSelf = self;
+    if (index >= (NSInteger)names.count) {
+        [self finishJLClassification:names result:result seq:seq];
+        return;
+    }
+    NSString *name = names[index];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    VPJLFileSystemManager *fs = [VPJLFileSystemManager shareInstance];
+
+    __block BOOL advanced = NO;
+    __block NSUInteger tick = 0;   // 静默期代次：新包到达就作废上一个静默期
+    void (^advance)(void) = ^{
+        if (advanced) return;
+        advanced = YES;
+        [weakSelf classifyJLDialNames:names index:index + 1 result:result seq:seq];
+    };
+    void (^advanceAfterQuiet)(void) = ^{
+        NSUInteger mine = ++tick;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (advanced || mine != tick) return;
+            advance();
+        });
+    };
+
+    [fs getWatchFaceWithAssist:pm.mAssist
+                     watchName:name
+                        action:^(NSString *photoWatchName, NSString *marketWatchName) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        if (photoWatchName.length) result[@"photo"] = name;
+        if (marketWatchName.length) result[name] = @"server";
+        if (photoWatchName.length || marketWatchName.length) {
+            advance();          // 类型已确定，不用再等
+        } else {
+            advanceAfterQuiet(); // 可能是开始包，等结束包
+        }
+    }];
+
+    // 硬上限：设备不回包时不能让整页卡死，按内置表盘处理继续下一个
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        advance();
+    });
+}
+
+/** 分类完成：拼三组列表并下发。sys=其余、server=市场标记、pic=照片标记 */
+- (void)finishJLClassification:(NSArray<NSString *> *)names
+                        result:(NSMutableDictionary *)result
+                           seq:(NSInteger)seq {
+    if (seq != self.dialSeq) return;
+
+    NSMutableArray *sys = [NSMutableArray array];
+    NSMutableArray *server = [NSMutableArray array];
+    NSDictionary *pic = nil;
+    NSString *photoFile = result[@"photo"];
+
+    NSInteger sysIndex = 0;
+    for (NSString *name in names) {
+        if ([name isEqualToString:photoFile]) {
+            pic = @{ @"name": name, @"path": [@"/" stringByAppendingString:name] };
+        } else if ([result[name] isEqualToString:@"server"]) {
+            [server addObject:@{ @"name": name, @"path": [@"/" stringByAppendingString:name] }];
+        } else {
+            [sys addObject:@{ @"name": name,
+                              @"path": [@"/" stringByAppendingString:name],
+                              @"index": @(sysIndex) }];
+            sysIndex++;
+        }
+    }
+    [self emitJLListWithSys:sys server:server pic:pic seq:seq];
+}
+
+/** 三组列表落缓存 + 下发事件。marketName/photoName 从入参推，不再单独传一遍 */
+- (void)emitJLListWithSys:(NSArray *)sys
+                   server:(NSArray *)server
+                      pic:(NSDictionary *)pic
+                      seq:(NSInteger)seq {
+    if (seq != self.dialSeq) return;
+
+    NSString *marketName = server.count ? server.firstObject[@"name"] : @"";
+    NSString *photoName = pic[@"name"] ?: @"";
+
+    // 缓存一份，setDial 只拿到路径时靠它反查分组（照片表盘没有 path 可传）
+    NSMutableArray *cache = [NSMutableArray array];
+    for (NSDictionary *o in sys) [cache addObject:@{ @"name": o[@"name"], @"group": @"sys", @"index": o[@"index"] }];
+    for (NSDictionary *o in server) [cache addObject:@{ @"name": o[@"name"], @"group": @"server" }];
+    if (photoName.length) [cache addObject:@{ @"name": photoName, @"group": @"pic" }];
+    self.jlDialCache = cache;
+    self.jlCurrentPicName = photoName;
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"platform"] = @"jl";
+    d[@"ok"] = @YES;
+    d[@"sys"] = sys;
+    d[@"server"] = server;
+    d[@"list"] = server;                          // 老调用方的别名，与 Android 一致
+    d[@"currentServerName"] = marketName;         // SDK 的权威值只覆盖市场表盘这一组
+    d[@"currentPicName"] = photoName;
+    if (pic) d[@"pic"] = pic;
+
+    [self sendEvent:@"dial" data:d];
+}
+
+// ---------- 表盘列表：非 JL ----------
+
+- (void)dialListNordic:(NSInteger)seq {
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSInteger dialCount = (NSInteger)m.dialCount;
+    NSString *pf = [self dialPlatformName];
+
+    [self sendEvent:@"dial" data:@{
+        @"platform": pf,
+        @"ok": @YES,
+        @"serverUi": @(m.marketDialCount > 0),
+        @"customUi": @(m.photoDialCount > 0),
+        @"serverCount": @(m.marketDialCount),
+        @"customCount": @(m.photoDialCount),
+        @"defaultCount": @(dialCount)
+    }];
+
+    // 设备内置表盘：数量来自握手回包（Android 读 COUNT_SCREEN_STYLE_TYPE，iOS 是 dialCount），
+    // 名称设备不上报，按「默认表盘N」生成。这条路径不依赖服务器，必定有数据。
+    NSMutableArray *arr = [NSMutableArray array];
+    for (NSInteger i = 0; i < dialCount; i++) {
+        [arr addObject:@{ @"index": @(i), @"name": [NSString stringWithFormat:@"默认表盘%ld", (long)(i + 1)], @"kind": @"default" }];
+    }
+    [self sendEvent:@"dial" data:@{
+        @"platform": pf,
+        @"kind": @"default",
+        @"ok": @YES,
+        @"defaultCount": @(dialCount),
+        @"list": arr
+    }];
+
+    [self readScreenStyleEvent:seq];
+}
+
+/**
+ 读当前屏幕样式（表盘位）。settingMode 2 = 读，dialType 传 default 时回包带实际类型。
+ 与 Android 的 readScreenStyle 事件字段对齐：screenType / screenIndex / style / dialType。
+ screenIndex 只在「当前是内置默认表盘」时才有意义（默认表盘 0 基），其余置 -1，
+ 避免页面把市场表盘的 1 基序号套到默认表盘上标错「使用中」。
+ */
+- (void)readScreenStyleEvent:(NSInteger)seq {
+    __weak typeof(self) weakSelf = self;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    NSString *pf = [self dialPlatformName];
+    __block BOOL done = NO;
+    void (^emit)(BOOL, VPDeviceDialType, int) = ^(BOOL ok, VPDeviceDialType dt, int style) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        if (done) return;
+        done = YES;
+        NSString *type = @"DEFAULT";
+        if (dt == VPDeviceDialTypeMarket) type = @"MARKET";
+        else if (dt == VPDeviceDialTypePhoto) type = @"PHOTO";
+        [self sendEvent:@"dial" data:@{
+            @"platform": pf,
+            @"ok": @(ok),
+            @"screenType": type,
+            @"screenIndex": @(dt == VPDeviceDialTypeDefault ? style : -1),
+            @"style": @(style),
+            @"dialType": @((NSInteger)dt)
+        }];
+    };
+
+    [pm veepooSDKSettingDeviceScreenStyle:0
+                              settingMode:2
+                                 dialType:VPDeviceDialTypeDefault
+                                   result:^(VPDeviceDialType dt, int screenStyle, BOOL settingSuccess) {
+        emit(settingSuccess, dt, screenStyle);
+    }];
+
+    // 个别固件对「读样式」不回包：10s 后按失败收尾，页面已有内置表盘时不会弹错
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSeq) return;
+        if (done) return;
+        done = YES;
+        [self sendEvent:@"dial" data:@{ @"fail": @YES, @"message": @"timeout" }];
+    });
+}
+
+// ---------- 切换表盘 ----------
+
+/**
+ 应用表盘。options 与 Android 完全一致：
+   { kind:'default', index }        → 切内置默认表盘（JL 走 sys 组，非 JL 走 settingScreenStyle）
+   { kind:'pic' }                   → 切照片表盘（仅 JL；设备上还没有该文件时回 noPicDial）
+   { path, source:'device' }        → 切设备上已有的表盘（JL 取 lastPathComponent 作为文件名）
+   { path }                         → 推送本机表盘文件（仅非 JL：startTransferWithFilePath + 切市场表盘）
+ 进度/结果全部走 on('dial')：{ start } / { progress } / { complete, name } / { fail, message }
+ */
+UNI_EXPORT_METHOD(@selector(setDial:callback:))
+- (void)setDial:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    callback(resultWithCode(200), NO);
+    self.dialSwitchSeq++;
+
+    NSString *kind = [options[@"kind"] isKindOfClass:[NSString class]] ? options[@"kind"] : @"";
+    NSString *path = [options[@"path"] isKindOfClass:[NSString class]] ? options[@"path"] : @"";
+    NSString *dialId = [options[@"dialId"] isKindOfClass:[NSString class]] ? options[@"dialId"] : @"";
+    NSString *filePath = path.length ? path : dialId;
+
+    if ([kind isEqualToString:@"default"] ||
+        (options[@"index"] != nil && filePath.length == 0)) {
+        NSInteger index = [options[@"index"] integerValue];
+        if ([self isJLDevice]) {
+            [self switchJLSystemDialAtIndex:index];
+        } else {
+            [self setDialDefault:index];
+        }
+        return;
+    }
+    if ([kind isEqualToString:@"pic"]) {
+        if (![self isJLDevice]) { [self emitDialFail:@"notSupported"]; return; }
+        if (self.jlCurrentPicName.length == 0) { [self emitDialFail:@"noPicDial"]; return; }
+        [self switchJLDialByName:self.jlCurrentPicName];
+        return;
+    }
+    if (filePath.length == 0) { [self emitDialFail:@"emptyDialPath"]; return; }
+
+    if ([self isJLDevice]) {
+        BOOL deviceDial = [options[@"source"] isEqualToString:@"device"];
+        if (!deviceDial) {
+            // 本机文件上传到 JL 设备 = enterDataTransformStateWithFileUrl → 写 fatfs → 切盘，
+            // SDK 这条链路没有公开头文件也没有成功回调。页面当前不会走这里（在线市场只对非 JL 开放），
+            // 与其猜一条可能写坏表盘的路径，不如明确回不支持。
+            [self emitDialFail:@"uploadNotSupported"];
+            return;
+        }
+        [self switchJLDialByName:[filePath lastPathComponent]];
+        return;
+    }
+    [self setDialFile:filePath];
+}
+
+/** JL：按 sys 组缓存序号切内置表盘 */
+- (void)switchJLSystemDialAtIndex:(NSInteger)index {
+    NSString *name = nil;
+    for (NSDictionary *o in self.jlDialCache) {
+        if ([o[@"group"] isEqualToString:@"sys"] && [o[@"index"] integerValue] == index) {
+            name = o[@"name"];
+            break;
+        }
+    }
+    if (name.length == 0) {
+        // 缓存没建立（用户没进过表盘页）时只能回失败：sys 文件清单必须现读，代价太高
+        [self emitDialFail:@"badIndex"];
+        return;
+    }
+    [self switchJLDialByName:name];
+}
+
+/**
+ JL：按文件名切盘。
+ SDK 的 switchToCustomWatchWithName:success:failure: 内部就是
+   cmdWatchFlashPath:("/"+name) Flag:JL_DialSettingSetDial(1)，
+ 与 Android 的 WatchManager.setCurrentWatchInfo 等价；flag==0 为成功。
+ 注意必须传**纯文件名**（WATCH026），SDK 会自己补前导 "/"。
+ */
+- (void)switchJLDialByName:(NSString *)name {
+    if (name.length == 0) { [self emitDialFail:@"emptyDialPath"]; return; }
+    NSInteger seq = self.dialSwitchSeq;
+    __weak typeof(self) weakSelf = self;
+
+    [self sendEvent:@"dial" data:@{ @"start": @YES }];
+
+    __block BOOL done = NO;
+    void (^finish)(NSDictionary *) = ^(NSDictionary *d) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSwitchSeq) return;
+        if (done) return;
+        done = YES;
+        [self sendEvent:@"dial" data:d];
+    };
+
+    [[VPDialTransformManager share] switchToCustomWatchWithName:name
+                                                        success:^{
+        finish(@{ @"ok": @YES, @"complete": @YES, @"name": name });
+    } failure:^{
+        finish(@{ @"ok": @NO, @"fail": @YES, @"name": name, @"message": @"switchDialFailed" });
+    }];
+
+    // rcsp 只给成功/失败回调，设备不回包时两个都不触发：15s 看门狗兜底
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        finish(@{ @"ok": @NO, @"fail": @YES, @"name": name, @"message": @"timeout" });
+    });
+}
+
+/** 非 JL：按序号切内置默认表盘（0 基，与 default 列表的 index 对应） */
+- (void)setDialDefault:(NSInteger)index {
+    if (index < 0) { [self emitDialFail:@"badIndex"]; return; }
+    NSInteger seq = self.dialSwitchSeq;
+    __weak typeof(self) weakSelf = self;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+
+    [self sendEvent:@"dial" data:@{ @"start": @YES }];
+    [pm veepooSDKSettingDeviceScreenStyle:(int)index
+                              settingMode:1
+                                 dialType:VPDeviceDialTypeDefault
+                                   result:^(VPDeviceDialType dt, int screenStyle, BOOL settingSuccess) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSwitchSeq) return;
+        if (settingSuccess) {
+            [self sendEvent:@"dial" data:@{
+                @"ok": @YES,
+                @"complete": @YES,
+                @"kind": @"default",
+                @"screenType": @"DEFAULT",
+                @"screenIndex": @(screenStyle),
+                @"style": @(screenStyle)
+            }];
+        } else {
+            [self emitDialFail:@"uiUpdateFailed"];
+        }
+    }];
+}
+
+/**
+ 非 JL：把本机表盘文件推送到设备并切过去（setDial 的 { path } 分支）。
+ 实际动作见 pushDialFileAndActivate:name:，这里只做文件存在性检查。
+ */
+- (void)setDialFile:(NSString *)filePath {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        [self emitDialFail:@"fileNotExist"];
+        return;
+    }
+    [self pushDialFileAndActivate:[NSURL fileURLWithPath:filePath] name:@""];
+}
 
 /**
  查询表盘能力（进入表盘页前调用）。
@@ -6843,15 +7909,29 @@ UNI_EXPORT_METHOD(@selector(dialCapability:callback:))
  JS：joemeWatch.dialOnline() -> on('dial') { kind:'online', ok, count, list:[{crc,name,fileUrl,previewUrl,...}] }
  实现：先用 veepooSDK_dialChannelWithChannelModel:Read 拿设备侧市场表盘信息（VPDeviceMarketDialModel），
       再调 VPMarketDialManager.getVeepooServerAllMarketDialsWithDeviceInfo: 拉服务器列表。
+ JL 设备没有 HTTP 市场（表盘都在设备 fatfs 里）→ 与 Android 一样回 jlUseDialList，
+ 页面据此把「在线市场」页签的失败文案换成「请用已装表盘列表」。
  */
 UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
 - (void)dialOnline:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    callback(resultWithCode(200), NO);
+
+    if ([self isJLDevice]) {
+        [self sendEvent:@"dial" data:@{ @"kind": @"online", @"fail": @YES, @"message": @"jlUseDialList" }];
+        return;
+    }
+    VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
+    if (model.marketDialCount == 0) {
+        [self sendEvent:@"dial" data:@{ @"kind": @"online", @"fail": @YES, @"message": @"serverUiNotSupported" }];
+        return;
+    }
+
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     VPMarketDialManager *mgr = [VPMarketDialManager share];
     __weak typeof(self) weakSelf = self;
 
-    [self sendEvent:@"dial" data:@{ @"loading": @YES }];
+    [self sendEvent:@"dial" data:@{ @"kind": @"online", @"loading": @YES }];
     [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelRead
                                     dialType:VPDeviceDialTypeMarket
                               photoDialModel:nil
@@ -6861,17 +7941,19 @@ UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
         if (error || !deviceMarketDialModel) {
             [weakSelf sendEvent:@"dial" data:@{
                 @"kind": @"online", @"fail": @YES,
-                @"message": error.localizedDescription ?: @"读取设备表盘信息失败"
+                @"message": error.localizedDescription ?: @"readDeviceDialFail"
             }];
-            callback(resultWithCode(-1), NO);
             return;
         }
+        // 缓存下来：downloadDial 要用同一份模型做 crc 校验与容量判断
+        weakSelf.dialDeviceInfo = deviceMarketDialModel;
         [mgr getVeepooServerAllMarketDialsWithDeviceInfo:deviceMarketDialModel
                                                  success:^(NSArray<VPServerMarketDialModel *> *response) {
             NSMutableArray *list = [NSMutableArray array];
             for (VPServerMarketDialModel *s in response) {
                 [list addObject:@{
                     @"crc": @(s.crc),
+                    // 服务器模型里没有展示名，只有 crc；用 crc 当名字，页面至少能区分卡片
                     @"name": [NSString stringWithFormat:@"表盘 %d", s.crc],
                     @"fileUrl": s.fileUrl ?: @"",
                     @"previewUrl": s.previewUrl ?: @"",
@@ -6882,73 +7964,146 @@ UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
             NSDictionary *d = @{ @"kind": @"online", @"ok": @YES,
                                  @"count": @(list.count), @"total": @(list.count), @"list": list };
             [weakSelf sendEvent:@"dial" data:d];
-            NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
-            [r addEntriesFromDictionary:d];
-            callback(r, NO);
         } failure:^(NSError *err, NSInteger code) {
             [weakSelf sendEvent:@"dial" data:@{
                 @"kind": @"online", @"fail": @YES,
                 @"message": err.localizedDescription ?: [NSString stringWithFormat:@"服务器返回错误(%ld)", (long)code]
             }];
-            callback(resultWithCode(-1), NO);
         }];
     } transformProgress:nil];
 }
 
 /**
  下载线上表盘并推送到设备。
- options: { url, name?, crc?, imageId?, address?, length? }
- JS：joemeWatch.downloadDial({...}) -> on('dial') { downloading } → { downloadProgress } → { downloaded }
+ options: { url, name?, crc, dialShape?, binProtocol?, imageId?, address?, length? }
+ JS：joemeWatch.downloadDial({...}) -> on('dial') { downloading } → { downloaded }
                                                          → { progress }（推送）→ { complete }
  实现：VPMarketDialManager.downloadMarketDialBinFileWithModel: → startTransferWithFilePath:
-      上游的 VPDeviceMarketDialModel 需要设备侧信息（校验用），这里用页面回传的 crc/imageId/address/length
-      组装一个最小模型；缺省时用 0（部分固件只校验 crc）。
+
+ 关键点：downloadMarketDialBinFileWithModel 的第二个参数（设备侧市场表盘信息）不是可选的 ——
+ SDK 会拿 imageId 跟本地已下载 bin 的 crc 比对，并在文件存在时直接复用/删除缓存。
+ 页面上没有 addr/length 这些字段，所以这里用 dialOnline 时读到的那份缓存；
+ 缓存缺失时先补一次 Read（与 dialOnline 同一条命令），再下载。
+ ⚠ crc 必须由页面传（服务器列表里的 crc），缺省 0 时 SDK 的「同 crc 直接复用」判断会失效。
  */
 UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
 - (void)downloadDial:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
-    NSString *url = options[@"url"];
-    if (![url isKindOfClass:[NSString class]] || url.length == 0) {
-        callback(@{ @"code": @(-1), @"message": @"url 不能为空" }, NO);
-        return;
-    }
+    callback(resultWithCode(200), NO);
+
+    NSString *url = [options[@"url"] isKindOfClass:[NSString class]] ? options[@"url"] : @"";
+    if (url.length == 0) { [self emitDialFail:@"emptyUrl"]; return; }
+    if ([self isJLDevice]) { [self emitDialFail:@"jlUseDialList"]; return; }
+
     VPServerMarketDialModel *server = [[VPServerMarketDialModel alloc] init];
     server.fileUrl = url;
     server.crc = options[@"crc"] ? [options[@"crc"] intValue] : 0;
     server.dialShape = options[@"dialShape"] ? [options[@"dialShape"] intValue] : 0;
     server.binProtocol = options[@"binProtocol"] ? [options[@"binProtocol"] intValue] : 0;
 
-    VPDeviceMarketDialModel *device = [[VPDeviceMarketDialModel alloc] init];
-    device.imageId = options[@"imageId"] ? [options[@"imageId"] integerValue] : 0;
-    device.address = options[@"address"] ? [options[@"address"] integerValue] : 0;
-    device.length = options[@"length"] ? [options[@"length"] integerValue] : 0;
-
-    VPMarketDialManager *mgr = [VPMarketDialManager share];
     __weak typeof(self) weakSelf = self;
+    NSString *displayName = [options[@"name"] isKindOfClass:[NSString class]] ? options[@"name"] : @"";
 
-    [self sendEvent:@"dial" data:@{ @"downloading": @YES }];
-    [mgr downloadMarketDialBinFileWithModel:server deviceMarketDialModel:device success:^(NSURL *filePath) {
-        [weakSelf sendEvent:@"dial" data:@{ @"downloaded": @YES, @"path": filePath.path ?: @"" }];
-        [mgr startTransferWithFilePath:filePath transformProgress:^(double progress) {
-            [weakSelf sendEvent:@"dial" data:@{ @"progress": @(progress * 100.0) }];
-        } failure:^(NSError *error) {
-            [weakSelf sendEvent:@"dial" data:@{
-                @"fail": @YES,
-                @"message": error.localizedDescription ?: @"表盘推送失败"
+    void (^startDownload)(VPDeviceMarketDialModel *) = ^(VPDeviceMarketDialModel *device) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        self.dialSwitchSeq++;
+        NSInteger seq = self.dialSwitchSeq;
+        VPMarketDialManager *mgr = [VPMarketDialManager share];
+
+        // 页面已经 showLoading，这里只发事件；下载阶段没有进度回调（NSURLSession 整包下载）
+        [self sendEvent:@"dial" data:@{ @"downloading": @YES }];
+        [mgr downloadMarketDialBinFileWithModel:server deviceMarketDialModel:device success:^(NSURL *filePath) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || seq != self.dialSwitchSeq) return;
+            [self sendEvent:@"dial" data:@{ @"downloaded": @YES, @"path": filePath.path ?: @"" }];
+            [self pushDialFileAndActivate:filePath name:displayName];
+        } failure:^(NSError *error, NSInteger code) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || seq != self.dialSwitchSeq) return;
+            // message 用固定标识（页面据此查中文文案），原始错误串放 detail 里
+            NSMutableDictionary *d = [@{ @"ok": @NO, @"fail": @YES,
+                                         @"message": @"downloadFail" } mutableCopy];
+            if (error.localizedDescription.length) d[@"detail"] = error.localizedDescription;
+            else d[@"detail"] = [NSString stringWithFormat:@"code=%ld", (long)code];
+            [self sendEvent:@"dial" data:d];
+        }];
+    };
+
+    if (self.dialDeviceInfo) {
+        startDownload(self.dialDeviceInfo);
+        return;
+    }
+    // 没进过表盘页/没拉过在线市场：先读一次设备侧信息
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelRead
+                                    dialType:VPDeviceDialTypeMarket
+                              photoDialModel:nil
+                                      result:^(VPPhotoDialModel *p, VPDeviceMarketDialModel *device, NSError *error) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        if (error || !device) {
+            [self emitDialFail:@"readDeviceDialFail"];
+            return;
+        }
+        self.dialDeviceInfo = device;
+        startDownload(device);
+    } transformProgress:nil];
+}
+
+/**
+ 把 bin 文件推给设备并切过去（downloadDial 的第二步，setDialFile 也走这里）。
+ 官方链路 = VPMarketDialManager.startTransferWithFilePath:（内部 → VPDialTransformManager
+ enterDataTransformStateWithFileUrl，先发 20 字节通道头再分片），完成后
+ veepooSDKSettingDeviceScreenStyle(1, MARKET) 让设备真正显示这个新表盘。
+ ⚠ startTransfer 只有 failure 和进度，没有成功回调：进度到 1 视为传输完成。
+ 不能提前发 complete —— 否则页面刚显示「已应用」就收到失败/超时。
+ */
+- (void)pushDialFileAndActivate:(NSURL *)filePath name:(NSString *)name {
+    if (!filePath) { [self emitDialFail:@"fileNotExist"]; return; }
+    NSInteger seq = self.dialSwitchSeq;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+
+    void (^finish)(NSDictionary *) = ^(NSDictionary *d) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSwitchSeq) return;
+        if (done) return;
+        done = YES;
+        [self sendEvent:@"dial" data:d];
+    };
+
+    [[VPMarketDialManager share] startTransferWithFilePath:filePath
+                                         transformProgress:^(double progress) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || seq != self.dialSwitchSeq) return;
+        [self sendEvent:@"dial" data:@{ @"progress": @(progress * 100.0) }];
+        if (progress >= 0.999 && !done) {
+            VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+            [pm veepooSDKSettingDeviceScreenStyle:1
+                                      settingMode:1
+                                         dialType:VPDeviceDialTypeMarket
+                                           result:^(VPDeviceDialType dt, int screenStyle, BOOL ok) {
+                if (ok) {
+                    finish(@{ @"ok": @YES, @"complete": @YES, @"name": name ?: @"",
+                              @"kind": @"server", @"screenType": @"MARKET",
+                              @"screenIndex": @(screenStyle), @"style": @(screenStyle) });
+                } else {
+                    finish(@{ @"ok": @NO, @"fail": @YES, @"message": @"uiUpdateFailed" });
+                }
             }];
-            callback(resultWithCode(-1), NO);
-        }];
-        // startTransfer 没有成功回调（只有 failure），下发成功即视为完成；
-        // 严格校验需要设备端 readScreenStyle 回读，页面已有 setDial 的 complete 收尾。
-        [weakSelf sendEvent:@"dial" data:@{ @"complete": @YES, @"name": options[@"name"] ?: @"" }];
-        callback(resultWithCode(200), NO);
-    } failure:^(NSError *error, NSInteger code) {
-        [weakSelf sendEvent:@"dial" data:@{
-            @"fail": @YES,
-            @"message": error.localizedDescription ?: [NSString stringWithFormat:@"表盘下载失败(%ld)", (long)code]
-        }];
-        callback(resultWithCode(-1), NO);
+        }
+    } failure:^(NSError *error) {
+        NSMutableDictionary *d = [@{ @"ok": @NO, @"fail": @YES, @"message": @"uploadFailed" } mutableCopy];
+        if (error.localizedDescription.length) d[@"detail"] = error.localizedDescription;
+        finish(d);
     }];
+
+    // 表盘 bin 1~2MB，BLE 下 30~60s；90s 上限避免页面永远停在「正在同步」
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        finish(@{ @"ok": @NO, @"fail": @YES, @"message": @"timeout" });
+    });
 }
 
 // 注：openCameraScreen / closeCameraScreen 与 capturePhoto 一起放在第 7 节「相机遥控」，
@@ -7264,10 +8419,10 @@ UNI_EXPORT_METHOD(@selector(readBloodComponentCalibration:callback:))
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKBloodAnalysisPersonalWithOpCode:2
-                                            open:NO
-                                           model:nil
-                                          result:^(BOOL success, BOOL open, VPBloodAnalysisResultModel *model) {
+    __block BOOL fired = NO;
+    void (^finish)(BOOL, BOOL, VPBloodAnalysisResultModel *) = ^(BOOL success, BOOL open, VPBloodAnalysisResultModel *model) {
+        if (fired) return;
+        fired = YES;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
         d[@"isOpen"] = @(open);
@@ -7289,7 +8444,18 @@ UNI_EXPORT_METHOD(@selector(readBloodComponentCalibration:callback:))
         NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+    [pm veepooSDKBloodAnalysisPersonalWithOpCode:2
+                                            open:NO
+                                           model:nil
+                                          result:^(BOOL success, BOOL open, VPBloodAnalysisResultModel *model) {
+        finish(success, open, model);
     }];
+
+    // 设备不回包时 6 秒兜底，否则 JS Promise 永久 pending。
+    // 不支持血液成分的机型根本不会回调，超时太长会把页面后续的读取一起拖慢。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(NO, NO, nil); });
 }
 
 /**
@@ -7312,10 +8478,10 @@ UNI_EXPORT_METHOD(@selector(setBloodComponentCalibration:callback:))
 
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKBloodAnalysisPersonalWithOpCode:1
-                                            open:isOpen
-                                           model:model
-                                          result:^(BOOL success, BOOL open, VPBloodAnalysisResultModel *m) {
+    __block BOOL fired = NO;
+    void (^finish)(BOOL, BOOL, VPBloodAnalysisResultModel *) = ^(BOOL success, BOOL open, VPBloodAnalysisResultModel *m) {
+        if (fired) return;
+        fired = YES;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
         d[@"isOpen"] = @(open);
@@ -7331,7 +8497,18 @@ UNI_EXPORT_METHOD(@selector(setBloodComponentCalibration:callback:))
         NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+    [pm veepooSDKBloodAnalysisPersonalWithOpCode:1
+                                            open:isOpen
+                                           model:model
+                                          result:^(BOOL success, BOOL open, VPBloodAnalysisResultModel *m) {
+        finish(success, open, m);
     }];
+
+    // 设备不回包时 6 秒兜底：blood/calibrate.vue 的开关和保存都 await 它，
+    // 不兜底会永远停在「保存中」且无法回滚。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(NO, isOpen, nil); });
 }
 
 /**
@@ -7347,7 +8524,10 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:2 model:nil result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+    __block BOOL fired = NO;
+    void (^finish)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        if (fired) return;
+        fired = YES;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
         d[@"isOpen"] = @(m ? m.open : NO);
@@ -7376,7 +8556,14 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
         NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+    [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:2 model:nil result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        finish(success, m);
     }];
+
+    // 设备不回包时 6 秒兜底，否则 JS Promise 永久 pending
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(NO, nil); });
 }
 
 /**
