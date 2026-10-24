@@ -1964,14 +1964,33 @@ UNI_EXPORT_METHOD(@selector(setAutoMonitor:callback:))
 
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
+    // successResult / 读设置失败 / 超时兜底三选一，避免回调重入。
+    // 没有兜底时：设备不回包 → veepooSDKReadAutoMonitSwitchInfo 永不回调 →
+    // JS Promise 永久 pending，页面的写入队列会一直被它占住。
+    __block BOOL fired = NO;
+    void (^finish)(BOOL, NSString *) = ^(BOOL ok, NSString *message) {
+        if (fired) return;
+        fired = YES;
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"ok"] = @(ok);
+        d[@"type"] = type ?: @"";
+        if (message) d[@"message"] = message;
+        [weakSelf sendEvent:@"autoMonitor" data:d];
+        callback(resultWithCode(ok ? 200 : -1), NO);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        finish(NO, @"设置自动测量开关超时");
+    });
+
     [pm veepooSDKReadAutoMonitSwitchInfo:^(NSArray<VPAutoMonitTestModel *> *models) {
+        if (fired) return;
         VPAutoMonitTestModel *target = nil;
         for (VPAutoMonitTestModel *m in models) {
             if (m.type == ttype) { target = m; break; }
         }
         if (!target) {
-            [weakSelf sendEvent:@"autoMonitor" data:@{ @"ok": @NO, @"message": @"设备不支持该自动测量类型" }];
-            callback(resultWithCode(200), NO);
+            finish(NO, @"设备不支持该自动测量类型");
             return;
         }
         target.on = on;
@@ -1981,8 +2000,7 @@ UNI_EXPORT_METHOD(@selector(setAutoMonitor:callback:))
         if (options[@"endHour"]) target.endHour = [options[@"endHour"] unsignedCharValue];
         if (options[@"endMinute"]) target.endMinute = [options[@"endMinute"] unsignedCharValue];
         [pm veepooSDKSetAutoMonitSwitchWithModel:target result:^(BOOL success, VPAutoMonitTestModel *m) {
-            [weakSelf sendEvent:@"autoMonitor" data:@{ @"ok": @(success), @"type": type ?: @"" }];
-            callback(resultWithCode(200), NO);
+            finish(success, nil);
         }];
     }];
 }
@@ -3991,6 +4009,20 @@ UNI_EXPORT_METHOD(@selector(readAllHealthData:callback:))
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
+    __block BOOL done = NO;
+    void (^emitComplete)(void) = ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"healthData" data:@{ @"complete": @YES }];
+    };
+    // 看门狗：整读跨天读取可能很慢，但设备不回包时不能无限等 ——
+    // 前端 _waitRead 60s 兜底放行后若原生还占着 BLE 通道，后续 readActivityByDay 会
+    // 被拖到 30s 看门狗超时（真机实测 30261ms，心率/血压/血氧/体温/压力/梅脱全空）。
+    // 这里 50s 主动补发 complete，让前端在兜底前就拿到结束标记继续串行链。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        emitComplete();
+    });
     [pm veepooSdkStartReadDeviceAllDataWithReadStateChangeBlock:^(VPReadDeviceBaseDataState state, NSUInteger totalDay, NSUInteger currentReadDayNumber, NSUInteger readCurrentDayProgress) {
         switch (state) {
             case VPReadDeviceBaseDataStart:
@@ -4000,7 +4032,7 @@ UNI_EXPORT_METHOD(@selector(readAllHealthData:callback:))
                 [weakSelf sendEvent:@"healthData" data:@{ @"progress": @(readCurrentDayProgress / 100.0) }];
                 break;
             case VPReadDeviceBaseDataComplete:
-                [weakSelf sendEvent:@"healthData" data:@{ @"complete": @YES }];
+                emitComplete();
                 break;
             default:
                 break;
@@ -5307,16 +5339,24 @@ UNI_EXPORT_METHOD(@selector(readSleepByDay:callback:))
 
 /**
  按天读取活动数据（步数/距离/卡路里/运动量 + 5 分钟原始点）。
- iOS SDK：veepooSDK_readBasicDataWithDayNumber:maxPackage:result:（分页，读到 totalPackage 为止）
- Android：readOriginDataSingleDay；JS：joemeWatch.readActivityByDay(day) -> Promise<当天汇总>
- 事件：on('activityByDay') -> { progress } / { complete, day, totalStep } / { timeout, day }
+ iOS SDK：**查库直返** —— 整读（veepooSdkStartReadDeviceAllData）把设备历史写进
+      SDK 本地 SQLite 库后，本方法直接按日期从库里读，不再走设备直读。
+      设备直读接口 veepooSDK_readBasicDataWithDayNumber:maxPackage:result: 在协议 3/5
+      设备上**不回调**（真机实测整读完成后重跑仍 30 秒看门狗超时、points 空），
+      因此本方法必须改用 VPDataBaseOperation 查库。
+ Android：readOriginDataSingleDay（设备直读）；JS：joemeWatch.readActivityByDay(day)
+       -> Promise<当天汇总>
+ 事件：on('activityByDay') -> { complete, day, totalStep }（查库同步返回，无 progress/timeout）
  返回：{ code, day, date, totalStep, totalDistance, totalCalorie, totalSportValue,
          pointCount, points:[{h,m,step,cal,dis,rate,sport,high,low,wear,temperature,
          baseTemperature,ppgs,oxygens,resRates,hypoxiaTimes,cardiacLoads,apneaResults,
          isHypoxias,met,pressure}] }
- 说明：查库补两张「整读才落库」的表——血糖（glucose/glucoseRisk）与血液成分
-      （bloodComponent），按 HH:mm 对齐到对应 5 分钟点；库里没有就不带字段，页面按 0 过滤。
- 超时：设备不回包时 30 秒看门狗，发 timeout 事件并 reject（与 Android 行为一致）。
+ 说明：四个数据源全部查库、按 5 分钟窗口对齐合并——
+      (1) veepooSDKGetOriginalDataWithDate（心率/血压/步数/卡路里/距离/运动量/梅脱/压力）；
+      (2) veepooSDKGetDeviceOxygenDataWithDate（血氧，每分钟一条 → 聚合成窗口数组）；
+      (3) veepooSDKGetDeviceTemperatureDataWithDate（体温/体表温度，value/originalValue）；
+      (4) 血糖/血液成分 merge（glucose/glucoseRisk、bloodComponent）。
+      整读未完成时库为空 → 返回空 points（不卡不超时），页面按 0 过滤显示「--」。
  */
 UNI_EXPORT_METHOD(@selector(readActivityByDay:callback:))
 - (void)readActivityByDay:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -5337,87 +5377,83 @@ UNI_EXPORT_METHOD(@selector(readActivityByDay:callback:))
     VMutablePointsHolder *holder = [[VMutablePointsHolder alloc] init];
 
     __weak typeof(self) weakSelf = self;
-    __block BOOL finished = NO;
-    __block NSInteger reads = 0;
-    __block void (^fetchNext)(NSInteger);
-    __block dispatch_block_t watchdogRef = nil;
 
-    void (^finish)(BOOL, NSString *) = ^(BOOL timeout, NSString *message) {
-        if (finished) return;
-        finished = true;
-        if (watchdogRef) { dispatch_block_cancel(watchdogRef); watchdogRef = nil; }
+    // ── (1) 原始 5 分钟点：key 是 "HH:mm"，value 是字段 dict ──
+    NSDictionary *origin = [VPDataBaseOperation veepooSDKGetOriginalDataWithDate:dateStr andTableID:mac];
+    for (NSString *timeKey in origin) {
+        id val = origin[timeKey];
+        if (![val isKindOfClass:[NSDictionary class]]) continue;
+        NSMutableDictionary *src = [NSMutableDictionary dictionaryWithDictionary:val];
+        src[@"Time"] = timeKey;   // activityPointFromDict 用 Time 解析 h/m
+        [holder addPoint:[weakSelf activityPointFromDict:src]];
+    }
 
-        // 血糖 / 血液成分：整读后才落库，必须先并进 holder 再取 points（顺序不能反）
-        [weakSelf mergeBloodGlucoseFromDBInto:holder date:dateStr mac:mac];
-        [weakSelf mergeBloodComponentFromDBInto:holder date:dateStr mac:mac];
-
-        NSArray<NSDictionary *> *points = [holder sortedPoints];
-        NSMutableDictionary *r = [resultWithCode(timeout ? -1 : 200) mutableCopy];
-        r[@"day"] = @(day);
-        r[@"date"] = dateStr;
-        r[@"points"] = points;
-        r[@"pointCount"] = @(points.count);
-
-        NSInteger totalStep = 0;
-        double totalDis = 0, totalCal = 0, totalSport = 0;
-        for (NSDictionary *p in points) {
-            totalStep += [p[@"step"] integerValue];
-            totalDis += [p[@"dis"] doubleValue];
-            totalCal += [p[@"cal"] doubleValue];
-            totalSport += [p[@"sport"] doubleValue];
+    // ── (2) 血氧：每分钟一条 → 按 5 分钟窗口聚合进 oxygens 数组 ──
+    NSArray *oxygenArr = [VPDataBaseOperation veepooSDKGetDeviceOxygenDataWithDate:dateStr andTableID:mac];
+    for (NSDictionary *d in oxygenArr) {
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSInteger h = 0, m = 0;
+        JoemeTimeOfDict(d, &h, &m);
+        NSInteger wm = m - m % 5;
+        NSString *key = [NSString stringWithFormat:@"%02ld:%02ld", (long)h, (long)wm];
+        NSMutableDictionary *p = holder.byKey[key];
+        if (!p) continue;
+        double ov = JoemeDouble(JoemeFirstValue(d, @[ @"OxygenValue", @"oxygenValue" ]));
+        if (ov <= 0) continue;
+        NSMutableArray *arr = p[@"oxygens"];
+        if (![arr isKindOfClass:[NSMutableArray class]]) {
+            arr = [NSMutableArray array];
+            p[@"oxygens"] = arr;
         }
-        r[@"totalStep"] = @(totalStep);
-        r[@"totalDistance"] = @(round(totalDis * 1000.0) / 1000.0);
-        r[@"totalCalorie"] = @(round(totalCal * 1000.0) / 1000.0);
-        r[@"totalSportValue"] = @((NSInteger)llround(totalSport));
+        [arr addObject:@(ov)];
+    }
 
-        if (timeout) {
-            r[@"message"] = message ?: @"设备读取超时";
-            [weakSelf sendEvent:@"activityByDay" data:@{ @"timeout": @YES, @"day": @(day) }];
-        } else {
-            NSMutableDictionary *ev = [NSMutableDictionary dictionary];
-            ev[@"complete"] = @YES;
-            ev[@"day"] = @(day);
-            ev[@"totalStep"] = @(totalStep);
-            [weakSelf sendEvent:@"activityByDay" data:ev];
-        }
-        callback(r, NO);
-    };
+    // ── (3) 体温/体表温度：每 5 分钟一条（value=体温℃, originalValue=体表温度℃）──
+    NSArray *tempArr = [VPDataBaseOperation veepooSDKGetDeviceTemperatureDataWithDate:dateStr andTableID:mac];
+    for (NSDictionary *d in tempArr) {
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSInteger h = 0, m = 0;
+        JoemeTimeOfDict(d, &h, &m);
+        NSInteger wm = m - m % 5;
+        NSString *key = [NSString stringWithFormat:@"%02ld:%02ld", (long)h, (long)wm];
+        NSMutableDictionary *p = holder.byKey[key];
+        if (!p) continue;
+        double t = JoemeDouble(JoemeFirstValue(d, @[ @"value", @"temperature", @"bodyTemperatrue" ]));
+        double bt = JoemeDouble(JoemeFirstValue(d, @[ @"originalValue", @"originalTemperatrue", @"baseTemperature" ]));
+        if (t > 0) p[@"temperature"] = @(t);
+        if (bt > 0) p[@"baseTemperature"] = @(bt);
+    }
 
-    // 30 秒看门狗：每次有回调都会重置（慢设备不会被误判）
-    void (^armWatchdog)(void) = ^{
-        if (watchdogRef) dispatch_block_cancel(watchdogRef);
-        dispatch_block_t blk = dispatch_block_create(0, ^{
-            finish(YES, @"读取活动数据超时");
-        });
-        watchdogRef = blk;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), blk);
-    };
+    // ── (4) 血糖 / 血液成分：整读后才落库，必须先并进 holder 再取 points（顺序不能反）──
+    [weakSelf mergeBloodGlucoseFromDBInto:holder date:dateStr mac:mac];
+    [weakSelf mergeBloodComponentFromDBInto:holder date:dateStr mac:mac];
 
-    // 分页读取：maxPackage 表示「读到第几包」，先要第 1 包拿到总包数，再逐包推进
-    fetchNext = ^(NSInteger maxPackage) {
-        reads++;
-        if (reads > 400) { finish(YES, @"读取活动数据包数异常"); return; }
-        [[VPBleCentralManage sharedBleManager].peripheralManage veepooSDK_readBasicDataWithDayNumber:day maxPackage:maxPackage result:^(NSArray *oneDayBasicArray, NSInteger totalPackage, NSInteger currentReadPackage) {
-            armWatchdog();
-            for (id it in oneDayBasicArray) {
-                if (![it isKindOfClass:[NSDictionary class]]) continue;
-                [holder addPoint:[weakSelf activityPointFromDict:it]];
-            }
-            [weakSelf sendEvent:@"activityByDay" data:@{
-                @"progress": totalPackage > 0 ? @((double)currentReadPackage / (double)totalPackage) : @0
-            }];
-            if (totalPackage <= 0 || currentReadPackage >= totalPackage) {
-                finish(NO, nil);
-                return;
-            }
-            fetchNext(currentReadPackage + 1);
-        }];
-    };
+    NSArray<NSDictionary *> *points = [holder sortedPoints];
+    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+    r[@"day"] = @(day);
+    r[@"date"] = dateStr;
+    r[@"points"] = points;
+    r[@"pointCount"] = @(points.count);
 
-    armWatchdog();
-    fetchNext(1);
+    NSInteger totalStep = 0;
+    double totalDis = 0, totalCal = 0, totalSport = 0;
+    for (NSDictionary *p in points) {
+        totalStep += [p[@"step"] integerValue];
+        totalDis += [p[@"dis"] doubleValue];
+        totalCal += [p[@"cal"] doubleValue];
+        totalSport += [p[@"sport"] doubleValue];
+    }
+    r[@"totalStep"] = @(totalStep);
+    r[@"totalDistance"] = @(round(totalDis * 1000.0) / 1000.0);
+    r[@"totalCalorie"] = @(round(totalCal * 1000.0) / 1000.0);
+    r[@"totalSportValue"] = @((NSInteger)llround(totalSport));
+
+    NSMutableDictionary *ev = [NSMutableDictionary dictionary];
+    ev[@"complete"] = @YES;
+    ev[@"day"] = @(day);
+    ev[@"totalStep"] = @(totalStep);
+    [weakSelf sendEvent:@"activityByDay" data:ev];
+    callback(r, NO);
 }
 
 // 从库补血糖点：DB key "time"(HH:mm) + "bloodGlucoses"(字符串数组) + "bloodGlucoseLevels"
