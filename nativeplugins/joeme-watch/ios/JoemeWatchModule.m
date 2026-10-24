@@ -106,6 +106,10 @@
 
 /** 最近一次拿到的文本闹钟整表（新增时用它挑空闲 alarmId，避免覆盖已有闹钟） */
 @property (nonatomic, strong) NSArray<NSDictionary *> *lastTextAlarms;
+/** 与 lastTextAlarms 同步的 SDK 模型对象缓存（对齐 iOS Demo：删除/修改用「读表返回的
+    VPDeviceTextAlarmModel copy」，而不是从 JS dict 重新构造——SDK 按模型内部状态定位
+    记录，重建模型会丢私有字段导致「回包成功但删不掉/改不动」。断连即清空。 */
+@property (nonatomic, strong) NSArray<VPDeviceTextAlarmModel *> *lastTextAlarmModels;
 
 /** 世界时钟本地缓存（对齐 Android mWorldClockCache）：add 挑空闲 id、delete/move 校验用。
     懒加载 getter 在 @implementation 里手写，所以这里只声明，不自动合成。 */
@@ -1665,6 +1669,9 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             // 开关写入覆盖表同理：字节表会随重连刷新，旧覆盖值不能再压着新快照
             [self.switchWriteOverride removeAllObjects];
             self.allDayOxygenWritten = nil;
+            // 文本闹钟缓存属于「上一台设备」：断连即失效，避免拿旧表的模型去删改新设备
+            self.lastTextAlarms = nil;
+            self.lastTextAlarmModels = nil;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
@@ -6673,8 +6680,27 @@ UNI_EXPORT_METHOD(@selector(readSOSCallTimes:callback:))
     }];
     // 留一份快照：新增闹钟时据此挑空闲 ID（否则固定传 1 会覆盖已有闹钟）。
     // 只有拿到数组才更新，避免失败路径把缓存冲成空表导致下次新增又用回 ID 1。
-    if ([alarmArray isKindOfClass:[NSArray class]]) self.lastTextAlarms = list;
+    if ([alarmArray isKindOfClass:[NSArray class]]) {
+        self.lastTextAlarms = list;
+        // 模型对象缓存与 dict 快照同步（同一份读表/回包数据）：
+        // 删除/修改时 copy 这里面的模型传给 SDK，保证内部字段与设备一致
+        self.lastTextAlarmModels = alarmArray;
+    }
     return list;
+}
+
+/**
+ 按 alarmId 从读表缓存里取模型副本（对齐 iOS Demo 的 deviceAlarmArray + copy()）。
+ 返回 nil 表示缓存缺失（还没读过表、或该 ID 不在缓存）——调用方回退到 options 重建。
+ */
+- (VPDeviceTextAlarmModel *)cachedTextAlarmModelWithId:(id)alarmId {
+    if (!alarmId) return nil;
+    NSInteger target = [alarmId integerValue];
+    for (VPDeviceTextAlarmModel *m in self.lastTextAlarmModels) {
+        if (![m isKindOfClass:[VPDeviceTextAlarmModel class]]) continue;
+        if ([m.alarmID integerValue] == target) return [m copy];
+    }
+    return nil;
 }
 
 /**
@@ -6763,7 +6789,25 @@ UNI_EXPORT_METHOD(@selector(modifyTextAlarm:callback:))
         return;
     }
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    VPDeviceTextAlarmModel *m = [self textAlarmModelFromOptions:options];
+    // 对齐 iOS Demo：优先 copy 读表缓存的模型对象，只覆盖用户改动的字段。
+    // SDK 按模型内部状态定位记录——用 init+赋值重建的模型缺内部字段，
+    // 会表现为「回包成功但设备上没变」（删除同理）。缓存缺失时才回退重建。
+    VPDeviceTextAlarmModel *m = [self cachedTextAlarmModelWithId:alarmId];
+    if (m) {
+        if (options[@"hour"]) m.alarmHour   = [NSString stringWithFormat:@"%ld", (long)[options[@"hour"] integerValue]];
+        if (options[@"minute"]) m.alarmMinute = [NSString stringWithFormat:@"%ld", (long)[options[@"minute"] integerValue]];
+        if (options[@"enable"]) m.alarmState  = [NSString stringWithFormat:@"%d", [options[@"enable"] boolValue] ? 1 : 0];
+        if (options[@"content"]) m.alarmText  = [options[@"content"] isKindOfClass:[NSString class]] ? options[@"content"] : @"";
+        if (options[@"unRepeatDate"]) m.alarmDate = [options[@"unRepeatDate"] isKindOfClass:[NSString class]] ? options[@"unRepeatDate"] : @"0000-00-00";
+        NSString *repeat = options[@"repeat"];
+        if ([repeat isKindOfClass:[NSString class]] && repeat.length >= 7) {
+            m.repeatState = [self iosRepeatStateFromAndroid:repeat];
+        }
+        NSLog(@"[JoemeAlarm] modifyTextAlarm cacheHit alarmId=%@ model=%@", alarmId, m);
+    } else {
+        m = [self textAlarmModelFromOptions:options];
+        NSLog(@"[JoemeAlarm] modifyTextAlarm cacheMiss 回退重建 alarmId=%@", alarmId);
+    }
     __weak typeof(self) weakSelf = self;
     [pm veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:m
                                               settingMode:VPDeviceTextAlarmSettingModelAddOrChange
@@ -6797,7 +6841,15 @@ UNI_EXPORT_METHOD(@selector(deleteTextAlarm:callback:))
         return;
     }
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    VPDeviceTextAlarmModel *m = [self textAlarmModelFromOptions:options];
+    // 对齐 iOS Demo：删除用「读表缓存的模型副本」原样下发（SDK 按模型内部状态定位记录，
+    // 重建模型会删不掉但回包仍 CLEAR_SUCCESS）。缓存缺失（未读过表/ID 不在缓存）才回退重建。
+    VPDeviceTextAlarmModel *m = [self cachedTextAlarmModelWithId:alarmId];
+    if (m) {
+        NSLog(@"[JoemeAlarm] deleteTextAlarm cacheHit alarmId=%@ model=%@", alarmId, m);
+    } else {
+        m = [self textAlarmModelFromOptions:options];
+        NSLog(@"[JoemeAlarm] deleteTextAlarm cacheMiss 回退重建 alarmId=%@", alarmId);
+    }
     __weak typeof(self) weakSelf = self;
     [pm veepooSDKSettingDeviceTextAlarmWithTextAlarmModel:m
                                               settingMode:VPDeviceTextAlarmSettingModelDelete
