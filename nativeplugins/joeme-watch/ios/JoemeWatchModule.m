@@ -135,6 +135,8 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 @property (nonatomic, assign) BOOL stressFinished;
 /** 压力测量看门狗（可取消）。设备把命令吃掉时页面会永远停在「测量中」，到点自己收尾 */
 @property (nonatomic, copy) dispatch_block_t stressWatchdog;
+/** 本轮是否已向设备补发过停止命令，保证一次测量只发一次 */
+@property (nonatomic, assign) BOOL stressDeviceStopped;
 
 /** 血液成分是否私人模式（官方「通用/私人模式」），start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodAnalysisPersonal;
@@ -161,6 +163,15 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 @property (nonatomic, assign) NSInteger ecgWaveSeq;
 /** 本次 ECG 测量的模型（结束时取 filterSignals 补发尾段） */
 @property (nonatomic, strong) VPECGTestDataModel *ecgModel;
+/** 本轮 ECG 是否已向 JS 发出终态。
+    设备可能重复回 Over/Complete，我方 stopMeasure 引出的 Over 之后也可能再补一帧；
+    没有这个标志页面会收到两条 result（存两条记录、跳两次详情页）。 */
+@property (nonatomic, assign) BOOL ecgFinished;
+/** ECG 实时波形轮询定时器。
+    SDK 文档明写「测试过程中 filterSignals 会一直拼接，画波形可以开定时器每 100ms 取点」——
+    测量回调本身只在状态变化时（约每秒）触发一次，只靠回调画图会一秒一跳。
+    测量期间按 100ms 轮询，与 Demo 的刷新节奏一致。 */
+@property (nonatomic, strong) NSTimer *ecgWaveTimer;
 
 /** 运动记录读取会话号；每次 readDeviceRunningData 自增，旧会话的迟到回调按它丢弃 */
 @property (nonatomic, assign) NSInteger sportReadSeq;
@@ -287,6 +298,9 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (void)armTemperatureWatchdog;
 - (void)cancelTemperatureWatchdog;
 - (void)stopTemperatureSession;
+- (void)armStressWatchdog;
+- (void)cancelStressWatchdog;
+- (void)stopStressSession;
 // 血液成分（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
 - (void)handleBloodAnalysisProgress:(NSProgress *)progress;
 - (void)handleBloodAnalysisState:(VPDeviceBloodAnalysisState)state
@@ -906,11 +920,36 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         // VPHealthGlanceTestModel 带 cuffBloodPressureHigh/Low。
         // 所以这里按能力位自动分流，页面无感：on('measure', type='bp') 的字段完全一致。
         VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
-        BOOL cuffOnly = (info.bloodPressureType == 3 || info.bloodPressureType == 5);
+        // 判据用 SDK 自己的 isSupportBPTest（= bloodPressureType 1/4），它决定
+        // veepooSDKTestBloodStart 会不会直接回 NoFunction。只要它 false 就说明光电通路不可用
+        // （气泵机型 3/5、或能力位没解析出来的机型都落在这一类），此时若支持微体检就走微体检。
+        BOOL photoBpOk = info.isSupportBPTest;
         // supportHealthGlanceTest 的 SDK 实现就是 healthGlanceType == 2 || == 4（反汇编 0x10d8）
         BOOL hgOk = info.supportHealthGlanceTest;
-        if (cuffOnly && hgOk) {
+        if (!photoBpOk && hgOk) {
+            NSLog(@"[joeme-watch] bp: isSupportBPTest=NO (type=%lu), 改走微体检 healthGlance",
+                  (unsigned long)info.bloodPressureType);
             [self startBpViaHealthGlance];
+            callback(resultWithCode(200), NO);
+            return;
+        }
+        if (!photoBpOk && !hgOk) {
+            // 两条路都不通：光电被 SDK 判不支持，微体检能力位也是 0。
+            // 明确回一帧 failed（带能力位数值），别让页面空转到 90s 超时。
+            NSLog(@"[joeme-watch] bp: 无可用通路 bloodPressureType=%lu healthGlanceType=%lu",
+                  (unsigned long)info.bloodPressureType, (unsigned long)info.healthGlanceType);
+            [self endMeasuring];
+            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
+            d[@"success"] = @NO;
+            d[@"value"] = @0;
+            d[@"progress"] = @0;
+            d[@"message"] = [NSString stringWithFormat:
+                             @"血压测量失败：该机型不支持（血压类型 %lu，微体检 %lu）",
+                             (unsigned long)info.bloodPressureType,
+                             (unsigned long)info.healthGlanceType];
+            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                             @"cuff": @NO, @"haveProgress": @NO };
+            [self sendEvent:@"measure" data:d];
             callback(resultWithCode(200), NO);
             return;
         }
@@ -950,6 +989,14 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleFatigueState:state progress:progress value:fatigueValue];
         }];
     } else if ([type isEqualToString:@"stress"]) {
+        // 与体温/血液成分同口径：每次开始清上一轮的兜底值与终态标志，
+        // 并挂上看门狗（设备吃掉命令时页面才不会永远停在「测量中」）。
+        // 不按 peripheralModel.stressType 提前拦截：握手能力位漏报是已知问题
+        // （README 里天气/血压同款坑），能力位为 0 但设备能测的机型确实存在。
+        self.lastStressValue = 0;
+        self.stressFinished = NO;
+        self.stressDeviceStopped = NO;
+        [self armStressWatchdog];
         [pm veepooSDK_stressTestStart:YES result:^(VPDeviceStressTestState state, NSInteger progress,
                                                    NSInteger stress) {
             [weakSelf handleStressState:state progress:progress stress:stress];
@@ -1016,10 +1063,14 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         self.ecgWaveFlushAt = 0;
         self.ecgWaveSeq = 0;
         self.ecgModel = nil;
+        self.ecgFinished = NO;
         [pm veepooSDKTestECGStart:YES
                        testResult:^(VPTestECGState state, NSUInteger progress, VPECGTestDataModel *model) {
             [weakSelf handleEcgState:state progress:progress model:model];
         }];
+        // 波形轮询：SDK 的 filterSignals 只在测量回调里增长（约 1 秒一次），
+        // 只靠回调会把波形画成一秒一跳；按 Demo 的 100ms 节奏主动取增量。
+        [self startEcgWaveTimer];
     }
 
     [self sendEvent:@"measure" data:[self measureEvent:type phase:@"start" isDone:NO]];
@@ -1486,44 +1537,176 @@ static BOOL JoemeTempPhaseIsDone(NSString *phase) {
     }
 }
 
-/** 压力：Complete 为正常结束，Over 表示人为结束 */
+/**
+ 压力状态映射。iOS 的 VPDeviceStressTestState 只有 6 个值，语义要靠 progress/stress 补：
+
+   Complete + progress>=100 + 有读数 → result（有值即成功，与 Android onDetectSuccess 同口径）
+   Complete + 其余（progress<100）   → testing（**进度帧**，progress 交给页面画环）
+   Over   → 人为结束 / 设备结束：有兜底值 → result，无值 → stop
+   DeviceBusy / LowPower / NotWear / NoFunction → failed（message 为具体原因）
+
+ iOS 必须自己兜住的三点（Android 那边 onDetecting / onDetectSuccess 已经分得很清）：
+
+ 1) **Over 帧不带值**。SDK 在结束帧里 progress 与 stress 都是 0，真值在进度帧
+    （实测是 Complete + progress 递增的帧）里给过。不兜底的话「测到 62 再点停止」
+    会被判成「测量结束（无有效值）」，页面直接回待机 —— 这是 iOS 上压力测量
+    「点了停止就什么都没了」的根因。用 lastStressValue 兜（与血氧 Over /
+    体温 Close / 血液成分 Over 同一套做法）。
+
+ 2) **Complete 不一定表示结束**。SDK 的压力回调把每一次进度上报都包在
+    VPDeviceStressTestStateComplete 里（progress 递增、stress 为 0），只有
+    progress 跑满且带读数才算真正结束。早期实现不看 progress，一律把 Complete
+    当 result，于是收到第一个进度帧就翻结果页（进度环根本没机会画）。
+
+ 3) **终态只发一次**。我方补发的停止会引出 Over，设备也可能重复回包；
+    不去重页面会弹两次保存框。
+
+ progress 是设备真实进度（0~100），页面直接用它画环，不用再按时间估算。
+ 收尾时补发一次停止（官方 Demo 行为）：设备侧状态机不复位的话，下一次测量会直接失败。
+ */
 - (void)handleStressState:(VPDeviceStressTestState)state progress:(NSInteger)progress stress:(NSInteger)stress {
+    if (self.stressFinished) return;
+
+    // 本轮最后一次有效压力值：0 表示这帧没带读数（进度帧 / 结束帧都可能不带）
+    if (stress > 0) self.lastStressValue = stress;
+    // 每来一帧就重置看门狗：慢设备不会被误判，真卡住也能收尾
+    [self armStressWatchdog];
+
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, stopDevice = NO;
     NSString *message = @"压力测量中";
+    NSString *stateName = @"STRESS_TESTING";
+
     switch (state) {
-        case VPDeviceStressTestStateComplete:
-            phase = stress > 0 ? @"result" : @"stop";
-            isDone = YES;
-            success = stress > 0;
-            message = success ? @"压力测量完成" : @"压力测量结束（无有效值）";
+        case VPDeviceStressTestStateComplete: {
+            // Android 的等价判定（vp_bt.handler 反编译）：同一包带 progress/值，
+            // progress==100 && value>0 才回调 onDetectSuccess；value<=0 时什么都不回调，
+            // 由后续帧 / onDetectStop 收尾。iOS 把「进度」和「完成」都塞进 Complete，
+            // 所以这里必须自己再分一次：
+            //   progress<100            → 进度帧，交给页面画环
+            //   progress>=100 + 有读数  → result
+            //   progress>=100 + 无读数  → 仍然不算结束（等 Over / 看门狗），
+            //                             否则「刚跑到 100 还没算出值」会被误判成无有效值
+            if (progress >= 100 && self.lastStressValue > 0) {
+                phase = @"result"; isDone = YES; success = YES; stopDevice = YES;
+                message = @"压力测量完成";
+                stateName = @"COMPLETE";
+            } else {
+                stateName = @"COMPLETE_PROGRESS";
+            }
             break;
-        case VPDeviceStressTestStateOver:
-            phase = @"stop"; isDone = YES; message = @"压力测量已结束";
+        }
+        case VPDeviceStressTestStateOver: {
+            // 人为结束 / 设备结束：有兜底值就当结果交出去，别让「测完再点停止」丢结果
+            BOOL hasValue = self.lastStressValue > 0;
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue;
+            message = hasValue ? @"压力测量完成" : @"压力测量已结束";
+            stateName = @"OVER";
             break;
+        }
         case VPDeviceStressTestStateDeviceBusy:
-            phase = @"failed"; isDone = YES; message = @"压力测量失败：设备正忙";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"压力测量失败：设备正忙";
+            stateName = @"DEVICE_BUSY";
             break;
         case VPDeviceStressTestStateLowPower:
-            phase = @"failed"; isDone = YES; message = @"压力测量失败：设备电量过低";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"压力测量失败：设备电量过低";
+            stateName = @"LOW_POWER";
             break;
         case VPDeviceStressTestStateNotWear:
-            phase = @"failed"; isDone = YES; message = @"压力测量失败：佩戴检测未通过";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"压力测量失败：佩戴检测未通过";
+            stateName = @"NOT_WEAR";
             break;
         case VPDeviceStressTestStateNoFunction:
-            phase = @"failed"; isDone = YES; message = @"压力测量失败：设备不支持该功能";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"压力测量失败：设备不支持该功能";
+            stateName = @"NO_FUNCTION";
             break;
         default:
-            break;
+            // 未知状态不打扰页面（保持「测量中」，等后续帧）
+            return;
     }
+
+    if (isDone) {
+        self.stressFinished = YES;
+        [self cancelStressWatchdog];
+    }
+
     NSMutableDictionary *d = [self measureEvent:@"stress" phase:phase isDone:isDone];
-    d[@"progress"] = @(progress);
-    d[@"value"] = @(stress);
+    NSInteger pct = MIN(MAX(progress, (NSInteger)0), (NSInteger)100);
+    d[@"progress"] = @(isDone ? 100 : pct);
+    d[@"value"] = @(self.lastStressValue);
     d[@"success"] = @(success);
-    d[@"state"] = @(state);
+    d[@"state"] = stateName;        // 与 Android 同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
     d[@"message"] = message;
+    d[@"extra"] = @{ @"lastValue": @(self.lastStressValue) };
     [self sendEvent:@"measure" data:d];
-    if (isDone) [self endMeasuring];
+
+    if (isDone) {
+        [self endMeasuring];
+        if (stopDevice) [self stopStressSession];
+    }
+}
+
+/**
+ 压力测量看门狗：一次手动测量官方 UI 约 30~60 秒。iOS 上超过 90 秒没有任何帧就说明
+ 设备把命令吃掉了（不支持 / 状态机没复位 / 被别的测量占着）。到点收尾，页面才不会
+ 永远停在「测量中」。
+ 收尾口径：本轮已拿到过读数 → 当 result 交出去（与 Over 帧同一套兜底，「跑到 100
+ 但设备没再回结束帧」不该把有效结果判成失败）；一个值都没拿到 → failed。
+ 每来一帧都重新计时：慢设备不会被误判，真卡住也不会无限等。
+ */
+- (void)armStressWatchdog {
+    [self cancelStressWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t blk = dispatch_block_create(0, ^{
+        JoemeWatchModule *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.stressFinished) return;
+        strongSelf.stressWatchdog = nil;
+        strongSelf.stressFinished = YES;
+        BOOL hasValue = strongSelf.lastStressValue > 0;
+        NSMutableDictionary *d = [strongSelf measureEvent:@"stress"
+                                                    phase:(hasValue ? @"result" : @"failed")
+                                                   isDone:YES];
+        d[@"progress"] = @100;
+        d[@"value"] = @(strongSelf.lastStressValue);
+        d[@"success"] = @(hasValue);
+        d[@"state"] = hasValue ? @"TIMEOUT_RESULT" : @"TIMEOUT";
+        d[@"message"] = hasValue ? @"压力测量完成" : @"压力测量超时：设备未响应，请重试";
+        d[@"extra"] = @{ @"timeout": @YES, @"lastValue": @(strongSelf.lastStressValue) };
+        [strongSelf sendEvent:@"measure" data:d];
+        [strongSelf endMeasuring];
+        [strongSelf stopStressSession];
+    });
+    self.stressWatchdog = blk;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), blk);
+}
+
+/** 取消压力看门狗（终态、手动停止、开始新一轮时都要调） */
+- (void)cancelStressWatchdog {
+    if (self.stressWatchdog) {
+        dispatch_block_cancel(self.stressWatchdog);
+        self.stressWatchdog = nil;
+    }
+}
+
+/**
+ 释放设备侧压力会话（官方 Demo / Android 的 onDetectStop 收尾行为）。
+ 幂等：同一轮只下发一次；回调换成本地空 block，避免自己补发的停止引出 Over 再回灌页面。
+ */
+- (void)stopStressSession {
+    [self cancelStressWatchdog];
+    if (self.stressDeviceStopped) return;
+    self.stressDeviceStopped = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    [pm veepooSDK_stressTestStart:NO
+                           result:^(VPDeviceStressTestState state, NSInteger progress, NSInteger stress) {}];
 }
 
 /** 情绪：Testing 期间随进度给值，没有单独的成功回调，靠 stopMeasure 收尾 */
@@ -1866,6 +2049,7 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     [self sendEvent:@"measure" data:d];
 
     if (isDone) {
+        [self cancelBloodAnalysisWatchdog];
         [self endMeasuring];
         if (stopDevice) [self stopBloodAnalysisSession];
     }
@@ -1981,56 +2165,118 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     if (isDone) [self endMeasuring];
 }
 
-/** ECG：动态测量，靠用户 stopMeasure 收尾；NotLead 表示导联脱落 */
+/**
+ ECG 状态映射（对齐 Android startMeasureEcg 的 IECGDetectListener + 官方 EcgTestViewController）。
+
+   Start / Testing  → testing（progress 即 testProgress；value 取 muHearts 最新一次心率）
+   NotLead          → testing + extra.leadOff=YES（导联脱落只是「还没接好」，不是失败：
+                      手放上去就会继续；页面据此盖一层「电极接触不良」提示，
+                      当 failed 收尾会让用户以为测废了）
+   Complete         → 有有效值 result / 无值 failed
+   Over             → 人为结束（我们下发 stop 或设备侧结束）：有有效值 result / 无值 stop
+   Failure / DeviceBusy / NoFunction → failed
+
+ 三个 iOS 必须自己兜住的点（Android 由枚举语义直接给出）：
+
+ 1) **Over 帧的 model 可能是 nil 或 aveHeart=0**。真值早就在之前那次回调里给过
+    （SDK 传的是同一个累计模型）；不兜底的话「测了 20 秒再点停止」会被判成「无有效值」。
+    这里用 self.ecgModel 兜（与血氧 lastSpo2Value / 体温 lastTempValue 同一套做法）。
+
+ 2) **终态只发一次**。设备可能重复回 Over/Complete，我方 stop 引出的 Over 之后还可能有尾帧；
+    不去重页面会收到两条 result（存两条记录、跳两次详情页）。
+
+ 3) **波形不能只靠状态回调画**。SDK 文档明写 filterSignals 在测试过程中一直拼接、
+    「画波形可以开定时器每 100ms 取点」；状态回调只有约 1 秒一次，只靠它波形会一秒一跳。
+    开始测量时挂一个 100ms 的轮询（startEcgWaveTimer），收尾时停掉并强制补发尾段。
+ */
 - (void)handleEcgState:(VPTestECGState)state progress:(NSUInteger)progress model:(VPECGTestDataModel *)model {
+    if (model) self.ecgModel = model;
+    // 终态已发过：丢弃重帧，但波形照收（尾段点不能丢）
+    if (self.ecgFinished) {
+        [self flushEcgWave:model force:NO];
+        return;
+    }
+
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, leadOff = NO;
     NSString *message = @"ECG 测量中";
+    NSString *stateName = @"ECG_TESTING";
+
     switch (state) {
         case VPTestECGStateStart:
+            message = @"ECG 测量准备中，请将手指放在电极上";
+            stateName = @"ECG_START";
+            break;
         case VPTestECGStateTesting:
             break;
         case VPTestECGStateNotLead:
+            leadOff = YES;
             message = @"ECG 测量中：导联脱落，请贴紧电极片";
+            stateName = @"ECG_NOT_LEAD";
+            break;
+        case VPTestECGStateComplete:
+            isDone = YES; stateName = @"ECG_COMPLETE";
             break;
         case VPTestECGStateOver:
-        case VPTestECGStateComplete:
-            phase = @"result"; isDone = YES;
-            success = (model.aveHeart.integerValue > 0);
-            message = success ? @"ECG 测量完成" : @"ECG 测量结束（无有效值）";
+            isDone = YES; stateName = @"ECG_OVER";
             break;
         case VPTestECGStateFailure:
             phase = @"failed"; isDone = YES; message = @"ECG 测量失败：测试无效";
+            stateName = @"ECG_FAILURE";
             break;
         case VPTestECGStateDeviceBusy:
             phase = @"failed"; isDone = YES; message = @"ECG 测量失败：设备正忙";
+            stateName = @"ECG_DEVICE_BUSY";
             break;
         case VPTestECGStateNoFunction:
             phase = @"failed"; isDone = YES; message = @"ECG 测量失败：设备不支持该功能";
+            stateName = @"ECG_NO_FUNCTION";
             break;
         default:
             break;
     }
-    if (model) self.ecgModel = model;
-    // 波形随每次回调增量下发（filterSignals 是累计数组，只发新追加的部分）
-    [self flushEcgWave:model force:isDone];
+
+    NSMutableDictionary *extra = [[self ecgExtraFromModel:self.ecgModel] mutableCopy];
+    extra[@"leadOff"] = @(leadOff);
+
+    if (isDone) {
+        // Over / Complete：用本次累计模型判有效值（Over 帧自带的 model 常为 nil）
+        BOOL hasValue = self.ecgModel.aveHeart.integerValue > 0;
+        if (hasValue) {
+            phase = @"result"; success = YES;
+            message = @"ECG 测量完成";
+            [self mergeEcgReport:extra model:self.ecgModel];   // 多诊断报告（付费能力）
+        } else {
+            phase = (state == VPTestECGStateOver) ? @"stop" : @"failed";
+            message = (state == VPTestECGStateOver)
+                ? @"ECG 测量已结束"
+                : @"ECG 测量失败：未采集到有效波形";
+        }
+    }
+
+    // 波形：收尾时强制补发尾段（filterSignals 是累计数组，只发新追加的部分）
+    [self flushEcgWave:self.ecgModel force:isDone];
+    if (isDone) [self stopEcgWaveTimer];
 
     NSMutableDictionary *d = [self measureEvent:@"ecg" phase:phase isDone:isDone];
-    d[@"progress"] = @(progress);
-    if (isDone && model.aveHeart.length) {
-        d[@"value"] = @(model.aveHeart.integerValue);        // 结束取平均心率
-    } else if (model.muHearts.count) {
-        d[@"value"] = model.muHearts.lastObject;             // 过程中取最新一次心率
+    d[@"progress"] = @(isDone ? 100 : MIN(progress, (NSUInteger)100));
+    if (isDone && self.ecgModel.aveHeart.length) {
+        d[@"value"] = @(self.ecgModel.aveHeart.integerValue);        // 结束取平均心率
+    } else if (self.ecgModel.muHearts.count) {
+        d[@"value"] = self.ecgModel.muHearts.lastObject;             // 过程中取最新一次心率
+    } else if (self.ecgModel.aveHeart.length) {
+        d[@"value"] = @(self.ecgModel.aveHeart.integerValue);
     }
     d[@"success"] = @(success);
-    d[@"state"] = @(state);
+    d[@"state"] = stateName;                      // 与 Android 同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
     d[@"message"] = message;
-    NSMutableDictionary *extra = [[self ecgExtraFromModel:model] mutableCopy];
-    // 多诊断报告（付费能力）：心电图测量结束后 SDK 从结果模型算，历史记录没有模型，不给
-    if (isDone && success && model) [self mergeEcgReport:extra model:model];
     d[@"extra"] = extra;
     [self sendEvent:@"measure" data:d];
-    if (isDone) [self endMeasuring];
+    if (isDone) {
+        self.ecgFinished = YES;
+        [self endMeasuring];
+    }
 }
 
 /**
@@ -2173,16 +2419,48 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     NSArray *slice = [all subarrayWithRange:NSMakeRange(start, all.count - start)];
     self.ecgWaveIndex = all.count;
     if (!slice.count) return;
+    // drawFrequency 是横向排布依据：uploadFrequency 个别固件为 0，
+    // 页面拿到 0 会退回默认 512，走速就不是设备真实值了，这里用采样频率兜底。
+    NSInteger drawHz = model.uploadFrequency.integerValue;
+    if (drawHz <= 0) drawHz = model.frequency.integerValue;
     [self sendEvent:@"ecgWave" data:@{
         @"points": [self ecgMvArrayFromModel:model signals:slice],   // 与 Android 同口径：mV
         @"powers": @[],
         @"raw": @NO,
-        @"drawFrequency": @(model.uploadFrequency.integerValue),
+        @"drawFrequency": @(MAX(drawHz, (NSInteger)0)),
         @"frequency": @(model.frequency.integerValue),
         @"ecgType": model.ecgType ?: @"",
         @"gain": @([model getGainValue]),
         @"seq": @(++self.ecgWaveSeq)
     }];
+}
+
+/**
+ 波形轮询：每 100ms 把 filterSignals 新增的部分发出去。
+ SDK 文档（VPECGTestDataModel.h filterSignals 注释）明写「测试过程中此数组会一直拼接，
+ 画波形可以开启个定时器，每 100 毫秒取 25 个点」——状态回调只有约 1 秒一次，
+ 只靠回调画图会一秒跳一次，实时感完全不对。
+ 定时器只读不写设备，收尾时由 stopEcgWaveTimer 停掉。
+ */
+- (void)startEcgWaveTimer {
+    [self stopEcgWaveTimer];
+    __weak typeof(self) weakSelf = self;
+    self.ecgWaveTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
+                                                         repeats:YES
+                                                           block:^(NSTimer *timer) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [timer invalidate]; return; }
+        // 没有进行中的 ECG 会话就没有模型可读，顺手把定时器收掉
+        if (strongSelf.ecgFinished || !strongSelf.ecgModel) return;
+        [strongSelf flushEcgWave:strongSelf.ecgModel force:NO];
+    }];
+}
+
+- (void)stopEcgWaveTimer {
+    if (self.ecgWaveTimer) {
+        [self.ecgWaveTimer invalidate];
+        self.ecgWaveTimer = nil;
+    }
 }
 
 /**
@@ -2246,6 +2524,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                            testResult:^(VPTestFatigueState state, NSUInteger progress,
                                         NSUInteger value) {}];
     } else if ([type isEqualToString:@"stress"]) {
+        // 与体温/血液成分同口径：手动停止先置终态标志，设备回的那帧 Over 就不再回灌
+        // 一条 result，页面 stop() 已按「有值→结果页 / 无值→已停止」收过尾了。
+        self.stressFinished = YES;
+        self.stressDeviceStopped = YES;
+        [self cancelStressWatchdog];
         [pm veepooSDK_stressTestStart:NO
                                result:^(VPDeviceStressTestState state, NSInteger progress,
                                         NSInteger stress) {}];
@@ -2284,7 +2567,12 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                          progress:^(NSProgress *progress) {}
                        testResult:^(VPDeviceGSRState state, VPGSRResultModel *model) {}];
     } else if ([type isEqualToString:@"ecg"]) {
+        // 手动停止：先补发尾段波形、停掉轮询，再下发 stop。
+        // 这里**不**置 ecgFinished —— 设备回的 Over 帧带的是本次累计模型（有效值），
+        // 页面还得靠它拿结果；置了标志就只剩页面自己攒的波形，心率/HRV/QT 全丢。
+        // 重复终态由 handleEcgState 自己按 isDone 去重（第一条 result 之后就置位）。
         [self flushEcgWave:self.ecgModel force:YES];   // 尾段波形补发
+        [self stopEcgWaveTimer];
         [pm veepooSDKTestECGStart:NO
                        testResult:^(VPTestECGState state, NSUInteger progress,
                                     VPECGTestDataModel *model) {}];
@@ -2354,6 +2642,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.bloodAnalysisFinished = YES;
             self.bloodAnalysisDeviceStopped = YES;
             self.lastBloodAnalysisModel = nil;
+            // 压力同理：撤看门狗 + 置已收尾，别让 90 秒后的 block 对着断开的设备补发停止
+            [self cancelStressWatchdog];
+            self.stressFinished = YES;
+            self.stressDeviceStopped = YES;
+            self.lastStressValue = 0;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
