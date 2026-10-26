@@ -2361,9 +2361,10 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
  */
 - (void)handleEcgState:(VPTestECGState)state progress:(NSUInteger)progress model:(VPECGTestDataModel *)model {
     if (model) self.ecgModel = model;
-    // 终态已发过：丢弃重帧，但波形照收（尾段点不能丢）
+    // 终态已发过：丢弃重帧，但波形照收（尾段点不能丢）。
+    // 用 self.ecgModel 而不是参数 model —— Over 尾帧常常只带 nil 模型。
     if (self.ecgFinished) {
-        [self flushEcgWave:model force:NO];
+        [self flushEcgWave:self.ecgModel force:NO];
         return;
     }
 
