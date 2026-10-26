@@ -2408,6 +2408,13 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
 
     NSMutableDictionary *extra = [[self ecgExtraFromModel:self.ecgModel] mutableCopy];
     extra[@"leadOff"] = @(leadOff);
+    if (!isDone) {
+        // 测量中的帧只带指标，不带波形：waveMv/filterSignals 是整场累计数组，
+        // 每帧（约 1 秒一次）塞进事件会把 JS 桥刷爆 —— 波形走专门的 ecgWave 增量通道。
+        [extra removeObjectForKey:@"waveMv"];
+        [extra removeObjectForKey:@"filterSignals"];
+        [extra removeObjectForKey:@"powers"];
+    }
 
     if (isDone) {
         // Over / Complete：用本次累计模型判有效值（Over 帧自带的 model 常为 nil）
@@ -2746,14 +2753,18 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                        testResult:^(VPDeviceGSRState state, VPGSRResultModel *model) {}];
     } else if ([type isEqualToString:@"ecg"]) {
         // 手动停止：先补发尾段波形、停掉轮询，再下发 stop。
-        // 这里**不**置 ecgFinished —— 设备回的 Over 帧带的是本次累计模型（有效值），
-        // 页面还得靠它拿结果；置了标志就只剩页面自己攒的波形，心率/HRV/QT 全丢。
-        // 重复终态由 handleEcgState 自己按 isDone 去重（第一条 result 之后就置位）。
+        // ⚠ 这里的回调**不能**用空 block：SDK 把 testECGResultBlock 存成实例属性，
+        //   每次调用都会覆盖。传空 block 的话，设备随后回的 Over（本次累计模型 +
+        //   平均心率/HRV/QT）就进了黑洞，页面永远拿不到结果 —— 只剩自己攒的波形。
+        //   所以原样转发给 handleEcgState，Over 由它按 result 收尾。
         [self flushEcgWave:self.ecgModel force:YES];   // 尾段波形补发
         [self stopEcgWaveTimer];
+        __weak typeof(self) weakSelf = self;
         [pm veepooSDKTestECGStart:NO
                        testResult:^(VPTestECGState state, NSUInteger progress,
-                                    VPECGTestDataModel *model) {}];
+                                    VPECGTestDataModel *model) {
+            [weakSelf handleEcgState:state progress:progress model:model];
+        }];
     }
 
     NSMutableDictionary *d = [self measureEvent:type phase:@"stop" isDone:YES];
