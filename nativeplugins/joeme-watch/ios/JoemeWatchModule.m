@@ -65,6 +65,13 @@
 #import <VeepooBleSDK/VPPttValueModel.h>
 #import <VeepooBleSDK/VPDeviceSportWithGPSModel.h>
 #import <VeepooBleSDK/VPDeviceSportModel.h>
+// 微体检（公版）：iOS 上唯一能拿到「气泵血压」高低压的模型。
+// VPPeripheralBaseManage.h 里有 import，但它是 SDK 内部头，模块直接写字段时最好自己再引一次。
+#import <VeepooBleSDK/VPHealthGlanceTestModel.h>
+#import <VeepooBleSDK/VPManualHealthGlanceModel.h>
+
+/** 微体检终态枚举名（healthGlance 事件用；页面按名字判终态，不依赖数值顺序） */
+static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 
 @interface JoemeWatchModule ()
 
@@ -88,6 +95,12 @@
 
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
+
+/** 本次血氧测量最后一次有效值（0 = 还没测到）。
+    SDK 的 Over（正常结束 / 人为结束）回调里 oxygenValue 可能给 0，而真正的血氧值
+    早在 Testing 帧里给过了；不兜底的话「测到 97% 再点停止」会被判成「无有效值」。
+    每次 startMeasure('spo2') 归零。 */
+@property (nonatomic, assign) NSUInteger lastSpo2Value;
 
 /** 最近一次经典蓝牙状态（VPBTConnectStateChangeBlock 回调），电话页读取用 */
 @property (nonatomic, strong) NSDictionary *lastBTInfo;
@@ -752,6 +765,21 @@ static NSArray<NSString *> *JoemeMeasureTypes(void) {
     return d;
 }
 
+/** 微体检终态枚举名（healthGlance 事件用；页面按名字判终态，不依赖数值顺序） */
+static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state) {
+    switch (state) {
+        case VPDeviceHealthGlanceStateNoFunction: return @"NO_FUNCTION";
+        case VPDeviceHealthGlanceStateDeviceBusy: return @"DEVICE_BUSY";
+        case VPDeviceHealthGlanceStateOver:       return @"OVER";
+        case VPDeviceHealthGlanceStateLowPower:   return @"LOW_POWER";
+        case VPDeviceHealthGlanceStateFailure:    return @"FAILURE";
+        case VPDeviceHealthGlanceStateNotWear:    return @"NOT_WEAR";
+        case VPDeviceHealthGlanceStateComplete:   return @"COMPLETE";
+        case VPDeviceHealthGlanceStateNotLead:    return @"NOT_LEAD";
+        default:                                  return @"UNKNOWN";
+    }
+}
+
 /** 一次测量结束，释放占用 */
 - (void)endMeasuring {
     self.measuringType = nil;
@@ -787,6 +815,8 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     __weak typeof(self) weakSelf = self;
 
     if ([type isEqualToString:@"spo2"]) {
+        // 每次开始清掉上一轮的兜底值，否则这轮失败也会把上次的结果当成「本次结果」
+        self.lastSpo2Value = 0;
         [pm veepooSDKTestOxygenStart:YES testResult:^(VPTestOxygenState state, NSUInteger oxygenValue) {
             [weakSelf handleSpo2State:state value:oxygenValue];
         }];
@@ -895,27 +925,52 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 
 // ---------- 各类型状态映射 ----------
 
-/** 血氧：Testing/Over 期间持续给值，Over 为正常结束 */
+/**
+ 血氧状态映射。
+ iOS 的 VPTestOxygenState 与 Android 的 EDeviceStatus 语义不同，这里按官方 Demo
+ VPTestOxygenController 的口径翻译：
+   Start / Testing     测量中，oxygenValue 是当前血氧值（可能一路刷新多次）
+   Calibration         校准中，此时 **oxygenValue 是校准进度 0~100，不是血氧值**
+   CalibrationComplete 校准完成（值同样是进度）
+   Over                正常结束 / 人为结束（我们自己下发 stop 也回这一帧）
+   NotWear / DeviceBusy / NoFunction / Invalid  都是终止态，要如实告诉用户原因
+
+ 两个关键兜底（Android 用不到，iOS 必须有）：
+   1) Over 帧的 oxygenValue 可能为 0 —— 真正的值早在 Testing 帧里给过。
+      用 lastSpo2Value 兜底，否则「测到 97% 再点停止」会被判成「无有效值」。
+   2) SDK 不给任何进度字段，页面按时间自己估算圆弧；校准进度是设备给的，
+      所以单独放在 extra.progress 并标 calibrating，避免页面拿它当血氧值。
+ */
 - (void)handleSpo2State:(VPTestOxygenState)state value:(NSUInteger)value {
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, calibrating = NO;
     NSString *message = @"血氧测量中";
+    NSUInteger reportValue = value;
     switch (state) {
         case VPTestOxygenStateStart:
+            message = @"血氧测量准备中，请保持正确姿势";
+            break;
         case VPTestOxygenStateTesting:
+            // 有效血氧值：0 表示还没测出来，不覆盖上一次的
+            if (value > 0 && value <= 100) self.lastSpo2Value = value;
             break;
         case VPTestOxygenStateCalibration:
+            calibrating = YES;
             message = @"血氧校准中";
             break;
         case VPTestOxygenStateCalibrationComplete:
+            calibrating = YES;
             message = @"血氧校准完成";
             break;
-        case VPTestOxygenStateOver:
-            phase = value > 0 ? @"result" : @"stop";
+        case VPTestOxygenStateOver: {
             isDone = YES;
-            success = value > 0;
-            message = value > 0 ? @"血氧测量完成" : @"血氧测量结束（无有效值）";
+            NSUInteger finalValue = value > 0 ? value : self.lastSpo2Value;
+            reportValue = finalValue;
+            phase = finalValue > 0 ? @"result" : @"stop";
+            success = finalValue > 0;
+            message = finalValue > 0 ? @"血氧测量完成" : @"血氧测量结束（无有效值）";
             break;
+        }
         case VPTestOxygenStateNotWear:
             phase = @"failed"; isDone = YES; message = @"血氧测量失败：佩戴检测未通过";
             break;
@@ -930,10 +985,16 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             break;
     }
     NSMutableDictionary *d = [self measureEvent:@"spo2" phase:phase isDone:isDone];
-    d[@"value"] = @(value);
+    d[@"value"] = @(reportValue);
     d[@"success"] = @(success);
     d[@"state"] = @(state);
     d[@"message"] = message;
+    NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+    extra[@"calibrating"] = @(calibrating);
+    // 校准帧的 value 是校准进度：透出一份 progress 给页面画环，别混进血氧值
+    if (calibrating) extra[@"progress"] = @(MIN(value, (NSUInteger)100));
+    extra[@"lastValue"] = @(self.lastSpo2Value);
+    d[@"extra"] = extra;
     [self sendEvent:@"measure" data:d];
     if (isDone) [self endMeasuring];
 }
@@ -1823,6 +1884,12 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         @"bloodGlucoseType": @(pm.bloodGlucoseType),
         @"bloodAnalysis": @(pm.bloodAnalysisType != 0),
         @"bp": @(pm.bloodPressureType != 0 || pm.isSupportBPTest),
+        // 气泵(cuff)血压：iOS 没有独立的 cuff 实时测量接口，只能从微体检结果里拿到
+        // （VPHealthGlanceTypeCuffBp）。页面要展示「气囊血压」就必须走 healthGlance。
+        @"bpCuff": @(pm.supportHealthGlanceTest && (pm.healthGlanceType != 0)),
+        @"healthGlance": @(pm.healthGlanceType != 0),
+        @"healthGlanceType": @(pm.healthGlanceType),
+        @"supportHealthGlanceTest": @(pm.supportHealthGlanceTest),
         @"heartRate": @(pm.heartRateType != 0),
         @"worldClock": @(pm.worldClockType != 0),
         // 文本闹钟（带标签）能力位：iOS 的 VPPeripheralModel 没有独立属性，
@@ -4812,6 +4879,120 @@ UNI_EXPORT_METHOD(@selector(miniCheckup:callback:))
     [pm veepooSDK_JH58ActiveTestPPGAndAcceleration:st andResult:^(VPJH58ActiveMeasurementResultState state) {
         [self sendEvent:@"miniCheckup" data:@{ @"state": @(state) }];
         callback(resultWithCode(200), NO);
+    }];
+}
+
+/**
+ 微体检（公版，一键多指标）。options: { on }。
+ iOS SDK：veepooSDK_healthGlanceTestStart:andProgress:andResult:
+ Android：同名接口未封装（Android 的 miniCheckup 是 JH58 定制型号的另一个接口）。
+ JS：joemeWatch.healthGlance(true) / healthGlance(false)
+
+ ★ 为什么这个接口对「气泵血压」很关键：
+   反汇编确认 iOS 的 veepooSDKTestBloodStart 只会拼 0x90 包做**光电/通用**血压，
+   而且进度是 SDK 自己每秒 +2 造的，到 101 直接报 TestFail；整个 SDK 二进制里
+   没有任何 startDetectCuffBP / VPCuffBPTestData / inflate 类接口。
+   唯一带 cuff 的字段是 VPHealthGlanceTestModel.cuffBloodPressureHigh/Low
+   （VPHealthGlanceTypeCuffBp = 1<<3），也就是**气泵血压只能从微体检里拿到**。
+
+ 事件：on('healthGlance')
+   进度：{ on:true, progress: 0~100 }
+   完成：{ on:true, state: Complete, complete:true, result:{...} }
+   其它终态：{ on:true, state: <枚举值>, stateName, message, done:true }
+   result 只在 state == Complete 且 functionSupport 对应位为 1 的字段才有意义：
+     heartRate / bloodOxygen / stress / fatigueLevel / bloodSugar / bodyTemperature /
+     orgTemperature / systolicBloodPressure / diastolicBloodPressure / hrv /
+     ppgBloodPressureHigh / ppgBloodPressureLow /   ← 光电血压
+     cuffBloodPressureHigh / cuffBloodPressureLow   ← 气泵血压（本次要找的那个）
+     血液成分（totalCholesterol 等）/ 身体成分 / 情绪 / 皮电 / functionSupport 位图
+ */
+UNI_EXPORT_METHOD(@selector(healthGlance:callback:))
+- (void)healthGlance:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    BOOL on = [options[@"on"] boolValue];
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+
+    [pm veepooSDK_healthGlanceTestStart:on
+                            andProgress:^(NSInteger progress) {
+        [weakSelf sendEvent:@"healthGlance" data:@{ @"on": @YES, @"progress": @(progress) }];
+    } andResult:^(VPDeviceHealthGlanceState state, VPHealthGlanceTestModel *model) {
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"on"] = @(on);
+        d[@"state"] = @(state);
+        d[@"stateName"] = JoemeHealthGlanceStateName(state);
+        BOOL complete = (state == VPDeviceHealthGlanceStateComplete);
+        BOOL done = complete ||
+                    state == VPDeviceHealthGlanceStateOver ||
+                    state == VPDeviceHealthGlanceStateFailure ||
+                    state == VPDeviceHealthGlanceStateNoFunction ||
+                    state == VPDeviceHealthGlanceStateDeviceBusy ||
+                    state == VPDeviceHealthGlanceStateLowPower ||
+                    state == VPDeviceHealthGlanceStateNotWear ||
+                    state == VPDeviceHealthGlanceStateNotLead;
+        d[@"complete"] = @(complete);
+        d[@"done"] = @(done);
+        if (!complete) d[@"message"] = JoemeHealthGlanceStateName(state);
+        if (complete && model) {
+            NSMutableDictionary *r = [NSMutableDictionary dictionary];
+            // 只有 functionSupport 里置位的指标才可信（官方 Demo 的判法）
+            NSUInteger fs = model.functionSupport & 0xFFFFFFFF;
+            r[@"functionSupport"] = @(fs);
+            // 位图为 0 时（老固件 protocol 0/1）Demo 也照样取值 —— 这里照抄：
+            // 不给 functionSupport 的设备把所有字段都给出去，页面按「值 > 0」自行过滤。
+            BOOL anyBit = (fs != 0);
+            #define JOEME_HG_FIELD(bit, key, expr) \
+                if (!anyBit || (fs & (NSUInteger)(bit)) != 0) { r[@#key] = @(expr); }
+            JOEME_HG_FIELD(VPHealthGlanceTypeHeartValue, heartRate, model.heartRate)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodOxy, bloodOxygen, model.bloodOxygen)
+            JOEME_HG_FIELD(VPHealthGlanceTypeStress, stress, model.stress)
+            JOEME_HG_FIELD(VPHealthGlanceTypeFatigue, fatigueLevel, model.fatigueLevel)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodGlucose, bloodSugar, model.bloodSugar)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyTemp, bodyTemperature, model.bodyTemperature)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyTemp, orgTemperature, model.orgTemperature)
+            JOEME_HG_FIELD(VPHealthGlanceTypeHRV, hrv, model.hrv)
+            // 光电血压：systolic/diastolic 是通用字段，ppg* 是细分字段，两个都给
+            JOEME_HG_FIELD(VPHealthGlanceTypePpgBp, systolic, model.systolicBloodPressure)
+            JOEME_HG_FIELD(VPHealthGlanceTypePpgBp, diastolic, model.diastolicBloodPressure)
+            JOEME_HG_FIELD(VPHealthGlanceTypePpgBp, ppgSystolic, model.ppgBloodPressureHigh)
+            JOEME_HG_FIELD(VPHealthGlanceTypePpgBp, ppgDiastolic, model.ppgBloodPressureLow)
+            // 气泵血压：iOS 上唯一能拿到它的地方
+            JOEME_HG_FIELD(VPHealthGlanceTypeCuffBp, cuffSystolic, model.cuffBloodPressureHigh)
+            JOEME_HG_FIELD(VPHealthGlanceTypeCuffBp, cuffDiastolic, model.cuffBloodPressureLow)
+            JOEME_HG_FIELD(VPHealthGlanceTypeEmotion, emotionLevel, model.emotionLevel)
+            JOEME_HG_FIELD(VPHealthGlanceTypeGSR, skinMoisture, model.skinMoisture)
+            JOEME_HG_FIELD(VPHealthGlanceTypeGSR, depressionRisk, model.depressionRisk)
+            JOEME_HG_FIELD(VPHealthGlanceTypeGSR, snsActivation, model.snsActivation)
+            JOEME_HG_FIELD(VPHealthGlanceTypeGSR, cortisolValue, model.cortisolValue)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodComp, totalCholesterol, model.totalCholesterol)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodComp, triglyceride, model.triglyceride)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodComp, highDensityLipoprotein, model.highDensityLipoprotein)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodComp, lowDensityLipoprotein, model.lowDensityLipoprotein)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBloodComp, uricAcid, model.uricAcid)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, weight, model.weight)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, height, model.height)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, age, model.age)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, gender, model.gender)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, bmi, model.bmi)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, bodyFatPercentage, model.bodyFatPercentage)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, fatMass, model.fatMass)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, leanBodyMass, model.leanBodyMass)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, muscleRate, model.muscleRate)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, muscleMass, model.muscleMass)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, subcutaneousFat, model.subcutaneousFat)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, bodyMoisture, model.bodyMoisture)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, waterContent, model.waterContent)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, skeletalMuscleRate, model.skeletalMuscleRate)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, boneMass, model.boneMass)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, proportionOfProtein, model.proportionOfProtein)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, proteinAmount, model.proteinAmount)
+            JOEME_HG_FIELD(VPHealthGlanceTypeBodyComp, basalMetabolicRate, model.basalMetabolicRate)
+            #undef JOEME_HG_FIELD
+            d[@"result"] = r;
+        }
+        [weakSelf sendEvent:@"healthGlance" data:d];
+        // 只有一次性的终态才回 callback，进度帧也回会让 JS 的 Promise 提前 resolve
+        if (done) callback(resultWithCode(200), NO);
     }];
 }
 
