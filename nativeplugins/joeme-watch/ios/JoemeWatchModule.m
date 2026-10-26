@@ -74,6 +74,11 @@
 /** 微体检终态枚举名（healthGlance 事件用；页面按名字判终态，不依赖数值顺序） */
 static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 
+/** NSProgress -> 0~100 的整数进度（身体成分/血液成分/皮电共用）。
+    定义在「各类型状态映射」区，但身体成分的 progress 回调在它之前就会用到，
+    所以这里先声明 —— C 里没有前置声明就是「call to undeclared function」硬错误。 */
+static NSInteger leadProgressPercent(NSProgress *progress);
+
 @interface JoemeWatchModule ()
 
 /** JS 侧注册的全局事件回调（uni.requireNativePlugin 侧 startEventListen 传入） */
@@ -123,6 +128,20 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 @property (nonatomic, assign) BOOL temperatureDeviceStopped;
 /** 体温测量看门狗（可取消）。设备不回帧时页面会永远停在「测量中」，到点自己收尾 */
 @property (nonatomic, copy) dispatch_block_t temperatureWatchdog;
+
+/** 本次身体成分测量最后一次有效模型（用于终态帧兜底）。
+    iOS 的 Over 帧可能是「人为结束」的空回包、Complete 帧也可能不带 model，
+    真值在前面的帧里给过；不兜底就会把「测到一半点停止」判成「已结束、无结果」。
+    每次 startMeasure('bodyComposition') 清空。 */
+@property (nonatomic, strong) VPBodyCompositionValueModel *lastBodyCompositionModel;
+/** 本次身体成分测量是否已向 JS 发出终态。
+    Complete 之后我方补发的 stop 会引出 Over，设备也可能重复回包 ——
+    不去重页面会弹两次失败弹窗 / 跳两次详情页。 */
+@property (nonatomic, assign) BOOL bodyCompositionFinished;
+/** 本轮是否已向设备补发过停止命令，保证一次测量只发一次 */
+@property (nonatomic, assign) BOOL bodyCompositionDeviceStopped;
+/** 身体成分测量看门狗（可取消）：一次测量约 60 秒，90 秒还没有任何帧就收尾 */
+@property (nonatomic, copy) dispatch_block_t bodyCompositionWatchdog;
 
 /** 本次压力测量最后一次有效压力值（0 = 还没测到）。
     SDK 的 Over 帧（人为结束 / 设备结束）里 progress 与 stress 都是 0，真正的压力值
@@ -298,6 +317,13 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (void)armTemperatureWatchdog;
 - (void)cancelTemperatureWatchdog;
 - (void)stopTemperatureSession;
+// 身体成分（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
+- (void)handleBodyCompositionLead:(NSInteger)lead progress:(NSProgress *)progress;
+- (void)handleBodyCompositionState:(VPDeviceBodyCompositionState)state
+                             model:(VPBodyCompositionValueModel *)model;
+- (void)armBodyCompositionWatchdog;
+- (void)cancelBodyCompositionWatchdog;
+- (void)stopBodyCompositionSession;
 - (void)armStressWatchdog;
 - (void)cancelStressWatchdog;
 - (void)stopStressSession;
@@ -941,24 +967,11 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             return;
         }
         if (!photoBpOk && !hgOk) {
-            // 两条路都不通：光电被 SDK 判不支持，微体检能力位也是 0。
-            // 明确回一帧 failed（带能力位数值），别让页面空转到 90s 超时。
-            NSLog(@"[joeme-watch] bp: 无可用通路 bloodPressureType=%lu healthGlanceType=%lu",
+            // 两条明确通路都没命中：**不拦**，让 SDK 自己回 NoFunction。
+            // 抢先拦会误伤「能力位解析时机未到」的机型（真不支持时 SDK 一样回 NoFunction，
+            // 结果相同但少了 SDK 侧的诊断信息），这里只打一行日志便于真机定位。
+            NSLog(@"[joeme-watch] bp: 能力位均未命中 bloodPressureType=%lu healthGlanceType=%lu，仍尝试光电通路",
                   (unsigned long)info.bloodPressureType, (unsigned long)info.healthGlanceType);
-            [self endMeasuring];
-            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
-            d[@"success"] = @NO;
-            d[@"value"] = @0;
-            d[@"progress"] = @0;
-            d[@"message"] = [NSString stringWithFormat:
-                             @"血压测量失败：该机型不支持（血压类型 %lu，微体检 %lu）",
-                             (unsigned long)info.bloodPressureType,
-                             (unsigned long)info.healthGlanceType];
-            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                             @"cuff": @NO, @"haveProgress": @NO };
-            [self sendEvent:@"measure" data:d];
-            callback(resultWithCode(200), NO);
-            return;
         }
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
@@ -1033,6 +1046,12 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleBloodGlucoseState:state progress:progress value:value level:level];
         }];
     } else if ([type isEqualToString:@"bodyComposition"]) {
+        // 每次开始清上一轮的状态：Over/Complete 帧可能不带 model，
+        // 不清会把上一次测量的结果当成本次的。
+        self.lastBodyCompositionModel = nil;
+        self.bodyCompositionFinished = NO;
+        self.bodyCompositionDeviceStopped = NO;
+        [self armBodyCompositionWatchdog];
         [pm veepooSDKTestBodyCompositionStart:YES
                                      progress:^(NSInteger lead, NSProgress *progress) {
             [weakSelf handleBodyCompositionLead:lead progress:progress];
@@ -1843,71 +1862,215 @@ static BOOL JoemeTempPhaseIsDone(NSString *phase) {
     if (isDone) [self endMeasuring];
 }
 
-/** 身体成分：进度回 (lead, progress)，lead=0 表示手已放在电极片上 */
+/**
+ 身体成分进度帧。lead=0 表示双手已握住电极片（导联通过）。
+
+ iOS 的进度是 NSProgress，部分固件只在开头给一两帧、之后不再回调；
+ 进度的对象为 nil 时仍然发帧（页面靠 leadOk 提示握持），但把 haveProgress 标成 NO，
+ 让页面按时间估算进度，而不是把 0 当成「设备真实进度」永远停在 0%。
+ */
 - (void)handleBodyCompositionLead:(NSInteger)lead progress:(NSProgress *)progress {
+    if (self.bodyCompositionFinished) return;
+    [self armBodyCompositionWatchdog];
+
     NSMutableDictionary *d = [self measureEvent:@"bodyComposition" phase:@"testing" isDone:NO];
-    d[@"progress"] = @(leadProgressPercent(progress));
+    NSInteger pct = MIN(MAX(leadProgressPercent(progress), (NSInteger)0), (NSInteger)99);
+    d[@"progress"] = @(pct);
     d[@"message"] = lead == 0 ? @"身体成分测量中（保持握持电极片）" : @"身体成分测量中（请双手握住电极片）";
-    d[@"extra"] = @{ @"lead": @(lead), @"leadOk": @(lead == 0) };
+    d[@"extra"] = @{ @"lead": @(lead),
+                     @"leadOk": @(lead == 0),
+                     @"haveProgress": @(progress != nil) };
     [self sendEvent:@"measure" data:d];
 }
 
-/** 身体成分结果：Complete 为正常结束，Over 表示人为结束 */
+/** 模型里是否真有结果（14 项任一 > 0）。全空等同于「这一帧没带结果」。 */
+- (BOOL)bodyCompositionModelHasValue:(VPBodyCompositionValueModel *)model {
+    if (!model) return NO;
+    NSArray<NSString *> *fields = @[ @"bmi", @"bodyFatPercentage", @"fatMass", @"leanBodyMass",
+                                     @"muscleRate", @"muscleMass", @"subcutaneousFat",
+                                     @"bodyMoisture", @"waterContent", @"skeletalMuscleRate",
+                                     @"boneMass", @"proportionOfProtein", @"proteinAmount",
+                                     @"basalMetabolicRate" ];
+    for (NSString *key in fields) {
+        NSString *v = [model valueForKey:key];
+        if ([v isKindOfClass:[NSString class]] && v.length && v.doubleValue > 0) return YES;
+    }
+    return NO;
+}
+
+/** VPBodyCompositionValueModel -> extra（字段保持 iOS 原生名，JS 桥归一成 Android 名） */
+- (NSDictionary *)bodyCompositionExtra:(VPBodyCompositionValueModel *)model {
+    if (!model) return @{};
+    NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+    extra[@"bmi"] = model.bmi ?: @"";
+    extra[@"bodyFatPercentage"] = model.bodyFatPercentage ?: @"";
+    extra[@"fatMass"] = model.fatMass ?: @"";
+    extra[@"leanBodyMass"] = model.leanBodyMass ?: @"";
+    extra[@"muscleRate"] = model.muscleRate ?: @"";
+    extra[@"muscleMass"] = model.muscleMass ?: @"";
+    extra[@"subcutaneousFat"] = model.subcutaneousFat ?: @"";
+    extra[@"bodyMoisture"] = model.bodyMoisture ?: @"";
+    extra[@"waterContent"] = model.waterContent ?: @"";
+    extra[@"skeletalMuscleRate"] = model.skeletalMuscleRate ?: @"";
+    extra[@"boneMass"] = model.boneMass ?: @"";
+    extra[@"proportionOfProtein"] = model.proportionOfProtein ?: @"";
+    extra[@"proteinAmount"] = model.proteinAmount ?: @"";
+    extra[@"basalMetabolicRate"] = model.basalMetabolicRate ?: @"";
+    extra[@"stature"] = @(model.stature);
+    extra[@"weight"] = @(model.weight);
+    extra[@"gender"] = @(model.gender);
+    // 设备侧测量时刻：详情页抬头优先用它（比本机 ts 更准，也与历史列表同口径）
+    if (model.testTime.length) extra[@"testTime"] = model.testTime;
+    if (model.date.length) extra[@"deviceDate"] = model.date;
+    extra[@"fromDevice"] = @(model.isDeviceTest);
+    return extra;
+}
+
+/**
+ 身体成分状态映射（对齐 Android 的 startMeasureBodyComposition / 官方 Demo）。
+
+   Complete → 有结果 result / 没结果 stop
+   Over     → 人为结束（也可能是我们补发 stop 的回帧）：有兜底结果 result / 没结果 stop
+   Failure / DeviceBusy / LowPower / NoFunction → failed
+
+ iOS 必须自己兜住的三点（Android 由 IBodyComponentDetectListener 直接分四路回调）：
+
+ 1) **Over/Complete 帧的 model 可能为 nil 或全空**。真值在更早的帧里给过，
+    用 lastBodyCompositionModel 兜底（与血氧 Over / 体温 Close / 血液成分同一套做法），
+    否则「测到一半点停止」会被判成「结束、无结果」，页面直接退回待机。
+ 2) **终态只发一次**。收尾时按官方 Demo 补发一次 `veepooSDKTestBodyCompositionStart:NO`，
+    这个 stop 会引出 Over、设备也可能重复回包；不去重页面会弹两次失败窗 / 跳两次详情页。
+ 3) **Android 的 result 帧带完整 extra**，iOS 只有 Complete 那一帧给全量，
+    所以 result 帧的 progress 一律给 100，extra 一律用兜底模型展开。
+ */
 - (void)handleBodyCompositionState:(VPDeviceBodyCompositionState)state model:(VPBodyCompositionValueModel *)model {
+    if (self.bodyCompositionFinished) return;
+    if ([self bodyCompositionModelHasValue:model]) self.lastBodyCompositionModel = model;
+    [self armBodyCompositionWatchdog];
+
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, stopDevice = NO;
     NSString *message = @"身体成分测量中";
+    NSString *stateName = @"BODY_COMPOSITION_TESTING";
+
     switch (state) {
-        case VPDeviceBodyCompositionStateComplete:
-            phase = @"result"; isDone = YES; success = YES; message = @"身体成分测量完成";
+        case VPDeviceBodyCompositionStateComplete: {
+            BOOL hasValue = [self bodyCompositionModelHasValue:self.lastBodyCompositionModel];
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue; stopDevice = YES;
+            message = hasValue ? @"身体成分测量完成" : @"身体成分测量结束（无有效值）";
+            stateName = @"COMPLETE";
             break;
-        case VPDeviceBodyCompositionStateOver:
-            phase = @"stop"; isDone = YES; message = @"身体成分测量已结束";
+        }
+        case VPDeviceBodyCompositionStateOver: {
+            // 人为结束：有兜底结果就交出去，别让「测完再点停止」丢结果
+            BOOL hasValue = [self bodyCompositionModelHasValue:self.lastBodyCompositionModel];
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue;
+            message = hasValue ? @"身体成分测量完成" : @"身体成分测量已结束";
+            stateName = @"OVER";
+            break;
+        }
+        case VPDeviceBodyCompositionStateFailure:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"身体成分测量失败：测试无效";
+            stateName = @"FAILURE";
             break;
         case VPDeviceBodyCompositionStateDeviceBusy:
-            phase = @"failed"; isDone = YES; message = @"身体成分测量失败：设备正忙";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"身体成分测量失败：设备正忙";
+            stateName = @"DEVICE_BUSY";
             break;
         case VPDeviceBodyCompositionStateLowPower:
-            phase = @"failed"; isDone = YES; message = @"身体成分测量失败：设备电量过低";
-            break;
-        case VPDeviceBodyCompositionStateFailure:
-            phase = @"failed"; isDone = YES; message = @"身体成分测量失败：测试无效";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"身体成分测量失败：设备电量过低";
+            stateName = @"LOW_POWER";
             break;
         case VPDeviceBodyCompositionStateNoFunction:
-            phase = @"failed"; isDone = YES; message = @"身体成分测量失败：设备不支持该功能";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"身体成分测量失败：设备不支持该功能";
+            stateName = @"NO_FUNCTION";
             break;
         default:
-            break;
+            // 未知状态不打扰页面（保持「测量中」，等后续帧）
+            return;
     }
+
+    if (isDone) self.bodyCompositionFinished = YES;
+
     NSMutableDictionary *d = [self measureEvent:@"bodyComposition" phase:phase isDone:isDone];
-    if (model) {
-        d[@"progress"] = @100;
-        d[@"value"] = model.bodyFatPercentage ?: @"";   // 主值取体脂率（字符串，SDK 原样）
-        NSMutableDictionary *extra = [NSMutableDictionary dictionary];
-        extra[@"bmi"] = model.bmi ?: @"";
-        extra[@"bodyFatPercentage"] = model.bodyFatPercentage ?: @"";
-        extra[@"fatMass"] = model.fatMass ?: @"";
-        extra[@"leanBodyMass"] = model.leanBodyMass ?: @"";
-        extra[@"muscleRate"] = model.muscleRate ?: @"";
-        extra[@"muscleMass"] = model.muscleMass ?: @"";
-        extra[@"subcutaneousFat"] = model.subcutaneousFat ?: @"";
-        extra[@"bodyMoisture"] = model.bodyMoisture ?: @"";
-        extra[@"waterContent"] = model.waterContent ?: @"";
-        extra[@"skeletalMuscleRate"] = model.skeletalMuscleRate ?: @"";
-        extra[@"boneMass"] = model.boneMass ?: @"";
-        extra[@"proportionOfProtein"] = model.proportionOfProtein ?: @"";
-        extra[@"proteinAmount"] = model.proteinAmount ?: @"";
-        extra[@"basalMetabolicRate"] = model.basalMetabolicRate ?: @"";
-        extra[@"stature"] = @(model.stature);
-        extra[@"weight"] = @(model.weight);
-        extra[@"gender"] = @(model.gender);
-        d[@"extra"] = extra;
+    VPBodyCompositionValueModel *result = [self bodyCompositionModelHasValue:self.lastBodyCompositionModel]
+        ? self.lastBodyCompositionModel : nil;
+    if (result) {
+        d[@"progress"] = @(isDone ? 100 : 0);
+        d[@"value"] = result.bodyFatPercentage ?: @"";   // 主值取体脂率（字符串，SDK 原样）
+        d[@"extra"] = [self bodyCompositionExtra:result];
+    } else {
+        d[@"extra"] = @{ @"haveProgress": @NO };
     }
     d[@"success"] = @(success);
-    d[@"state"] = @(state);
+    d[@"state"] = stateName;      // 与 Android 同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
     d[@"message"] = message;
     [self sendEvent:@"measure" data:d];
-    if (isDone) [self endMeasuring];
+
+    if (isDone) {
+        [self cancelBodyCompositionWatchdog];
+        [self endMeasuring];
+        if (stopDevice) [self stopBodyCompositionSession];
+    }
+}
+
+/**
+ 身体成分看门狗：官方 UI 一次测量约 60 秒，iOS 上超过 90 秒没有任何帧就说明
+ 设备把命令吃掉了（不支持 / 状态机没复位 / 被别的测量占着）。到点按失败收尾，
+ 页面才不会永远停在「测量中」。每来一帧都重新计时：慢设备不会被误判，真卡住也能收尾。
+ */
+- (void)armBodyCompositionWatchdog {
+    [self cancelBodyCompositionWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t blk = dispatch_block_create(0, ^{
+        JoemeWatchModule *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.bodyCompositionFinished) return;
+        strongSelf.bodyCompositionWatchdog = nil;
+        strongSelf.bodyCompositionFinished = YES;
+        NSMutableDictionary *d = [strongSelf measureEvent:@"bodyComposition" phase:@"failed" isDone:YES];
+        d[@"progress"] = @0;
+        d[@"success"] = @NO;
+        d[@"state"] = @"TIMEOUT";
+        d[@"message"] = @"身体成分测量超时：设备未响应，请重试";
+        d[@"extra"] = @{ @"timeout": @YES };
+        [strongSelf sendEvent:@"measure" data:d];
+        [strongSelf endMeasuring];
+        [strongSelf stopBodyCompositionSession];
+    });
+    self.bodyCompositionWatchdog = blk;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), blk);
+}
+
+/** 取消身体成分看门狗（终态、手动停止、开始新一轮时都要调） */
+- (void)cancelBodyCompositionWatchdog {
+    if (self.bodyCompositionWatchdog) {
+        dispatch_block_cancel(self.bodyCompositionWatchdog);
+        self.bodyCompositionWatchdog = nil;
+    }
+}
+
+/**
+ 释放设备侧身体成分会话（官方 Demo 的做法：同一个接口传 NO）。
+ 幂等：同一轮只发一次；回调换成本地空 block，避免自己补发的 stop 引出 Over 再回灌页面。
+ */
+- (void)stopBodyCompositionSession {
+    [self cancelBodyCompositionWatchdog];
+    if (self.bodyCompositionDeviceStopped) return;
+    self.bodyCompositionDeviceStopped = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    [pm veepooSDKTestBodyCompositionStart:NO
+                                 progress:^(NSInteger lead, NSProgress *progress) {}
+                               testResult:^(VPDeviceBodyCompositionState state,
+                                            VPBodyCompositionValueModel *model) {}];
 }
 
 /** NSProgress -> 0-100 的整数进度 */
@@ -2531,9 +2694,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                            testResult:^(VPTestFatigueState state, NSUInteger progress,
                                         NSUInteger value) {}];
     } else if ([type isEqualToString:@"stress"]) {
-        // 与体温/血液成分同口径：手动停止先置终态标志，设备回的那帧 Over 就不再回灌
-        // 一条 result，页面 stop() 已按「有值→结果页 / 无值→已停止」收过尾了。
-        self.stressFinished = YES;
+        // 与血氧同口径：**不**把本轮置成已收尾。iOS 的进度帧不一定带读数，真值往往
+        // 就挂在我们下发停止所引出的那帧 Over 上（原生用 lastStressValue 兜底）；
+        // 提前置 stressFinished 会把这条 result 丢掉，表现为「测到一半点停止就白测」。
+        // 页面侧 _manualStop 已置位，所以这条 result 只停在结果页、不再弹保存确认。
+        // stressDeviceStopped 置位：停止命令已经由这里下发，终态处理里不必再补一次。
         self.stressDeviceStopped = YES;
         [self cancelStressWatchdog];
         [pm veepooSDK_stressTestStart:NO
@@ -2554,6 +2719,12 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                                 testResult:^(VPDeviceBloodGlucoseTestState state, NSUInteger progress,
                                              NSUInteger value, NSUInteger level) {}];
     } else if ([type isEqualToString:@"bodyComposition"]) {
+        // 用户手动停止：先置终态标志，设备回的那帧 Over 就不会再回灌一条 result，
+        // 页面的 stop 已按「有完整结果→详情页 / 无结果→待机」收过尾了。
+        // 停止命令由这里直接下发，下面 stopBodyCompositionSession 不用再补。
+        self.bodyCompositionFinished = YES;
+        self.bodyCompositionDeviceStopped = YES;
+        [self cancelBodyCompositionWatchdog];
         [pm veepooSDKTestBodyCompositionStart:NO
                                      progress:^(NSInteger lead, NSProgress *progress) {}
                                    testResult:^(VPDeviceBodyCompositionState state,
@@ -2654,6 +2825,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.stressFinished = YES;
             self.stressDeviceStopped = YES;
             self.lastStressValue = 0;
+            // 身体成分同理：断连后不能留着看门狗对空设备补发停止，也不能把本轮结果留给下一轮
+            [self cancelBodyCompositionWatchdog];
+            self.bodyCompositionFinished = YES;
+            self.bodyCompositionDeviceStopped = YES;
+            self.lastBodyCompositionModel = nil;
             // ECG 同理：停掉 100ms 波形轮询（断连后没有新点，定时器只会空转），
             // 并把本轮置为已收尾，页面不会再收到半截 result。
             [self stopEcgWaveTimer];
