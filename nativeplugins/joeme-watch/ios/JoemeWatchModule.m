@@ -191,6 +191,10 @@ static NSInteger leadProgressPercent(NSProgress *progress);
     测量回调本身只在状态变化时（约每秒）触发一次，只靠回调画图会一秒一跳。
     测量期间按 100ms 轮询，与 Demo 的刷新节奏一致。 */
 @property (nonatomic, strong) NSTimer *ecgWaveTimer;
+/** ECG 测量会话号：每次 startMeasure('ecg') +1，随每个 measure / ecgWave 事件下发（session）。
+    页面用它识别「上一场测量迟到的结束帧」：宽限期结束后用户点「重新测量」，
+    上一场的 Over 若此时才到，没有会话号就会把旧数据存成新一场的结果。 */
+@property (nonatomic, assign) NSInteger ecgSession;
 
 /** 运动记录读取会话号；每次 readDeviceRunningData 自增，旧会话的迟到回调按它丢弃 */
 @property (nonatomic, assign) NSInteger sportReadSeq;
@@ -339,6 +343,7 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 // ECG（第 13 节）：状态映射、结果字段、波形增量与轮询，块里回调、实现在后，先声明
 - (void)handleEcgState:(VPTestECGState)state progress:(NSUInteger)progress model:(VPECGTestDataModel *)model;
 - (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model;
+- (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model includeWave:(BOOL)includeWave;
 - (void)mergeEcgReport:(NSMutableDictionary *)extra model:(VPECGTestDataModel *)model;
 - (void)flushEcgWave:(VPECGTestDataModel *)model force:(BOOL)force;
 - (void)startEcgWaveTimer;
@@ -1090,6 +1095,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         self.ecgWaveSeq = 0;
         self.ecgModel = nil;
         self.ecgFinished = NO;
+        self.ecgSession += 1;    // 新一场：页面据此区分上一场迟到的结束帧
         [pm veepooSDKTestECGStart:YES
                        testResult:^(VPTestECGState state, NSUInteger progress, VPECGTestDataModel *model) {
             [weakSelf handleEcgState:state progress:progress model:model];
@@ -1099,7 +1105,11 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         [self startEcgWaveTimer];
     }
 
-    [self sendEvent:@"measure" data:[self measureEvent:type phase:@"start" isDone:NO]];
+    NSMutableDictionary *startEvent = [self measureEvent:type phase:@"start" isDone:NO];
+    // ECG 的会话号：页面用 start 帧的 session 校准本地计数（重新测量时两边的节奏
+    // 可能因为一次 startMeasure 失败而错开，以原生为准最稳）。
+    if ([type isEqualToString:@"ecg"]) startEvent[@"session"] = @(self.ecgSession);
+    [self sendEvent:@"measure" data:startEvent];
     callback(resultWithCode(200), NO);
 }
 
@@ -1951,7 +1961,9 @@ static BOOL JoemeTempPhaseIsDone(NSString *phase) {
     NSString *phase = @"testing";
     BOOL isDone = NO, success = NO, stopDevice = NO;
     NSString *message = @"身体成分测量中";
-    NSString *stateName = @"BODY_COMPOSITION_TESTING";
+    // 只有终态帧才带 state：switch 里每条路径都会赋值，default 直接 return。
+    // 进度帧走 handleBodyCompositionLead，不带 state（页面也不该按 state 判进度）。
+    NSString *stateName = nil;
 
     switch (state) {
         case VPDeviceBodyCompositionStateComplete: {
@@ -2009,7 +2021,9 @@ static BOOL JoemeTempPhaseIsDone(NSString *phase) {
         d[@"extra"] = @{ @"haveProgress": @NO };
     }
     d[@"success"] = @(success);
-    d[@"state"] = stateName;      // 与 Android 同口径：字符串枚举名
+    // state 只在终态帧给（switch 里每条路径都赋过值；default 已提前 return）。
+    // 这里再判一次 nil 是为了不被后续新增 case 漏赋值拖成 setObject:nil 崩溃。
+    if (stateName) d[@"state"] = stateName;
     d[@"stateCode"] = @(state);
     d[@"message"] = message;
     [self sendEvent:@"measure" data:d];
@@ -2407,7 +2421,10 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
             break;
     }
 
-    NSMutableDictionary *extra = [[self ecgExtraFromModel:self.ecgModel] mutableCopy];
+    // 测量中的帧不带波形：waveMv/filterSignals 是整场累计数组，每秒往事件里塞一份
+    // 会把 JS 桥刷爆，而且每帧重算一遍 mV 换算也是 O(n²)。波形只走 ecgWave 增量通道。
+    NSMutableDictionary *extra =
+        [[self ecgExtraFromModel:self.ecgModel includeWave:isDone] mutableCopy];
     extra[@"leadOff"] = @(leadOff);
     // 逐秒指标：Android 的 testing 帧带 hr1/hrv/qtc（EcgDetectState），页面靠这三个键
     // 攒逐秒序列，用来算最高/最低心率与心率分布。iOS 的这三个值在模型的
@@ -2425,13 +2442,6 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
             extra[@"hrv"] = @([self.ecgModel.muHrvs.lastObject doubleValue]);
         if (self.ecgModel.muQTs.count)
             extra[@"qtc"] = @([self.ecgModel.muQTs.lastObject doubleValue]);
-    }
-    if (!isDone) {
-        // 测量中的帧只带指标，不带波形：waveMv/filterSignals 是整场累计数组，
-        // 每帧（约 1 秒一次）塞进事件会把 JS 桥刷爆 —— 波形走专门的 ecgWave 增量通道。
-        [extra removeObjectForKey:@"waveMv"];
-        [extra removeObjectForKey:@"filterSignals"];
-        [extra removeObjectForKey:@"powers"];
     }
 
     if (isDone) {
@@ -2466,6 +2476,7 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     d[@"success"] = @(success);
     d[@"state"] = stateName;                      // 与 Android 同口径：字符串枚举名
     d[@"stateCode"] = @(state);
+    d[@"session"] = @(self.ecgSession);           // 页面用来识别上一场迟到的结束帧
     d[@"message"] = message;
     d[@"extra"] = extra;
     [self sendEvent:@"measure" data:d];
@@ -2511,6 +2522,18 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
  waveMv 是已按 ecgType/testType/gain 换算好的 mV —— 页面只认 waveMv。
  */
 - (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model {
+    return [self ecgExtraFromModel:model includeWave:YES];
+}
+
+/**
+ 同 ecgExtraFromModel，但可以不要波形。
+
+ 为什么需要：滤波后的 filterSignals 是**整场累计**的数组（30 秒约 1.5 万点），
+ 测量中的状态帧每秒来一次，若每帧都做一遍 ADC→mV 换算，既白烧 CPU 又是 O(n²)，
+ 而页面在这类帧上根本不看波形（实时波形走 ecgWave 增量通道）。
+ 只有收尾帧（result）和历史读取才需要完整波形。
+ */
+- (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model includeWave:(BOOL)includeWave {
     NSMutableDictionary *extra = [NSMutableDictionary dictionary];
     if (!model) return extra;
     extra[@"ecgType"] = model.ecgType ?: @"";
@@ -2533,11 +2556,13 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     extra[@"state"] = @(model.state.integerValue);
     extra[@"gain"] = @([model getGainValue]);
     extra[@"multiDiagnosis"] = @NO;       // 由调用方按是否拿到多诊断报告覆盖
-    NSArray *signals = model.filterSignals ?: @[];
-    extra[@"filterSignals"] = signals;
-    extra[@"powers"] = @[];               // iOS 侧无逐点信号质量，页面按默认值画
-    extra[@"waveMv"] = [self ecgMvArrayFromModel:model signals:signals];
-    extra[@"wavePoints"] = @(signals.count);
+    if (includeWave) {
+        NSArray *signals = model.filterSignals ?: @[];
+        extra[@"filterSignals"] = signals;
+        extra[@"powers"] = @[];               // iOS 侧无逐点信号质量，页面按默认值画
+        extra[@"waveMv"] = [self ecgMvArrayFromModel:model signals:signals];
+        extra[@"wavePoints"] = @(signals.count);
+    }
     // 逐秒数组（Android 叫 detectHeart/detectHrv/detectQT，这里给同名键）。
     // 详情页的「心率分布 / 最高最低心率」只认这三项；不映射的话 iOS 上永远是占位。
     extra[@"detectHeart"] = [self ecgNumArrayFrom:model.hearts];
@@ -2627,7 +2652,8 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
         @"frequency": @(model.frequency.integerValue),
         @"ecgType": model.ecgType ?: @"",
         @"gain": @([model getGainValue]),
-        @"seq": @(++self.ecgWaveSeq)
+        @"seq": @(++self.ecgWaveSeq),
+        @"session": @(self.ecgSession)      // 页面按它过滤上一场迟到的波形帧
     }];
 }
 
