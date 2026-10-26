@@ -2415,12 +2415,16 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     //   HRV 的 255 是 SDK 约定的无效哨兵，页面会自己过滤，这里原样透出。
     //   muHearts/muHrvs/muQTs 的元素可能是 NSNumber 也可能是 NSString，
     //   统一用 doubleValue 转成 NSNumber，页面不用判类型。
-    if (self.ecgModel.muHearts.count)
-        extra[@"hr1"] = @([self.ecgModel.muHearts.lastObject doubleValue]);
-    if (self.ecgModel.muHrvs.count)
-        extra[@"hrv"] = @([self.ecgModel.muHrvs.lastObject doubleValue]);
-    if (self.ecgModel.muQTs.count)
-        extra[@"qtc"] = @([self.ecgModel.muQTs.lastObject doubleValue]);
+    //   只在测量中的帧给：结果帧的 extra.hrv 必须保持「平均 HRV」语义（与 Android 的
+    //   ecgResultExtra 同名同义），页面/缓存都靠 aveHrv|hrv 取平均值。
+    if (!isDone) {
+        if (self.ecgModel.muHearts.count)
+            extra[@"hr1"] = @([self.ecgModel.muHearts.lastObject doubleValue]);
+        if (self.ecgModel.muHrvs.count)
+            extra[@"hrv"] = @([self.ecgModel.muHrvs.lastObject doubleValue]);
+        if (self.ecgModel.muQTs.count)
+            extra[@"qtc"] = @([self.ecgModel.muQTs.lastObject doubleValue]);
+    }
     if (!isDone) {
         // 测量中的帧只带指标，不带波形：waveMv/filterSignals 是整场累计数组，
         // 每帧（约 1 秒一次）塞进事件会把 JS 桥刷爆 —— 波形走专门的 ecgWave 增量通道。
