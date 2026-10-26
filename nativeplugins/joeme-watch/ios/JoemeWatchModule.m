@@ -32,6 +32,7 @@
 // 这三个模型在 VPPeripheralBaseManage.h 里只有 @class 前置声明，
 // 直接用它们的属性必须单独引入头文件（umbrella header 没有 import）。
 #import <VeepooBleSDK/VPBodyCompositionValueModel.h>
+#import <VeepooBleSDK/VPBloodAnalysisResultModel.h>
 #import <VeepooBleSDK/VPGSRResultModel.h>
 #import <VeepooBleSDK/VPECGTestDataModel.h>
 // 精准睡眠模型不在 umbrella 里（VPDataBaseOperation 只 @class 前置声明）
@@ -93,6 +94,11 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 /** 血压测量模式（0 通用 / 1 私人），start/stop 必须一致 */
 @property (nonatomic, assign) NSInteger bpTestMode;
 
+/** 本次 bp 测量是否走「微体检」通道（而不是光电 veepooSDKTestBloodStart）。
+    气泵机型（bloodPressureType 3/5）不能用光电接口，只能从微体检结果里取高低压；
+    stopMeasure('bp') 要靠它决定停哪个接口。 */
+@property (nonatomic, assign) BOOL bpViaHealthGlance;
+
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
 
@@ -101,6 +107,48 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
     早在 Testing 帧里给过了；不兜底的话「测到 97% 再点停止」会被判成「无有效值」。
     每次 startMeasure('spo2') 归零。 */
 @property (nonatomic, assign) NSUInteger lastSpo2Value;
+
+/** 本次体温测量最后一次有效值（℃ 的 10 倍，0 = 还没测到）。
+    SDK 的 Close 帧 tempValue 可能给 0，真正的值在 Open 帧里给过；
+    不兜底的话「测到 36.6 再结束」会被判成「测量结束（无有效值）」。
+    每次 startMeasure('temperature') 归零。 */
+@property (nonatomic, assign) NSInteger lastTempValue;
+/** 本次体温测量最后一次有效体表温度（℃ 的 10 倍），与 lastTempValue 同步 */
+@property (nonatomic, assign) NSInteger lastOriginalTempValue;
+/** 本次体温测量是否已向 JS 发出终态。
+    progress>=100 的 Open 帧与紧接的 Close 帧都会收尾，我们自己补发 stop 后设备还会再回一帧
+    Close —— 没有这个标志就会重复发 result/stop，页面弹两次保存框。 */
+@property (nonatomic, assign) BOOL temperatureFinished;
+/** 本轮是否已向设备补发过停止命令（官方 b()），保证一次测量只发一次 */
+@property (nonatomic, assign) BOOL temperatureDeviceStopped;
+/** 体温测量看门狗（可取消）。设备不回帧时页面会永远停在「测量中」，到点自己收尾 */
+@property (nonatomic, copy) dispatch_block_t temperatureWatchdog;
+
+/** 本次压力测量最后一次有效压力值（0 = 还没测到）。
+    SDK 的 Over 帧（人为结束 / 设备结束）里 progress 与 stress 都是 0，真正的压力值
+    早在进度帧里给过；不兜底的话「测到 62 再结束」会被判成「结束（无有效值）」。
+    每次 startMeasure('stress') 归零。 */
+@property (nonatomic, assign) NSInteger lastStressValue;
+/** 本次压力测量是否已向 JS 发出终态。
+    iOS 的 Complete 帧既可能只是进度（progress<100）也可能是结果，设备结束还会补一帧
+    Over —— 没有这个标志就会重复发 result/stop，页面弹两次保存框。 */
+@property (nonatomic, assign) BOOL stressFinished;
+/** 压力测量看门狗（可取消）。设备把命令吃掉时页面会永远停在「测量中」，到点自己收尾 */
+@property (nonatomic, copy) dispatch_block_t stressWatchdog;
+
+/** 血液成分是否私人模式（官方「通用/私人模式」），start/stop 必须一致 */
+@property (nonatomic, assign) BOOL bloodAnalysisPersonal;
+/** 本次血液成分测量最后一次有效结果（5 项，nil = 还没测到）。
+    SDK 的 Over（人为结束 / 正常结束）回调里 model 可能为 nil 或全 0，
+    真值在 Complete 帧里给过；不兜底的话「测完再点停止」会被判成「无有效值」。
+    每次 startMeasure('bloodComponent') 清空。 */
+@property (nonatomic, strong) VPBloodAnalysisResultModel *lastBloodAnalysisModel;
+/** 本轮血液成分是否已向 JS 发出终态（Complete 与紧随的 Over / 我方补发的停止回帧都可能来） */
+@property (nonatomic, assign) BOOL bloodAnalysisFinished;
+/** 本轮是否已向设备补发过停止命令，保证一次测量只发一次 */
+@property (nonatomic, assign) BOOL bloodAnalysisDeviceStopped;
+/** 血液成分测量看门狗（可取消）。设备不回帧时页面会永远停在「测量中」，到点自己收尾 */
+@property (nonatomic, copy) dispatch_block_t bloodAnalysisWatchdog;
 
 /** 最近一次经典蓝牙状态（VPBTConnectStateChangeBlock 回调），电话页读取用 */
 @property (nonatomic, strong) NSDictionary *lastBTInfo;
@@ -160,18 +208,21 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 /** 最近一次**实时读成功**的天气状态（isOpen / unit / crc）。
     用途有两个：
       1) 页面没读到状态时 setWeatherStatus 靠它保住设备原开关；
-      2) 下发设置时带上设备回过的 crc（官方 Demo WeatherActivity 就是
-         `setting.crc = crc`，crc 来自上一次读回；iOS SDK 的模型里也有 crc 字段）。
+      2) 本次读不到时给页面一份「上次真实值」兜底显示（同时标 cached，页面不当证据）。
+    注意 crc 只是原样回传：两端 SDK 的设置组包只有 4 字节（0xC8/0x03/开关/单位），
+    crc 根本不进下行包，别把它当成固件校验依据。
     只在读到真模型时更新，写回执不写这里 —— 否则回读验证会自己证明自己成功。 */
 @property (nonatomic, strong) NSDictionary *lastWeatherStatus;
-/** 天气读取进行中的回调队列：SDK 的 readWeatherInfo 无并发保护，同一时刻只允许一次。 */
-@property (nonatomic, strong) NSMutableArray *weatherReadQueue;
-/** cofigModel 是不是被「写回执」刷新的。
-     SDK 的 receiveData 收到 0xC8 0x03（设置回执）且状态位=1 时会把解析出的模型写进
-     cofigModel，于是紧随其后的 readWeatherStatus 即使设备没回读包，也能从 cofigModel
-     拿到「我们自己刚写下去的值」，看起来像读成功了。置位后 readWeatherStatus 会给这类帧
-     打 echo=YES，页面据此拒绝把它当回读证据。实时读成功（拿到真模型）时清零。 */
-@property (nonatomic, assign) BOOL weatherCofigFromWrite;
+/** 强制天气能力位的深度计数与原始值。
+    VPWeatherHandle 的 readWeatherInfo / settingWeatherInfo 第一件事就是看
+    peripheralModel.weatherType：读在 0/2 时、写在 <=0 时**直接回调失败，一个字节都不发**。
+    这和 Android 的 FunctionCheckUtil.checkWeather() 读 SP 缓存是同一类问题（基础机型漏报
+    A7 功能包 → 能力位为假 → 命令静默丢弃），Android 侧已有 ensureWeatherCapability()
+    兜底，iOS 侧此前没有，于是「改了天气单位、手表没变」。
+    这里在调用 SDK 前后临时把 weatherType 顶成 1 再还原，与 Android 同口径：
+    命令照发，是否支持以设备回包为准。用计数是为了并发调用时只还原最后一次。 */
+@property (nonatomic, assign) NSInteger weatherCapabilityDepth;
+@property (nonatomic, assign) NSInteger weatherCapabilitySaved;
 
 /** 本会话内写过的开关状态覆盖表：key = @(VPSettingBaseFunctionSwitchType)，value = @"SUPPORT_OPEN"/@"SUPPORT_CLOSE"。
     用途：个别开关的读命令恒定回 Failure（实测 VPSettingAutomaticPPGTest），只能靠握手字节表兜底；
@@ -205,10 +256,9 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (BOOL)allDayOxygenStateFromModel:(VPPeripheralModel *)model;
 /** 从握手缓存的开关字节表兜底取一个开关（读命令回 Failure 时用） */
 - (NSString *)switchByteStateForType:(VPSettingBaseFunctionSwitchType)type;
-/** 天气能力位兜底：VPWeatherHandle 内部按 peripheralModel.weatherType 拦截命令，
-     为 0/2 时读和写都直接回调失败、一个字节都不发。返回原值供还原（-1 = 没有设备模型） */
-- (NSInteger)forceWeatherCapabilityOn;
-- (void)restoreWeatherCapability:(NSInteger)saved;
+/** 顶开天气能力位（见 weatherCapabilityDepth 注释）。成对使用，配对调用 exit */
+- (void)enterWeatherCapability;
+- (void)exitWeatherCapability;
 
 // 世界时钟（第 5 节实现）：内部辅助，先声明避免后向调用告警
 - (BOOL)worldClockSupported;
@@ -232,6 +282,20 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (void)handleSpo2State:(VPTestOxygenState)state value:(NSUInteger)value;
 - (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
                  high:(NSUInteger)high low:(NSUInteger)low;
+// 气泵机型（bloodPressureType 3/5）走微体检测血压：实现在 handleBpState 之后
+- (void)startBpViaHealthGlance;
+- (void)armTemperatureWatchdog;
+- (void)cancelTemperatureWatchdog;
+- (void)stopTemperatureSession;
+// 血液成分（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
+- (void)handleBloodAnalysisProgress:(NSProgress *)progress;
+- (void)handleBloodAnalysisState:(VPDeviceBloodAnalysisState)state
+                           model:(VPBloodAnalysisResultModel *)model;
+- (void)armBloodAnalysisWatchdog;
+- (void)cancelBloodAnalysisWatchdog;
+- (void)stopBloodAnalysisSession;
+- (NSDictionary *)bloodAnalysisExtra:(VPBloodAnalysisResultModel *)model;
+- (BOOL)bloodAnalysisModelHasValue:(VPBloodAnalysisResultModel *)model;
 
 // 表盘（第 7 节实现）：内部拆分较多，先声明避免后向调用告警
 - (BOOL)isJLDevice;                                       // 平台判定（CPUType == 1）
@@ -761,7 +825,7 @@ static NSArray<NSString *> *JoemeMeasureTypes(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         types = @[@"spo2", @"bp", @"temperature", @"hrv", @"fatigue", @"stress", @"emotion", @"met",
-                  @"breath", @"bloodGlucose", @"bodyComposition", @"gsr", @"ecg"];
+                  @"breath", @"bloodGlucose", @"bodyComposition", @"bloodComponent", @"gsr", @"ecg"];
     });
     return types;
 }
@@ -796,10 +860,12 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state) {
 }
 
 /**
- 开始一次手动测量。options: { type, model?, personalMode? }
+ 开始一次手动测量。options: { type, model?, personalMode?, privateMode? }
    type         必填，取值见 JoemeMeasureTypes()
    model        仅 bp：'public'（通用，默认）/ 'private'（私人）
    personalMode 仅 bloodGlucose：是否私人模式，默认 NO
+   privateMode  仅 bloodComponent：官方「通用/私人模式」，默认 NO。
+                私人模式需先在校准页（setBloodComponentCalibration）写入基准值
  结果通过 on('measure') 持续下发，本回调只表示命令已下发。
  */
 UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
@@ -832,26 +898,25 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         }];
     } else if ([type isEqualToString:@"bp"]) {
         // iOS 只有光电血压（veepooSDKTestBloodStart），没有 Android 的 startDetectCuffBP
-        // 气囊通路 —— 整个 iOS 侧都拿不到充气压力，只有 progress 0~100，
-        // 页面据此把仪表盘降级成「进度」，别把进度当 mmHg 显示。
+        // 气囊实时通路。但机型分两类（反汇编 VPPeripheralModel.isSupportBPTest，0x1068）：
+        //   bloodPressureType ∈ {1,4} → 光电血压，veepooSDKTestBloodStart 可用
+        //   bloodPressureType ∈ {3,5} → **气泵血压**，veepooSDKTestBloodStart 会立刻回
+        //                              NoFunction（isSupportBPTest 恒 false）
+        // 气泵机型在 iOS 上唯一能测的方式是微体检（healthGlance），它的结果模型
+        // VPHealthGlanceTestModel 带 cuffBloodPressureHigh/Low。
+        // 所以这里按能力位自动分流，页面无感：on('measure', type='bp') 的字段完全一致。
         VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
-        if (info.bloodPressureType == 0 && !info.isSupportBPTest) {
-            // 设备不支持时明确回一帧 failed，比让 SDK 静默丢弃好：
-            // 页面会直接弹失败原因，而不是空转到 90s 超时看门狗。
-            [self endMeasuring];
-            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
-            d[@"success"] = @NO;
-            d[@"value"] = @0;
-            d[@"progress"] = @0;
-            d[@"message"] = @"血压测量失败：设备不支持血压功能";
-            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                             @"cuff": @NO, @"haveProgress": @NO };
-            [self sendEvent:@"measure" data:d];
+        BOOL cuffOnly = (info.bloodPressureType == 3 || info.bloodPressureType == 5);
+        // supportHealthGlanceTest 的 SDK 实现就是 healthGlanceType == 2 || == 4（反汇编 0x10d8）
+        BOOL hgOk = info.supportHealthGlanceTest;
+        if (cuffOnly && hgOk) {
+            [self startBpViaHealthGlance];
             callback(resultWithCode(200), NO);
             return;
         }
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
+        self.bpViaHealthGlance = NO;
         [pm veepooSDKTestBloodStart:YES
                            testMode:(NSUInteger)self.bpTestMode
                          testResult:^(VPTestBloodState state, NSUInteger progress,
@@ -859,6 +924,16 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleBpState:state progress:progress high:highBlood low:lowBlood];
         }];
     } else if ([type isEqualToString:@"temperature"]) {
+        // ⚠ 不按 peripheralModel.temperatureType 提前拦截：握手能力位漏报是已知问题
+        // （README 里天气同款坑，weatherType 漏报导致读写被吃），这里照「命令照发、
+        // 以设备回包为准」的口径走，不支持由 SDK 的 Unsupported 帧或看门狗收尾。
+        // 每次开始清上一轮的兜底值：Close 帧的 tempValue 可能是 0，
+        // 不归零会把上一次测量的体温当成这一次的结果。
+        self.lastTempValue = 0;
+        self.lastOriginalTempValue = 0;
+        self.temperatureFinished = NO;
+        self.temperatureDeviceStopped = NO;
+        [self armTemperatureWatchdog];
         [pm veepooSDK_temperatureTestStart:YES
                                     result:^(VPTemperatureTestState state, BOOL enable, NSInteger progress,
                                              NSInteger tempValue, NSInteger originalTempValue) {
@@ -909,6 +984,24 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleBodyCompositionLead:lead progress:progress];
         } testResult:^(VPDeviceBodyCompositionState state, VPBodyCompositionValueModel *model) {
             [weakSelf handleBodyCompositionState:state model:model];
+        }];
+    } else if ([type isEqualToString:@"bloodComponent"]) {
+        // 血液成分（尿酸 + 血脂四项）。
+        // SDK 的 isPersonalModel 就是官方「通用/私人模式」：私人模式要求先在校准页
+        // （veepooSDKBloodAnalysisPersonalWithOpCode:opCode=1）写入基准值，
+        // 未校准时下发 YES，设备仍按通用结果测。
+        BOOL personal = [options[@"privateMode"] boolValue];
+        self.bloodAnalysisPersonal = personal;
+        self.lastBloodAnalysisModel = nil;
+        self.bloodAnalysisFinished = NO;
+        self.bloodAnalysisDeviceStopped = NO;
+        [self armBloodAnalysisWatchdog];
+        [pm veepooSDKTestBloodAnalysisStart:YES
+                            isPersonalModel:personal
+                                   progress:^(NSProgress *progress) {
+            [weakSelf handleBloodAnalysisProgress:progress];
+        } testResult:^(VPDeviceBloodAnalysisState state, VPBloodAnalysisResultModel *model) {
+            [weakSelf handleBloodAnalysisState:state model:model];
         }];
     } else if ([type isEqualToString:@"gsr"]) {
         [pm veepooSDKTestGSRStart:YES
@@ -974,6 +1067,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             break;
         case VPTestOxygenStateOver: {
             isDone = YES;
+            // Over 帧自带值就用它，否则回退到本次最后一帧有效值
             NSUInteger finalValue = value > 0 ? value : self.lastSpo2Value;
             reportValue = finalValue;
             phase = finalValue > 0 ? @"result" : @"stop";
@@ -1049,7 +1143,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     d[@"success"] = @(success);
     d[@"state"] = @(state);
     d[@"message"] = message;
-    // iOS 没有气囊通路：只有 progress(0~100)，永远没有 pressure。
+    // iOS 没有气囊实时通路：只有 progress(0~100)，永远没有 pressure。
     // 页面靠 extra.cuff=false 把仪表盘切成「进度」量程，别把 0~100 当 mmHg 显示。
     d[@"extra"] = @{ @"systolic": @(high), @"diastolic": @(low),
                      @"model": self.bpTestMode == 1 ? @"private" : @"public",
@@ -1059,41 +1153,259 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     if (isDone) [self endMeasuring];
 }
 
-/** 体温：tempValue 是 ℃ 的 10 倍，Open 期间回进度，Close 为正常结束 */
+/**
+ 气泵机型（bloodPressureType 3/5）的血压测量：走微体检，把结果重新包成 type='bp' 的
+ 标准 measure 事件，页面无需区分走的是哪条通道。
+
+ 为什么必须这样：iOS SDK 的 veepooSDKTestBloodStart 内部先判 isSupportBPTest，而这个属性
+ 的真实实现是 `bloodPressureType == 1 || bloodPressureType == 4`（反汇编 0x1068），
+ 气泵机型恒为 false → 一定回 NoFunction。气泵高低压只出现在
+ VPHealthGlanceTestModel.cuffBloodPressureHigh/Low（VPHealthGlanceTypeCuffBp = 1<<3）。
+
+ 事件：仍然只发 on('measure') { type:'bp', phase, progress, value, extra.systolic/diastolic }
+   - 测量中：phase=testing, progress=微体检进度(0~100)
+   - 出结果：phase=result，取 cuff 高低压；设备只给光电血压时退回 systolic/diastolic
+   - 失败/中止：phase=failed/stop，message 带微体检原因
+ */
+- (void)startBpViaHealthGlance {
+    self.bpViaHealthGlance = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+
+    [pm veepooSDK_healthGlanceTestStart:YES
+                            andProgress:^(NSInteger progress) {
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
+        d[@"progress"] = @(MAX((NSInteger)0, MIN((NSInteger)100, progress)));
+        d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @YES };
+        [weakSelf sendEvent:@"measure" data:d];
+    } andResult:^(VPDeviceHealthGlanceState state, VPHealthGlanceTestModel *model) {
+        if (state == VPDeviceHealthGlanceStateComplete) {
+            NSUInteger sys = model ? model.cuffBloodPressureHigh : 0;
+            NSUInteger dia = model ? model.cuffBloodPressureLow : 0;
+            // 设备只开了光电血压位时，微体检把值放在通用 systolic/diastolic 里
+            if ((sys == 0 || dia == 0) && model) {
+                if (sys == 0) sys = model.systolicBloodPressure;
+                if (dia == 0) dia = model.diastolicBloodPressure;
+            }
+            BOOL valid = (sys > 0 && dia > 0);
+            NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
+                                                      phase:(valid ? @"result" : @"stop")
+                                                     isDone:YES];
+            d[@"progress"] = @100;
+            d[@"value"] = @(sys);
+            d[@"success"] = @(valid);
+            d[@"message"] = valid ? @"血压测量完成" : @"血压测量结束（无有效值）";
+            d[@"extra"] = @{ @"systolic": @(sys), @"diastolic": @(dia),
+                             @"model": @"public", @"cuff": @YES,
+                             @"viaHealthGlance": @YES, @"haveProgress": @NO };
+            [weakSelf sendEvent:@"measure" data:d];
+            [weakSelf endMeasuring];
+            weakSelf.bpViaHealthGlance = NO;
+            return;
+        }
+        // 其余终态：Over/NoFunction/NotWear/Busy/LowPower/Failure/NotLead
+        NSString *msg = JoemeHealthGlanceStateName(state);
+        BOOL interrupted = [msg isEqualToString:@"OVER"];
+        if ([msg isEqualToString:@"NO_FUNCTION"]) msg = @"血压测量失败：设备不支持该功能";
+        else if ([msg isEqualToString:@"NOT_WEAR"]) msg = @"血压测量失败：佩戴检测未通过";
+        else if ([msg isEqualToString:@"DEVICE_BUSY"]) msg = @"血压测量失败：设备正忙";
+        else if ([msg isEqualToString:@"LOW_POWER"]) msg = @"血压测量失败：设备电量过低";
+        else if (interrupted) msg = @"血压测量已中断";
+        else msg = @"血压测量失败";
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
+                                                  phase:(interrupted ? @"stop" : @"failed")
+                                                 isDone:YES];
+        d[@"progress"] = @0;
+        d[@"value"] = @0;
+        d[@"success"] = @NO;
+        d[@"message"] = msg;
+        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @NO };
+        [weakSelf sendEvent:@"measure" data:d];
+        [weakSelf endMeasuring];
+        weakSelf.bpViaHealthGlance = NO;
+    }];
+}
+
+/** result/stop 帧的进度统一给 100（部分固件的 Close 帧 progress 还是 0） */
+static BOOL JoemeTempPhaseIsDone(NSString *phase) {
+    return [phase isEqualToString:@"result"] || [phase isEqualToString:@"stop"];
+}
+
+/**
+ 体温状态映射。对齐 Android 的 startMeasureTemperature（官方 BodyTemperatureDetectViewModel 口径），
+ iOS 的枚举只有 4 个值，语义要靠 `enable` + `progress` 补足：
+
+   VPTemperatureTestStateOpen + progress<100  → testing（progress 是设备真实进度）
+   VPTemperatureTestStateOpen + progress>=100 → result / stop（官方 Demo 就在这里收尾）
+   VPTemperatureTestStateOpen + 无进度无读数且 enable=NO → failed：设备正忙
+   VPTemperatureTestStateClose                → 设备侧结束 → 有值 result / 无值 stop
+   VPTemperatureTestStateUnsupported          → failed：设备不支持
+   VPTemperatureTestStateNotWear              → failed：佩戴未通过
+
+ 三个 iOS 必须自己兜住的点（Android 那边由 oprate/deviceState 直接给出）：
+
+ 1) **Close 帧的 tempValue 经常是 0**。真正的读数在 Open 帧里给过，不兜底的话
+    「测到 36.6 之后设备自己结束」会被判成「测量结束（无有效值）」，页面弹失败。
+    用 lastTempValue / lastOriginalTempValue 兜（与血氧 lastSpo2Value 同一套做法）。
+
+ 2) **完成判据不能只看 Close**。部分固件 progress 到 100 后不再回 Close，页面会一直停在
+    「测量中」；所以 progress>=100 就按官方 Demo 立刻出结果并收尾。
+    反过来，只回 Close 不回 progress=100 的机型也靠 Close 出结果 —— 两条都要走。
+
+ 3) **enable 的语义头文件与 Demo 相反**。头文件注释说「enable 表示设备是否正忙」，
+    官方 Demo（VPTemperatureViewController）却是 enable 为真才读数、为假打「设备正忙」。
+    以 Demo 为准，但只在「没有进度也没有读数」时才判正忙 —— 否则 enable 恒为 NO 的固件
+    会一进来就失败。
+
+ 收尾时补发一次 stop（Android 官方 b() 行为）：设备侧状态机不复位的话，下一次测量会直接失败。
+ 已经发过终态就丢弃后续重帧（我们补发的 stop 会引出 Close，设备也可能重复回包），
+ 否则页面会弹两次保存框。
+ */
 - (void)handleTemperatureState:(VPTemperatureTestState)state enable:(BOOL)enable
                       progress:(NSInteger)progress tempValue:(NSInteger)tempValue
              originalTempValue:(NSInteger)originalTempValue {
+    // 本轮最后一次有效读数（Close / 无值帧靠它兜底）
+    if (tempValue > 0) self.lastTempValue = tempValue;
+    if (originalTempValue > 0) self.lastOriginalTempValue = originalTempValue;
+
+    // 终态只发一次
+    if (self.temperatureFinished) return;
+
+    // 每来一帧就重置看门狗：慢设备不会被误判，真卡住也能收尾
+    [self armTemperatureWatchdog];
+
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, stopDevice = NO;
     NSString *message = @"体温测量中";
+    NSString *stateName = @"TEMPERATURE_OPEN";
+
     switch (state) {
-        case VPTemperatureTestStateOpen:
+        case VPTemperatureTestStateOpen: {
+            // 头文件说 enable 表示「设备是否正忙」，Demo 却把 !enable 打成「设备正忙」、
+            // enable 为真才读数。以 Demo 为准，但加一道 progress/值的前置判断：
+            // 只要这帧带进度或读数就按测量中处理，避免某些固件 enable 恒为 NO 时一进来就判失败。
+            if (!enable && progress <= 0 && self.lastTempValue <= 0) {
+                phase = @"failed"; isDone = YES; stopDevice = YES;
+                message = @"体温测量失败：设备正忙";
+                stateName = @"TEMPERATURE_BUSY";
+                break;
+            }
+            if (progress >= 100) {
+                BOOL hasValue = self.lastTempValue > 0;
+                phase = hasValue ? @"result" : @"stop";
+                isDone = YES; success = hasValue; stopDevice = YES;
+                message = hasValue ? @"体温测量完成" : @"体温测量结束（无有效值）";
+            }
             break;
-        case VPTemperatureTestStateClose:
-            phase = tempValue > 0 ? @"result" : @"stop";
-            isDone = YES;
-            success = tempValue > 0;
-            message = tempValue > 0 ? @"体温测量完成" : @"体温测量结束（无有效值）";
+        }
+        case VPTemperatureTestStateClose: {
+            // 设备自己结束（也可能是我方 stop 的回帧）。有值就是正常结果，
+            // 没值才按「结束无结果」处理 —— 不能一律当 stop，否则永远看不到结果。
+            BOOL hasValue = self.lastTempValue > 0;
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue;
+            message = hasValue ? @"体温测量完成" : @"体温测量结束（无有效值）";
+            stateName = @"TEMPERATURE_CLOSE";
             break;
+        }
         case VPTemperatureTestStateUnsupported:
-            phase = @"failed"; isDone = YES; message = @"体温测量失败：设备不支持该功能";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"体温测量失败：设备不支持该功能";
+            stateName = @"UNSUPPORT";
             break;
         case VPTemperatureTestStateNotWear:
-            phase = @"failed"; isDone = YES; message = @"体温测量失败：佩戴检测未通过";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"体温测量失败：佩戴检测未通过";
+            stateName = @"TEMPERATURE_NOT_WEAR";
             break;
         default:
-            break;
+            // 未知状态不打扰页面（保持「测量中」，等后续帧）
+            return;
     }
+
+    if (isDone) {
+        self.temperatureFinished = YES;
+        [self cancelTemperatureWatchdog];
+    }
+
     NSMutableDictionary *d = [self measureEvent:@"temperature" phase:phase isDone:isDone];
-    d[@"progress"] = @(progress);
-    d[@"value"] = @(tempValue / 10.0);          // 摄氏度
+    NSInteger pct = MIN(MAX(progress, (NSInteger)0), (NSInteger)100);
+    d[@"progress"] = @(JoemeTempPhaseIsDone(phase) ? 100 : pct);
+    d[@"value"] = @(self.lastTempValue / 10.0);          // 摄氏度
     d[@"success"] = @(success);
-    d[@"state"] = @(state);
+    d[@"state"] = stateName;                             // 与 Android 同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
     d[@"message"] = message;
-    d[@"extra"] = @{ @"originalTemp": @(originalTempValue / 10.0),   // 原始/体表温度
-                     @"deviceBusy": @(enable) };
+    d[@"extra"] = @{ @"originalTemp": @(self.lastOriginalTempValue / 10.0),  // 原始/体表温度
+                     // 只有 Open 帧的 enable 才表示「能不能测」；Close 帧不携带该语义，
+                     // 一律置 NO，否则结果帧会被标成「设备正忙」
+                     @"deviceBusy": @(state == VPTemperatureTestStateOpen && !enable),
+                     @"fromClose": @(state == VPTemperatureTestStateClose) };
     [self sendEvent:@"measure" data:d];
-    if (isDone) [self endMeasuring];
+
+    if (isDone) {
+        [self endMeasuring];
+        if (stopDevice) [self stopTemperatureSession];
+    }
+}
+
+/**
+ 体温测量看门狗：一次手动测量官方 UI 上限约 60 秒，iOS 上超过 90 秒没有任何帧就说明
+ 设备把命令吃掉了（不支持 / 状态机没复位 / 被别的测量占着）。到点按「结束无有效值」收尾，
+ 页面才不会永远停在「测量中」。
+ 每来一帧都重新计时：慢设备不会被误判，真卡住也不会无限等。
+ */
+- (void)armTemperatureWatchdog {
+    [self cancelTemperatureWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t blk = dispatch_block_create(0, ^{
+        JoemeWatchModule *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.temperatureFinished) return;
+        // 本 block 就是当前看门狗，先摘掉引用再收尾，别在 stopTemperatureSession
+        // 里对自己再 cancel 一次
+        strongSelf.temperatureWatchdog = nil;
+        strongSelf.temperatureFinished = YES;
+        NSMutableDictionary *d = [strongSelf measureEvent:@"temperature" phase:@"failed" isDone:YES];
+        d[@"progress"] = @0;
+        d[@"value"] = @0;
+        d[@"success"] = @NO;
+        d[@"state"] = @"TIMEOUT";
+        d[@"message"] = @"体温测量超时：设备未响应，请重试";
+        d[@"extra"] = @{ @"originalTemp": @0, @"deviceBusy": @NO, @"timeout": @YES };
+        [strongSelf sendEvent:@"measure" data:d];
+        [strongSelf endMeasuring];
+        [strongSelf stopTemperatureSession];
+    });
+    self.temperatureWatchdog = blk;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), blk);
+}
+
+/** 取消体温看门狗（终态、手动停止、开始新一轮时都要调） */
+- (void)cancelTemperatureWatchdog {
+    if (self.temperatureWatchdog) {
+        dispatch_block_cancel(self.temperatureWatchdog);
+        self.temperatureWatchdog = nil;
+    }
+}
+
+/**
+ 释放设备侧体温会话（官方 Demo / Android 的 b() 行为）。
+ 幂等：同一轮只下发一次；回调换成本地空 block，避免自己补发的 stop 引出 Close 再回灌页面。
+ */
+- (void)stopTemperatureSession {
+    [self cancelTemperatureWatchdog];
+    if (self.temperatureDeviceStopped) return;
+    self.temperatureDeviceStopped = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    [pm veepooSDK_temperatureTestStart:NO
+                                result:^(VPTemperatureTestState state, BOOL enable,
+                                         NSInteger progress, NSInteger tempValue,
+                                         NSInteger originalTempValue) {}];
 }
 
 /** HRV：设备持续回值，没有"完成"回调，靠用户 stopMeasure 收尾 */
@@ -1417,6 +1729,202 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     return (NSInteger)(fraction * 100);
 }
 
+#pragma mark - 血液成分（bloodComponent）
+
+/** 血液成分结果是否有有效值（5 项任一 > 0）；全 0 等同于「没测到」 */
+- (BOOL)bloodAnalysisModelHasValue:(VPBloodAnalysisResultModel *)model {
+    if (!model) return NO;
+    return model.uricAcidValue > 0 || model.totalCholesterolValue > 0
+        || model.triglycerideValue > 0 || model.highDensityLipoproteinValue > 0
+        || model.lowDensityLipoproteinValue > 0;
+}
+
+/** 血液成分 5 项 -> extra（字段名与 Android/JS 完全一致，单位：尿酸 μmol/L，血脂 mmol/L） */
+- (NSDictionary *)bloodAnalysisExtra:(VPBloodAnalysisResultModel *)model {
+    if (!model) return @{};
+    return @{
+        @"uricAcid": @(model.uricAcidValue),
+        @"tcho": @(model.totalCholesterolValue),
+        @"tag": @(model.triglycerideValue),
+        @"hdl": @(model.highDensityLipoproteinValue),
+        @"ldl": @(model.lowDensityLipoproteinValue),
+        @"model": self.bloodAnalysisPersonal ? @"private" : @"public",
+        @"summary": [NSString stringWithFormat:
+                     @"BloodComponent{uricAcid=%.1f, tcho=%.2f, tag=%.2f, hdl=%.2f, ldl=%.2f}",
+                     model.uricAcidValue, model.totalCholesterolValue,
+                     model.triglycerideValue, model.highDensityLipoproteinValue,
+                     model.lowDensityLipoproteinValue]
+    };
+}
+
+/**
+ 血液成分进度：SDK 只给 NSProgress（没有数值），按它转 0~100。
+ 与身体成分同口径，但这里**不**下发 value —— 进度不是测量值。
+ */
+- (void)handleBloodAnalysisProgress:(NSProgress *)progress {
+    if (self.bloodAnalysisFinished) return;
+    [self armBloodAnalysisWatchdog];
+    NSMutableDictionary *d = [self measureEvent:@"bloodComponent" phase:@"testing" isDone:NO];
+    NSInteger pct = MIN(MAX(leadProgressPercent(progress), (NSInteger)0), (NSInteger)99);
+    d[@"progress"] = @(pct);
+    d[@"message"] = [NSString stringWithFormat:@"血液成分测量中：%ld%%", (long)pct];
+    d[@"extra"] = @{ @"model": self.bloodAnalysisPersonal ? @"private" : @"public",
+                     @"haveProgress": @YES };
+    [self sendEvent:@"measure" data:d];
+}
+
+/**
+ 血液成分状态映射（对齐 Android 的 startMeasureBloodComponent / 官方 Demo）：
+
+   Complete → result（5 项）
+   Over     → 人为结束 / 正常结束的回帧：有兜底值 → result，没有 → stop
+   Failure  → failed（测试无效）
+   NotWear  → failed（佩戴检测未通过）
+   DeviceBusy / LowPower / NoFunction → failed
+
+ iOS 必须自己兜住的两点（Android 由 progress/枚举语义直接给出）：
+
+ 1) **Over 帧的 model 可能是 nil 或全 0**。真值在 Complete 帧给过，
+    用 lastBloodAnalysisModel 兜底（与血氧 Over / 体温 Close 同一套做法）。
+ 2) **终态只发一次**。我方补发的停止会引出 Over，设备也可能重复回包；
+    不去重页面会弹两次保存框。
+
+ 收尾时补发一次停止：设备侧状态机不复位的话，下一次测量会直接失败。
+ */
+- (void)handleBloodAnalysisState:(VPDeviceBloodAnalysisState)state
+                           model:(VPBloodAnalysisResultModel *)model {
+    if (self.bloodAnalysisFinished) return;
+    if ([self bloodAnalysisModelHasValue:model]) self.lastBloodAnalysisModel = model;
+    [self armBloodAnalysisWatchdog];
+
+    NSString *phase = @"testing";
+    BOOL isDone = NO, success = NO, stopDevice = NO;
+    NSString *message = @"血液成分测量中";
+    NSString *stateName = @"BLOOD_ANALYSIS_TESTING";
+
+    switch (state) {
+        case VPDeviceBloodAnalysisStateComplete: {
+            BOOL hasValue = [self bloodAnalysisModelHasValue:self.lastBloodAnalysisModel];
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue; stopDevice = YES;
+            message = hasValue ? @"血液成分测量完成" : @"血液成分测量结束（无有效值）";
+            stateName = @"COMPLETE";
+            break;
+        }
+        case VPDeviceBloodAnalysisStateOver: {
+            // 人为结束 / 正常结束：有兜底值就当结果交出去，别让「测完再点停止」丢结果
+            BOOL hasValue = [self bloodAnalysisModelHasValue:self.lastBloodAnalysisModel];
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue;
+            message = hasValue ? @"血液成分测量完成" : @"血液成分测量已结束";
+            stateName = @"OVER";
+            break;
+        }
+        case VPDeviceBloodAnalysisStateFailure:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血液成分测量失败：测试无效，请重试";
+            stateName = @"FAILURE";
+            break;
+        case VPDeviceBloodAnalysisStateNotWear:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血液成分测量失败：佩戴检测未通过";
+            stateName = @"NOT_WEAR";
+            break;
+        case VPDeviceBloodAnalysisStateDeviceBusy:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血液成分测量失败：设备正忙";
+            stateName = @"DEVICE_BUSY";
+            break;
+        case VPDeviceBloodAnalysisStateLowPower:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血液成分测量失败：设备电量过低";
+            stateName = @"LOW_POWER";
+            break;
+        case VPDeviceBloodAnalysisStateNoFunction:
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血液成分测量失败：设备不支持该功能";
+            stateName = @"NO_FUNCTION";
+            break;
+        default:
+            // 未知状态不打扰页面（保持「测量中」，等后续帧）
+            return;
+    }
+
+    if (isDone) self.bloodAnalysisFinished = YES;
+
+    NSMutableDictionary *d = [self measureEvent:@"bloodComponent" phase:phase isDone:isDone];
+    d[@"progress"] = @(isDone ? 100 : 0);
+    d[@"success"] = @(success);
+    d[@"state"] = stateName;            // 与 Android 同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
+    d[@"message"] = message;
+    if ([self bloodAnalysisModelHasValue:self.lastBloodAnalysisModel]) {
+        d[@"extra"] = [self bloodAnalysisExtra:self.lastBloodAnalysisModel];
+    } else {
+        d[@"extra"] = @{ @"model": self.bloodAnalysisPersonal ? @"private" : @"public" };
+    }
+    [self sendEvent:@"measure" data:d];
+
+    if (isDone) {
+        [self endMeasuring];
+        if (stopDevice) [self stopBloodAnalysisSession];
+    }
+}
+
+/**
+ 血液成分看门狗：一次完整测量约 60~90 秒（官方 UI 上限），iOS 上超过 120 秒没有任何帧
+ 就说明设备把命令吃掉了（不支持 / 状态机没复位 / 被别的测量占着）。到点按「失败」收尾，
+ 页面才不会永远停在「测量中」。每来一帧都重新计时。
+ */
+- (void)armBloodAnalysisWatchdog {
+    [self cancelBloodAnalysisWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t blk = dispatch_block_create(0, ^{
+        JoemeWatchModule *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.bloodAnalysisFinished) return;
+        strongSelf.bloodAnalysisWatchdog = nil;
+        strongSelf.bloodAnalysisFinished = YES;
+        NSMutableDictionary *d = [strongSelf measureEvent:@"bloodComponent" phase:@"failed" isDone:YES];
+        d[@"progress"] = @0;
+        d[@"success"] = @NO;
+        d[@"state"] = @"TIMEOUT";
+        d[@"message"] = @"血液成分测量超时：设备未响应，请重试";
+        d[@"extra"] = @{ @"timeout": @YES,
+                         @"model": strongSelf.bloodAnalysisPersonal ? @"private" : @"public" };
+        [strongSelf sendEvent:@"measure" data:d];
+        [strongSelf endMeasuring];
+        [strongSelf stopBloodAnalysisSession];
+    });
+    self.bloodAnalysisWatchdog = blk;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), blk);
+}
+
+/** 取消血液成分看门狗（终态、手动停止、开始新一轮时都要调） */
+- (void)cancelBloodAnalysisWatchdog {
+    if (self.bloodAnalysisWatchdog) {
+        dispatch_block_cancel(self.bloodAnalysisWatchdog);
+        self.bloodAnalysisWatchdog = nil;
+    }
+}
+
+/**
+ 释放设备侧血液成分会话（官方 Demo / Android 的 stopDetectBloodComponent 行为）。
+ 幂等：同一轮只下发一次；回调换成本地空 block，避免自己补发的停止引出 Over 再回灌页面。
+ */
+- (void)stopBloodAnalysisSession {
+    [self cancelBloodAnalysisWatchdog];
+    if (self.bloodAnalysisDeviceStopped) return;
+    self.bloodAnalysisDeviceStopped = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    [pm veepooSDKTestBloodAnalysisStart:NO
+                        isPersonalModel:self.bloodAnalysisPersonal
+                               progress:^(NSProgress *progress) {}
+                             testResult:^(VPDeviceBloodAnalysisState state,
+                                          VPBloodAnalysisResultModel *model) {}];
+}
+
 /** 皮电：进度回调 */
 - (void)handleGsrProgress:(NSProgress *)progress {
     NSMutableDictionary *d = [self measureEvent:@"gsr" phase:@"testing" isDone:NO];
@@ -1707,11 +2215,26 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
     if ([type isEqualToString:@"spo2"]) {
         [pm veepooSDKTestOxygenStart:NO testResult:^(VPTestOxygenState state, NSUInteger value) {}];
     } else if ([type isEqualToString:@"bp"]) {
-        [pm veepooSDKTestBloodStart:NO
-                           testMode:(NSUInteger)self.bpTestMode
-                         testResult:^(VPTestBloodState state, NSUInteger progress,
-                                      NSUInteger high, NSUInteger low) {}];
+        if (self.bpViaHealthGlance) {
+            // 气泵机型：本次走的是微体检，停的也得是微体检
+            [pm veepooSDK_healthGlanceTestStart:NO
+                                    andProgress:nil
+                                      andResult:^(VPDeviceHealthGlanceState state,
+                                                  VPHealthGlanceTestModel *model) {}];
+            self.bpViaHealthGlance = NO;
+        } else {
+            [pm veepooSDKTestBloodStart:NO
+                               testMode:(NSUInteger)self.bpTestMode
+                             testResult:^(VPTestBloodState state, NSUInteger progress,
+                                          NSUInteger high, NSUInteger low) {}];
+        }
     } else if ([type isEqualToString:@"temperature"]) {
+        // 用户手动停止：先置终态标志，设备回的那帧 Close 就不会再回灌一条 result，
+        // 页面的 stop() 已经按「有值→结果页 / 无值→已停止」收过尾了。
+        // 停止命令由这里直接下发，下面 stopTemperatureSession 不用再补。
+        self.temperatureFinished = YES;
+        self.temperatureDeviceStopped = YES;
+        [self cancelTemperatureWatchdog];
         [pm veepooSDK_temperatureTestStart:NO
                                     result:^(VPTemperatureTestState state, BOOL enable,
                                              NSInteger progress, NSInteger tempValue,
@@ -1745,6 +2268,17 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                                      progress:^(NSInteger lead, NSProgress *progress) {}
                                    testResult:^(VPDeviceBodyCompositionState state,
                                                 VPBodyCompositionValueModel *model) {}];
+    } else if ([type isEqualToString:@"bloodComponent"]) {
+        // 与体温同口径：手动停止先置终态标志，设备回的那帧 Over 就不再回灌一条 result，
+        // 页面 stop() 已按「有值→结果页 / 无值→已停止」收过尾了。
+        self.bloodAnalysisFinished = YES;
+        self.bloodAnalysisDeviceStopped = YES;
+        [self cancelBloodAnalysisWatchdog];
+        [pm veepooSDKTestBloodAnalysisStart:NO
+                            isPersonalModel:self.bloodAnalysisPersonal
+                                   progress:^(NSProgress *progress) {}
+                                 testResult:^(VPDeviceBloodAnalysisState state,
+                                              VPBloodAnalysisResultModel *model) {}];
     } else if ([type isEqualToString:@"gsr"]) {
         [pm veepooSDKTestGSRStart:NO
                          progress:^(NSProgress *progress) {}
@@ -1804,6 +2338,22 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             // 文本闹钟缓存属于「上一台设备」：断连即失效，避免拿旧表的模型去删改新设备
             self.lastTextAlarms = nil;
             self.lastTextAlarmModels = nil;
+            // 天气状态快照同理：换表/重连后开关与单位都可能不同，旧值不能再用
+            self.lastWeatherStatus = nil;
+            self.weatherCapabilityDepth = 0;
+            self.weatherCapabilitySaved = -1;
+            // 断连时体温会话已不存在：撤掉看门狗并把本轮置为已收尾，
+            // 否则 90 秒后那个 block 会对着已断开的设备补发停止命令、并给页面补一条 stop。
+            [self cancelTemperatureWatchdog];
+            self.temperatureFinished = YES;
+            self.temperatureDeviceStopped = YES;
+            self.lastTempValue = 0;
+            self.lastOriginalTempValue = 0;
+            // 血液成分同理：断连后不能留着看门狗对空设备补发停止
+            [self cancelBloodAnalysisWatchdog];
+            self.bloodAnalysisFinished = YES;
+            self.bloodAnalysisDeviceStopped = YES;
+            self.lastBloodAnalysisModel = nil;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
@@ -7896,49 +8446,128 @@ UNI_EXPORT_METHOD(@selector(readUnitSetting:callback:))
 }
 
 /**
+ 临时顶开天气能力位。
+ 
+ 反编译 VPWeatherHandle.o 得到的门禁（readWeatherInfo）：
+     model = sharedBleManager.peripheralModel
+     t = model.weatherType
+     if ((t == 0) || (t == 2)) { 回调 (None, nil); return; }   // 一个字节都不发
+ settingWeatherInfo 更严格：weatherType <= 0 直接失败返回。
+ 
+ peripheralModel.weatherType 来自握手包「是否有天气数据」，基础机型/部分固件漏报时为 0，
+ 于是读写全部静默丢弃 —— Android 侧同一个坑（checkWeather 读 SP 缓存）已经有
+ ensureWeatherCapability() 强行写支持位兜底，iOS 这边没有，表现就是
+ 「点了保存、提示成功、手表单位没变」。
+ 
+ 做法与 Android 对齐：命令照发，是否真正支持以设备回包为准（不支持时设备不回包，
+ 页面会走「未能确认」而不是谎报成功）。机制是临时把能力位写成 1，SDK 发完包后由
+ exitWeatherCapability 还原，不影响 supportWeather 诊断输出。
+ */
+- (void)enterWeatherCapability {
+    if (self.weatherCapabilityDepth == 0) {
+        VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+        self.weatherCapabilitySaved = m ? (NSInteger)m.weatherType : -1;
+    }
+    self.weatherCapabilityDepth++;
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    if (m && (NSInteger)m.weatherType != 1) m.weatherType = 1;
+}
+
+/** 还原 enterWeatherCapability 顶掉的能力位 */
+- (void)exitWeatherCapability {
+    if (self.weatherCapabilityDepth <= 0) return;
+    self.weatherCapabilityDepth--;
+    if (self.weatherCapabilityDepth > 0) return;
+    NSInteger saved = self.weatherCapabilitySaved;
+    self.weatherCapabilitySaved = -1;
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    if (m && saved >= 0) m.weatherType = saved;
+}
+
+/**
  读取天气开关与单位。
  iOS SDK：VPWeatherHandle readWeatherInfo:（回 VPWeatherConfigModel：switchState / weatherUnit）
  JS：joemeWatch.readWeatherStatus() -> resolve + on('weather') { isOpen, weatherType, ok, raw }
  说明：weatherType 输出 'C' / 'F'（页面只认这两个字母）；
       iOS 的 weatherType（能力位）为 0 时也照常下发（与 Android 的「软提示」同口径）。
+
+ 两个必须自己兜住的坑：
+  1) SDK 的门禁：readWeatherInfo 首行看 peripheralModel.weatherType，为 0/2 时
+     **一个字节都不发**、直接回调 (None, nil)。基础机型漏报 A7 功能包时就恒为 0，
+     与 Android 的 checkWeather() 读 SP 缓存同源（那边有 ensureWeatherCapability 兜底）。
+     这里用 enterWeatherCapability 临时顶成 1，走同一条「命令照发、以回包为准」的路子。
+  2) 回调可能永远不来。SDK 的 readWeatherInfo 只是把 block 存起来，
+     真正的回调在 receiveData 里（设备不回包就永远不回调），JS 的 Promise 会永久 pending，
+     页面读单位/保存都会卡住。所以有 3.5 秒看门狗，到点回 timeout 帧。
  */
 UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
 - (void)readWeatherStatus:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     __weak typeof(self) weakSelf = self;
+    __block BOOL settled = NO;
+
+    void (^finish)(NSMutableDictionary *) = ^(NSMutableDictionary *d) {
+        if (settled) return;
+        settled = YES;
+        [weakSelf sendEvent:@"weather" data:d];
+        // 与 Android 同口径：一律回 200，把结论放在 ok / oprate / noData / timeout 里。
+        // 回 -1 会让 JS 的 Promise reject，页面在中途抛错就没法再按「未确认」而不是
+        // 「失败」来提示；而且读不到天气状态本身不该当成整页错误。
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
+    };
+
+    // 3.5s 而不是 4s：页面侧等回读的证据窗口也是 4s，原生必须先到点回帧，
+    // 否则两边同时超时，页面拿不到「设备没回」这个结论。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (settled) return;
+        finish([@{
+            @"ok": @NO,
+            @"oprate": @"READ_FAIL",
+            @"noData": @YES,
+            @"timeout": @YES,
+            @"message": @"设备 3.5 秒内未回天气状态"
+        } mutableCopy]);
+    });
+
+    [self enterWeatherCapability];
+    // 先清掉 SDK 的 cofigModel 再读：它会同时缓存「读回包」和「写回执」，
+    // 刚写完紧接着读、设备却不回包时，SDK 会拿刚写下去的值当「读到」回调成功 ——
+    // 这就是 iOS 上「提示已保存、手表其实没变」的直接来源。
+    // 清掉之后：设备回包 → 回调带真模型；不回包 → cfg 为 nil，这次读就是「没读到」。
+    [[VPWeatherHandle share] reset];
     [[VPWeatherHandle share] readWeatherInfo:^(VPWeatherSettingState state, VPWeatherConfigModel *cfg) {
-        // live = 这次回调真的带了模型。注意必须在用缓存兜底**之前**判断，
-        // 否则「state=Success + 只有缓存」会被误当成实时读到 → 保存后的回读
-        // 用缓存证明缓存（真机上就是「提示已保存、实际没写进设备」的来源）。
+        // live = 这次回调真的带了「读回包」解析出的模型（reset 之后 cofigModel 已空，
+        // 所以这里的 cfg 非 nil 只可能来自本次设备回包）。
         BOOL live = (state == VPWeatherSettingStateSuccess) && cfg != nil;
-        // 兜底：SDK 自己的缓存（VPWeatherHandle 会保留上次读写的 cofigModel）
-        if (!cfg) cfg = [VPWeatherHandle share].cofigModel;
 
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        if (cfg) {
+        if (live) {
             d[@"isOpen"] = @(cfg.switchState == 1);
             d[@"weatherType"] = (cfg.weatherUnit == 1) ? @"F" : @"C";
             d[@"crc"] = @(cfg.crc);
             d[@"ok"] = @YES;
             d[@"oprate"] = @"READ_SUCCESS";
-            if (!live) d[@"cached"] = @YES;   // 来自缓存而非本次实时读
             d[@"raw"] = [NSString stringWithFormat:@"WeatherStatusData{isOpen=%@, weatherType=%@}",
                          cfg.switchState == 1 ? @"true" : @"false", d[@"weatherType"]];
-            // 只有实时读到的才更新快照；缓存帧不能再写回快照（否则缓存自我延续）
-            if (live) {
-                weakSelf.lastWeatherStatus = @{
-                    @"isOpen": @(cfg.switchState == 1),
-                    @"weatherType": d[@"weatherType"],
-                    @"crc": @(cfg.crc)
-                };
-            }
+            // 只有实时读到的才更新快照
+            weakSelf.lastWeatherStatus = @{
+                @"isOpen": @(cfg.switchState == 1),
+                @"weatherType": d[@"weatherType"],
+                @"crc": @(cfg.crc)
+            };
         } else if (weakSelf.lastWeatherStatus) {
+            // 本次没读到：退回「上次真实读到的值」给界面兜底显示。
+            // cached 必须标出来 —— 页面拿它当「未确认」，不能当保存后的生效证据。
             d[@"isOpen"] = weakSelf.lastWeatherStatus[@"isOpen"];
             d[@"weatherType"] = weakSelf.lastWeatherStatus[@"weatherType"];
             if (weakSelf.lastWeatherStatus[@"crc"]) d[@"crc"] = weakSelf.lastWeatherStatus[@"crc"];
-            d[@"ok"] = @YES;
-            d[@"oprate"] = @"READ_SUCCESS";
+            d[@"ok"] = @NO;
+            d[@"oprate"] = @"READ_FAIL";
             d[@"cached"] = @YES;
+            d[@"message"] = @"设备本次未回天气状态，显示的是上次读到的值";
         } else {
             // 真的没有状态：不给 isOpen，避免页面把开关误翻成「关」
             d[@"ok"] = @NO;
@@ -7946,19 +8575,21 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
             d[@"noData"] = @YES;
             d[@"message"] = @"设备不支持天气或读取失败";
         }
-        [weakSelf sendEvent:@"weather" data:d];
-        NSMutableDictionary *r = [resultWithCode([d[@"ok"] boolValue] ? 200 : -1) mutableCopy];
-        [r addEntriesFromDictionary:d];
-        callback(r, NO);
+        finish(d);
     }];
+    // writeCharacteristic 在 readWeatherInfo 内部同步完成，能力位只是进门时看一眼，
+    // 发完立刻还原，不把假的能力位留在设备模型上（supportWeather 诊断仍看真值）。
+    [self exitWeatherCapability];
 }
 
 /**
- 设置天气开关与单位。options: { isOpen, unit:'C'|'F' }
+ 设置天气开关与单位。options: { isOpen, unit:'C'|'F', crc? }
  iOS SDK：VPWeatherHandle settingWeatherInfo:（VPWeatherConfigModel）
  JS：joemeWatch.setWeatherStatus({...}) -> on('weather') { isOpen, weatherType, ok, oprate }
  说明：oprate 固定 SETTING_STATUS_SUCCESS / SETTING_STATUS_FAIL（与 Android 同名），
       页面据此判断写入是否真的成功，而不是只看命令已下发。
+      crc 可传但**不会进入下行包**：两端 SDK 的组包都只有 4 个字节
+      （0xC8 / 0x03 / 开关 / 单位），官方 Demo 里那个 setting.crc 实际被忽略。
  */
 UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
 - (void)setWeatherStatus:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -7981,29 +8612,55 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
     VPWeatherConfigModel *cfg = [[VPWeatherConfigModel alloc] init];
     cfg.switchState = open ? 1 : 0;
     cfg.weatherUnit = celsius ? 0 : 1;
-    // crc：官方 Demo WeatherActivity 下发前是 `setting.crc = crc`（crc 来自上一次读回）。
-    // 不带 crc 时部分固件会把这条设置当成「版本不匹配」而静默丢弃 ——
-    // 表现就是 App 说已保存、手表上单位没变。
     id crcVal = options[@"crc"] ?: self.lastWeatherStatus[@"crc"];
     if (crcVal != nil) cfg.crc = (uint16_t)[crcVal unsignedIntValue];
     __weak typeof(self) weakSelf = self;
-    [[VPWeatherHandle share] settingWeatherInfo:cfg result:^(VPWeatherSettingState state) {
-        BOOL ok = (state == VPWeatherSettingStateSuccess);
-        NSDictionary *d = @{
+    __block BOOL settled = NO;
+
+    void (^finish)(BOOL, NSString *, BOOL) = ^(BOOL ok, NSString *oprate, BOOL timeout) {
+        if (settled) return;
+        settled = YES;
+        NSMutableDictionary *d = [@{
             @"ok": @(ok),
-            @"oprate": ok ? @"SETTING_STATUS_SUCCESS" : @"SETTING_STATUS_FAIL",
+            @"oprate": oprate,
             @"isOpen": @(open),
             @"weatherType": celsius ? @"C" : @"F"
-        };
+        } mutableCopy];
+        if (timeout) {
+            d[@"timeout"] = @YES;
+            d[@"message"] = @"设备 2.5 秒内未回天气写回执";
+        }
         // 写回执只代表「设备收到了这条设置命令」，不代表值已经落盘。
         // 这里**不**更新 lastWeatherStatus：否则保存后的回读验证会读到刚写进来的
         // 缓存值，自己证明自己成功（真机上就是这样谎报成功的）。
-        // 快照只由真实读成功（readWeatherInfo 拿到 configModel）更新。
+        // 快照只由真实读成功（readWeatherInfo 拿到模型）更新。
         [weakSelf sendEvent:@"weather" data:d];
-        NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
+        // 同 readWeatherStatus：一律 200，结论放 ok/oprate/timeout。
+        // 页面据此区分「设备明确拒绝」和「命令已下发但没回执」，两种都不能报成功。
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
+    };
+
+    // 设备不回写回执时 JS 会永远 pending（保存按钮一直转圈），2.5 秒兜底。
+    // 必须比页面侧 _waitSettled('weather', 600, 3000) 的上限更早收口，
+    // 否则页面先收尾、拿不到「设备没回」这个明确结论。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (settled) return;
+        finish(NO, @"SETTING_STATUS_TIMEOUT", YES);
+    });
+
+    // 写回执（0xC8 0x03）也会被 SDK 解析成模型写进 cofigModel，若随后设备不回读包，
+    // 回读就会命中这份「我们自己写下去的回声」→ 页面误判「已生效」。
+    // 对策不在读侧打标记，而是让 readWeatherStatus 发读命令前先 reset 掉 cofigModel
+    // （见上面的注释），这里不需要额外记录。
+    [self enterWeatherCapability];
+    [[VPWeatherHandle share] settingWeatherInfo:cfg result:^(VPWeatherSettingState state) {
+        BOOL ok = (state == VPWeatherSettingStateSuccess);
+        finish(ok, ok ? @"SETTING_STATUS_SUCCESS" : @"SETTING_STATUS_FAIL", NO);
     }];
+    [self exitWeatherCapability];
 }
 
 /**
@@ -8038,20 +8695,42 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
     m.forecast = @[];
 
     __weak typeof(self) weakSelf = self;
+    __block BOOL settled = NO;
+    void (^finish)(BOOL, NSString *, BOOL) = ^(BOOL ok, NSString *oprate, BOOL timeout) {
+        if (settled) return;
+        settled = YES;
+        NSMutableDictionary *d = [@{
+            @"ok": @(ok),
+            @"oprate": oprate,
+            @"setWeatherData": @(ok),
+            @"cityName": m.city ?: @""
+        } mutableCopy];
+        if (timeout) {
+            d[@"timeout"] = @YES;
+            d[@"message"] = @"设备 8 秒内未回天气数据回执";
+        }
+        [weakSelf sendEvent:@"weather" data:d];
+        // 一律 200（结论在 ok/timeout 里），页面才能区分「设备拒绝」和「没回执」
+        NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
+    };
+
+    // syncWeatherData 要按 hourly/forecast 逐包推送，本来就慢；设备不回包时给 8 秒上限，
+    // 否则页面的「检测并同步」会一直停在「同步中...」
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        finish(NO, @"SETTING_CONTENT_TIMEOUT", YES);
+    });
+
+    // 同一个门禁：syncWeatherData 也要求天气能力位为真，否则命令直接丢弃
+    [self enterWeatherCapability];
     [[VPWeatherHandle share] syncWeatherDataToDeviceWithWeatherServerModel:m result:^(VPWeatherSettingState state) {
         BOOL ok = (state == VPWeatherSettingStateSuccess);
         // oprate 与 Android 的 SETTING_CONTENT_SUCCESS/FAIL 对齐，页面据此判同步结果
-        NSDictionary *d = @{
-            @"ok": @(ok),
-            @"oprate": ok ? @"SETTING_CONTENT_SUCCESS" : @"SETTING_CONTENT_FAIL",
-            @"setWeatherData": @(ok),
-            @"cityName": m.city ?: @""
-        };
-        [weakSelf sendEvent:@"weather" data:d];
-        NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
-        [r addEntriesFromDictionary:d];
-        callback(r, NO);
+        finish(ok, ok ? @"SETTING_CONTENT_SUCCESS" : @"SETTING_CONTENT_FAIL", NO);
     }];
+    [self exitWeatherCapability];
 }
 
 /**
