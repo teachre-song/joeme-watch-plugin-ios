@@ -166,6 +166,12 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 @property (nonatomic, strong) NSDictionary *lastWeatherStatus;
 /** 天气读取进行中的回调队列：SDK 的 readWeatherInfo 无并发保护，同一时刻只允许一次。 */
 @property (nonatomic, strong) NSMutableArray *weatherReadQueue;
+/** cofigModel 是不是被「写回执」刷新的。
+     SDK 的 receiveData 收到 0xC8 0x03（设置回执）且状态位=1 时会把解析出的模型写进
+     cofigModel，于是紧随其后的 readWeatherStatus 即使设备没回读包，也能从 cofigModel
+     拿到「我们自己刚写下去的值」，看起来像读成功了。置位后 readWeatherStatus 会给这类帧
+     打 echo=YES，页面据此拒绝把它当回读证据。实时读成功（拿到真模型）时清零。 */
+@property (nonatomic, assign) BOOL weatherCofigFromWrite;
 
 /** 本会话内写过的开关状态覆盖表：key = @(VPSettingBaseFunctionSwitchType)，value = @"SUPPORT_OPEN"/@"SUPPORT_CLOSE"。
     用途：个别开关的读命令恒定回 Failure（实测 VPSettingAutomaticPPGTest），只能靠握手字节表兜底；
@@ -199,6 +205,10 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (BOOL)allDayOxygenStateFromModel:(VPPeripheralModel *)model;
 /** 从握手缓存的开关字节表兜底取一个开关（读命令回 Failure 时用） */
 - (NSString *)switchByteStateForType:(VPSettingBaseFunctionSwitchType)type;
+/** 天气能力位兜底：VPWeatherHandle 内部按 peripheralModel.weatherType 拦截命令，
+     为 0/2 时读和写都直接回调失败、一个字节都不发。返回原值供还原（-1 = 没有设备模型） */
+- (NSInteger)forceWeatherCapabilityOn;
+- (void)restoreWeatherCapability:(NSInteger)saved;
 
 // 世界时钟（第 5 节实现）：内部辅助，先声明避免后向调用告警
 - (BOOL)worldClockSupported;
@@ -7368,15 +7378,20 @@ UNI_EXPORT_METHOD(@selector(readBpFunction:callback:))
     VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
     // 判据与 startMeasure 的 bp 分支保持一致：两个能力位任一为真即视为支持
     BOOL supported = (m.bloodPressureType > 0 || m.isSupportBPTest);
+    // 有没有「独立的 cuff 实时测量接口」：iOS 永远没有（SDK 里不存在这类符号）。
+    // 但支持微体检的设备能从 healthGlance 结果里拿到气泵高低压，故单列一个能力位。
+    BOOL cuffViaHG = (m.supportHealthGlanceTest && m.healthGlanceType != 0);
     NSDictionary *d = @{
         @"ok": @YES,
         @"supported": @(supported),
         @"bloodPressureType": @(m.bloodPressureType),
         @"supportPrivate": @(supported),
-        // iOS SDK 没有气囊（cuff）血压接口，只有光电测量，页面据此切进度量程
+        // iOS SDK 没有气囊（cuff）血压测量接口，页面据此切进度量程
         @"cuff": @NO,
-        @"data": [NSString stringWithFormat:@"BpFunctionData{supported=%@, bloodPressureType=%lu, cuff=false}",
-                  supported ? @"true" : @"false", (unsigned long)m.bloodPressureType]
+        @"cuffViaHealthGlance": @(cuffViaHG),
+        @"data": [NSString stringWithFormat:@"BpFunctionData{supported=%@, bloodPressureType=%lu, cuff=false, cuffViaHealthGlance=%@}",
+                  supported ? @"true" : @"false", (unsigned long)m.bloodPressureType,
+                  cuffViaHG ? @"true" : @"false"]
     };
     [self sendEvent:@"bpFunction" data:d];
     NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
