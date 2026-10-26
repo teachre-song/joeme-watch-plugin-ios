@@ -2408,6 +2408,19 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
 
     NSMutableDictionary *extra = [[self ecgExtraFromModel:self.ecgModel] mutableCopy];
     extra[@"leadOff"] = @(leadOff);
+    // 逐秒指标：Android 的 testing 帧带 hr1/hrv/qtc（EcgDetectState），页面靠这三个键
+    // 攒逐秒序列，用来算最高/最低心率与心率分布。iOS 的这三个值在模型的
+    // muHearts/muHrvs/muQTs（测试过程中每秒 append，最后一个就是当秒的值），
+    // 这里按 Android 的键名补一份，页面两端才能走同一套逻辑。
+    //   HRV 的 255 是 SDK 约定的无效哨兵，页面会自己过滤，这里原样透出。
+    //   muHearts/muHrvs/muQTs 的元素可能是 NSNumber 也可能是 NSString，
+    //   统一用 doubleValue 转成 NSNumber，页面不用判类型。
+    if (self.ecgModel.muHearts.count)
+        extra[@"hr1"] = @([self.ecgModel.muHearts.lastObject doubleValue]);
+    if (self.ecgModel.muHrvs.count)
+        extra[@"hrv"] = @([self.ecgModel.muHrvs.lastObject doubleValue]);
+    if (self.ecgModel.muQTs.count)
+        extra[@"qtc"] = @([self.ecgModel.muQTs.lastObject doubleValue]);
     if (!isDone) {
         // 测量中的帧只带指标，不带波形：waveMv/filterSignals 是整场累计数组，
         // 每帧（约 1 秒一次）塞进事件会把 JS 桥刷爆 —— 波形走专门的 ecgWave 增量通道。
@@ -2440,7 +2453,8 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
     if (isDone && self.ecgModel.aveHeart.length) {
         d[@"value"] = @(self.ecgModel.aveHeart.integerValue);        // 结束取平均心率
     } else if (self.ecgModel.muHearts.count) {
-        d[@"value"] = self.ecgModel.muHearts.lastObject;             // 过程中取最新一次心率
+        // 测量中取最新一次心率（元素可能是 NSString，统一成数字）
+        d[@"value"] = @([self.ecgModel.muHearts.lastObject doubleValue]);
     } else if (self.ecgModel.aveHeart.length) {
         d[@"value"] = @(self.ecgModel.aveHeart.integerValue);
     }
@@ -2622,15 +2636,18 @@ static NSInteger leadProgressPercent(NSProgress *progress) {
 - (void)startEcgWaveTimer {
     [self stopEcgWaveTimer];
     __weak typeof(self) weakSelf = self;
-    self.ecgWaveTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
-                                                         repeats:YES
-                                                           block:^(NSTimer *timer) {
+    // timerWithTimeInterval + NSRunLoopCommonModes：默认模式下页面滚动会暂停定时器，
+    // 波形就跟着卡住；common modes 包含 tracking，滚动时也照常刷新。
+    NSTimer *timer = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *t) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) { [timer invalidate]; return; }
-        // 没有进行中的 ECG 会话就没有模型可读，顺手把定时器收掉
+        if (!strongSelf) { [t invalidate]; return; }
         if (strongSelf.ecgFinished || !strongSelf.ecgModel) return;
-        [strongSelf flushEcgWave:strongSelf.ecgModel force:NO];
+        // force:YES 只是绕过 flushEcgWave 自己的 0.1s 节流（定时器本身就是 0.1s，
+        // 两者取整撞在一起会把帧整批丢掉）；没有新增点时 flush 仍然会立刻返回。
+        [strongSelf flushEcgWave:strongSelf.ecgModel force:YES];
     }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.ecgWaveTimer = timer;
 }
 
 - (void)stopEcgWaveTimer {
