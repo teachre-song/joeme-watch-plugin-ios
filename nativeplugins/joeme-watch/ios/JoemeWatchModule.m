@@ -202,6 +202,14 @@
 // 文本闹钟能力位（funcSupport 用）：读 deviceFuctionData[17]
 - (NSString *)textAlarmCapabilityName;
 
+// 业务前置检查（第 13 节实现）：startMeasure / heart 等手写体在它之前就要用，
+// 先声明避免「instance method not found」告警。
+- (BOOL)checkReady:(UniModuleKeepAliveCallback)callback;
+// 测量状态映射（第 13 节实现）：块里回调、实现在后，同样先声明
+- (void)handleSpo2State:(VPTestOxygenState)state value:(NSUInteger)value;
+- (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
+                 high:(NSUInteger)high low:(NSUInteger)low;
+
 // 表盘（第 7 节实现）：内部拆分较多，先声明避免后向调用告警
 - (BOOL)isJLDevice;                                       // 平台判定（CPUType == 1）
 - (NSString *)dialPlatformName;                            // jl / zk / nordic
@@ -770,11 +778,10 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
                                                  self.measuringType] }, NO);
         return;
     }
+    // 未连接时 SDK 会静默丢弃业务命令，页面只能等到自己的超时看门狗；
+    // 这里按 checkReady 的口径立刻回 -1（与 heart / powerOff 一致）。
+    if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    if (!pm) {
-        callback(@{ @"code": @(-1), @"message": @"未初始化：请先调用 initWatch" }, NO);
-        return;
-    }
 
     self.measuringType = type;
     __weak typeof(self) weakSelf = self;
@@ -784,6 +791,25 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleSpo2State:state value:oxygenValue];
         }];
     } else if ([type isEqualToString:@"bp"]) {
+        // iOS 只有光电血压（veepooSDKTestBloodStart），没有 Android 的 startDetectCuffBP
+        // 气囊通路 —— 整个 iOS 侧都拿不到充气压力，只有 progress 0~100，
+        // 页面据此把仪表盘降级成「进度」，别把进度当 mmHg 显示。
+        VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
+        if (info.bloodPressureType == 0 && !info.isSupportBPTest) {
+            // 设备不支持时明确回一帧 failed，比让 SDK 静默丢弃好：
+            // 页面会直接弹失败原因，而不是空转到 90s 超时看门狗。
+            [self endMeasuring];
+            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
+            d[@"success"] = @NO;
+            d[@"value"] = @0;
+            d[@"progress"] = @0;
+            d[@"message"] = @"血压测量失败：设备不支持血压功能";
+            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                             @"cuff": @NO, @"haveProgress": @NO };
+            [self sendEvent:@"measure" data:d];
+            callback(resultWithCode(200), NO);
+            return;
+        }
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
         [pm veepooSDKTestBloodStart:YES
@@ -921,12 +947,15 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     switch (state) {
         case VPTestBloodStateTesting:
             break;
-        case VPTestBloodStateComplete:
-            phase = (high > 0 || low > 0) ? @"result" : @"stop";
+        case VPTestBloodStateComplete: {
+            // 必须高低压都有值才算有效结果：只回高压会让页面显示「120/0」
+            BOOL valid = (high > 0 && low > 0);
+            phase = valid ? @"result" : @"stop";
             isDone = YES;
-            success = (high > 0 || low > 0);
-            message = success ? @"血压测量完成" : @"血压测量结束（无有效值）";
+            success = valid;
+            message = valid ? @"血压测量完成" : @"血压测量结束（无有效值）";
             break;
+        }
         case VPTestBloodStateTestInterrupt:
             phase = @"stop"; isDone = YES; message = @"血压测量已中断";
             break;
@@ -949,8 +978,12 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     d[@"success"] = @(success);
     d[@"state"] = @(state);
     d[@"message"] = message;
+    // iOS 没有气囊通路：只有 progress(0~100)，永远没有 pressure。
+    // 页面靠 extra.cuff=false 把仪表盘切成「进度」量程，别把 0~100 当 mmHg 显示。
     d[@"extra"] = @{ @"systolic": @(high), @"diastolic": @(low),
-                     @"model": self.bpTestMode == 1 ? @"private" : @"public" };
+                     @"model": self.bpTestMode == 1 ? @"private" : @"public",
+                     @"cuff": @NO,
+                     @"haveProgress": @(progress > 0) };
     [self sendEvent:@"measure" data:d];
     if (isDone) [self endMeasuring];
 }
@@ -1586,9 +1619,17 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         callback(resultWithCode(200), NO);   // 没有进行中的测量，静默成功
         return;
     }
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
+    VPPeripheralBaseManage *pm = manager.peripheralManage;
     if (!pm) {
         callback(@{ @"code": @(-1), @"message": @"未初始化：请先调用 initWatch" }, NO);
+        return;
+    }
+    if (!manager.peripheralModel) {
+        // 断连后停止没有意义（SDK 会静默丢弃），但页面收尾不依赖返回值：
+        // 照 heart 的口径回 200，别让 onUnload / 取消按钮打红日志。
+        [self endMeasuring];
+        callback(resultWithCode(200), NO);
         return;
     }
 
@@ -7136,21 +7177,24 @@ UNI_EXPORT_METHOD(@selector(readBpModel:callback:))
 
 /**
  读取血压功能状态（能力位）。
- iOS 没有 BpFunctionData；这里用 peripheralModel.bloodPressureType 与若干能力位组装。
+ iOS 没有 BpFunctionData；这里用 peripheralModel.bloodPressureType / isSupportBPTest 组装。
  Android：readBpFunctionState；JS：joemeWatch.readBpFunction() -> on('bpFunction')
- 事件：on('bpFunction') -> { ok, supported, bloodPressureType, supportPrivate, data }
+ 事件：on('bpFunction') -> { ok, supported, bloodPressureType, supportPrivate, cuff, data }
  */
 UNI_EXPORT_METHOD(@selector(readBpFunction:callback:))
 - (void)readBpFunction:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
-    BOOL supported = (m.bloodPressureType > 0);
+    // 判据与 startMeasure 的 bp 分支保持一致：两个能力位任一为真即视为支持
+    BOOL supported = (m.bloodPressureType > 0 || m.isSupportBPTest);
     NSDictionary *d = @{
         @"ok": @YES,
         @"supported": @(supported),
         @"bloodPressureType": @(m.bloodPressureType),
         @"supportPrivate": @(supported),
-        @"data": [NSString stringWithFormat:@"BpFunctionData{supported=%@, bloodPressureType=%lu}",
+        // iOS SDK 没有气囊（cuff）血压接口，只有光电测量，页面据此切进度量程
+        @"cuff": @NO,
+        @"data": [NSString stringWithFormat:@"BpFunctionData{supported=%@, bloodPressureType=%lu, cuff=false}",
                   supported ? @"true" : @"false", (unsigned long)m.bloodPressureType]
     };
     [self sendEvent:@"bpFunction" data:d];
