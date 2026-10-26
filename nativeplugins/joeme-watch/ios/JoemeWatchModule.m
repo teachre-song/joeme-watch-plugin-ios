@@ -610,11 +610,24 @@ UNI_EXPORT_METHOD(@selector(readBattery:callback:))
 
 UNI_EXPORT_METHOD(@selector(startHeartDetect:callback:))
 - (void)startHeartDetect:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
+    if (!manager.peripheralManage) {
+        // 未 initWatch 时 SDK 会静默丢弃命令，页面只能等到自己的 30s 超时
+        callback(@{ @"code": @(-1), @"message": @"未初始化：请先调用 initWatch" }, NO);
+        return;
+    }
+    if (!manager.peripheralModel) {
+        callback(@{ @"code": @(-1), @"message": @"设备未连接，请先连接并完成密码验证" }, NO);
+        return;
+    }
+    VPPeripheralBaseManage *pm = manager.peripheralManage;
     [pm veepooSDKTestHeartStart:YES testResult:^(VPTestHeartState state, NSUInteger heartValue) {
         BOOL done = (state == VPTestHeartStateNotWear ||
                      state == VPTestHeartStateDeviceBusy ||
                      state == VPTestHeartStateOver);
+        // status 是 VPTestHeartState 数值（0 开始 / 1 检测中 / 2 脱腕 / 3 忙 / 4 结束）。
+        // JS 侧 utils/joeme-watch.js 的 normalizeHeart 会换成 Android 的 EHeartStatus 名，
+        // 这里保持数值透出，两端共用同一套原始枚举。
         [self sendEvent:@"heart" data:@{
             @"status": @(state),
             @"value": @(heartValue),
@@ -626,7 +639,14 @@ UNI_EXPORT_METHOD(@selector(startHeartDetect:callback:))
 
 UNI_EXPORT_METHOD(@selector(stopHeartDetect:callback:))
 - (void)stopHeartDetect:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    VPBleCentralManage *manager = [VPBleCentralManage sharedBleManager];
+    VPPeripheralBaseManage *pm = manager.peripheralManage;
+    // 未连接时停止没有意义（SDK 会静默丢弃），但也不算错误：页面收尾不依赖这个返回值，
+    // 所以照 Android 的口径直接回 200，别让 onUnload 的 best-effort 停止打红日志。
+    if (!pm || !manager.peripheralModel) {
+        callback(resultWithCode(200), NO);
+        return;
+    }
     [pm veepooSDKTestHeartStart:NO testResult:nil];
     callback(resultWithCode(200), NO);
 }
