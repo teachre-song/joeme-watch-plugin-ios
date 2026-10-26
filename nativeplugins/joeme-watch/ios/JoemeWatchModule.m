@@ -310,6 +310,13 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
 - (void)stopBloodAnalysisSession;
 - (NSDictionary *)bloodAnalysisExtra:(VPBloodAnalysisResultModel *)model;
 - (BOOL)bloodAnalysisModelHasValue:(VPBloodAnalysisResultModel *)model;
+// ECG（第 13 节）：状态映射、结果字段、波形增量与轮询，块里回调、实现在后，先声明
+- (void)handleEcgState:(VPTestECGState)state progress:(NSUInteger)progress model:(VPECGTestDataModel *)model;
+- (NSDictionary *)ecgExtraFromModel:(VPECGTestDataModel *)model;
+- (void)mergeEcgReport:(NSMutableDictionary *)extra model:(VPECGTestDataModel *)model;
+- (void)flushEcgWave:(VPECGTestDataModel *)model force:(BOOL)force;
+- (void)startEcgWaveTimer;
+- (void)stopEcgWaveTimer;
 
 // 表盘（第 7 节实现）：内部拆分较多，先声明避免后向调用告警
 - (BOOL)isJLDevice;                                       // 平台判定（CPUType == 1）
@@ -2647,6 +2654,11 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.stressFinished = YES;
             self.stressDeviceStopped = YES;
             self.lastStressValue = 0;
+            // ECG 同理：停掉 100ms 波形轮询（断连后没有新点，定时器只会空转），
+            // 并把本轮置为已收尾，页面不会再收到半截 result。
+            [self stopEcgWaveTimer];
+            self.ecgFinished = YES;
+            self.ecgModel = nil;
             [self sendEvent:@"status" data:@{ @"mac": [self currentMac], @"connected": @NO }];
             break;
         case VPDeviceConnectStateConnect:
