@@ -424,6 +424,11 @@ static NSInteger leadProgressPercent(NSProgress *progress);
                    server:(NSArray *)server
                       pic:(NSDictionary *)pic
                       seq:(NSInteger)seq;
+// 表盘预热/缓存（见 dialPrepare 与 clearDialCache 的注释）
+- (BOOL)dialCacheFresh;
+- (void)clearDialCache;
+- (void)invalidateDialCache;
+- (void)finishDialChainFail:(NSString *)code seq:(NSInteger)seq;
 
 // 翻腕亮屏模型 -> raiseHand/nightRaise 事件载荷（setRaiseHand 与 setNightRaiseHand 共用）
 - (NSDictionary *)raiseHandEventFromModel:(VPDeviceRaiseHandModel *)rm;
@@ -9736,7 +9741,10 @@ UNI_EXPORT_METHOD(@selector(dialList:callback:))
         // 预热还在跑：登记「跑完把结果发给页面」，页面继续等事件即可。
         // 这里**不能**递增 dialSeq —— 否则正在飞的链路回调会因为 seq 不匹配全部作废，
         // 页面会一直等不到结果。
+        // 补一条 init：预热的 init 是在页面打开之前发的，页面收不到，不补的话它只会
+        // 停在默认的「正在获取表盘列表...」上，看不出设备正在初始化。
         self.dialEmitOnDone = YES;
+        [self sendEvent:@"dial" data:@{ @"platform": @"jl", @"init": @YES }];
         return;
     }
     self.dialEmitOnDone = YES;
