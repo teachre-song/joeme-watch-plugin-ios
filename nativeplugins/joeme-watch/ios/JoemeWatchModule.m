@@ -249,10 +249,20 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 最近一次主动下发 Exit 的时间；超出窗口就认为对端没回包，不再过滤 */
 @property (nonatomic, assign) NSTimeInterval pendingSelfExitAt;
 
-/** 表盘列表会话号：每次 dialList 自增，迟到的 BLE 回调与看门狗按它丢弃 */
+/** 表盘链路会话号：每次开链路（预热或页面首读）自增，迟到的 BLE 回调与看门狗按它丢弃 */
 @property (nonatomic, assign) NSInteger dialSeq;
 /** 表盘切换/传输会话号：每次推送自增，用于「完成回调」与「看门狗」互斥 */
 @property (nonatomic, assign) NSInteger dialSwitchSeq;
+/** JL 三组表盘载荷缓存（与 dialListJL 下发的事件同形）。
+    JL 的「开通知 → rcsp 认证 → 开 fatfs → 逐个读 describe」要好几秒且只能独占跑，
+    连接握手后预热一次存这里，页面进来直接命中，不再看到「正在初始化设备」。 */
+@property (nonatomic, strong) NSDictionary *dialPayloadCache;
+/** 缓存写入时间（CFAbsoluteTime）；超 TTL 后重跑一次链路 */
+@property (nonatomic, assign) NSTimeInterval dialPayloadCacheAt;
+/** 链路是否在跑：同一时刻只允许一条，JL 文件系统初始化不可并发 */
+@property (nonatomic, assign) BOOL dialChainRunning;
+/** 链路跑完时是否把载荷发给页面：预热时为 NO（页面可能还不存在），页面在等时为 YES */
+@property (nonatomic, assign) BOOL dialEmitOnDone;
 /** JL 表盘缓存：[{name, group:'sys'|'server'|'pic', index?}]。
     页面切盘只回传设备路径（/WATCH026），靠它反查分组与系统表盘序号。 */
 @property (nonatomic, strong) NSArray<NSDictionary *> *jlDialCache;
@@ -311,6 +321,16 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 - (VPSettingBaseFunctionSwitchType)baseFunctionTypeForKey:(NSString *)key;
 /** 从握手缓存推断全天血氧开关（读命令失败时用） */
 - (BOOL)allDayOxygenStateFromModel:(VPPeripheralModel *)model;
+/** 血氧自动监测：读/写各一份实现，设备页与血氧页共用（两个事件名都发） */
+- (void)doReadOxygenAutoDetect:(NSString *)event callback:(UniModuleKeepAliveCallback)callback;
+- (void)doSetOxygenAutoDetect:(BOOL)on event:(NSString *)event callback:(UniModuleKeepAliveCallback)callback;
+/** 血氧自动监测的统一回包（与 Android 同形，页面不分端） */
+- (NSMutableDictionary *)oxygenAutoPayloadOK:(BOOL)ok
+                                   openState:(NSInteger)openState
+                                      isOpen:(NSInteger)isOpen
+                                     summary:(NSString *)summary;
+/** 两个页面历史上各监听一个事件名，都发 —— 一边改完另一边立刻同步 */
+- (void)sendOxygenAutoEvents:(NSDictionary *)d primary:(NSString *)primary;
 /** 从握手缓存的开关字节表兜底取一个开关（读命令回 Failure 时用） */
 - (NSString *)switchByteStateForType:(VPSettingBaseFunctionSwitchType)type;
 /** 顶开天气能力位（见 weatherCapabilityDepth 注释）。成对使用，配对调用 exit */
@@ -3169,6 +3189,8 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.lastWeatherStatus = nil;
             self.weatherCapabilityDepth = 0;
             self.weatherCapabilitySaved = -1;
+            // 表盘载荷缓存同样属于「上一台设备」，且 JL 文件系统句柄会随断连失效
+            [self clearDialCache];
             // 断连时体温会话已不存在：撤掉看门狗并把本轮置为已收尾，
             // 否则 90 秒后那个 block 会对着已断开的设备补发停止命令、并给页面补一条 stop。
             [self cancelTemperatureWatchdog];
@@ -3551,44 +3573,21 @@ UNI_EXPORT_METHOD(@selector(setAutoMonitor:callback:))
 }
 
 /**
- 24 小时血氧自动检测开关。options: { on: bool }。
+ 24 小时血氧自动检测开关（**与血氧页的 setSpo2AutoDetect 是同一件事**）。
+ options: { on: bool }。
  iOS SDK：veepooSDKSettingAllDayOxygenTest:result:（VPSettingFunctionState：1=开 2=关）
- Android：settingSpo2hAutoDetect(...)；JS：joemeWatch.setAllDayOxygen(on)
- 事件：on('allDayOxygen') -> { ok, isOpen, data }
+          官方 Demo VPBaseFunctionRemindController 里「血氧自动检测」这一档就是基本开关 tag=1000
+          （VPSettingAutomaticOxygenTest），读写都走 veepooSDKSettingBaseFunctionType。
+ Android：settingSpo2hAutoDetect(AllSetSetting SPO2H_NIGHT_AUTO_DETECT, 22:00-08:00)
+ JS：joemeWatch.setAllDayOxygen(on)
+ 事件：on('allDayOxygen') + on('spo2Auto')（同一 payload）
  说明：关闭时设备回的是 VPFunctionCompleteClose，不能只认 Open/Complete 判成功
       （否则关血氧永远被当成失败）。
  */
 UNI_EXPORT_METHOD(@selector(setAllDayOxygen:callback:))
 - (void)setAllDayOxygen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if (![self checkReady:callback]) return;
     BOOL on = [options[@"on"] boolValue];
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    __weak typeof(self) weakSelf = self;
-    __block BOOL fired = NO;
-    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
-        if (fired) return;
-        fired = YES;
-        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
-                   || state == VPFunctionCompleteComplete);
-        // 写入确认生效后记一笔：oxygenAutoDetectType 是握手快照，
-        // 写完回读若还读快照会把界面拨回去（与 switchWriteOverride 同理）。
-        if (ok) weakSelf.allDayOxygenWritten = @(on);
-        NSMutableDictionary *d = [@{ @"ok": @(ok), @"isOpen": @(on) } mutableCopy];
-        if (ok) {
-            d[@"data"] = [NSString stringWithFormat:
-                          @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=%d}", on ? 1 : 0];
-        }
-        [weakSelf sendEvent:@"allDayOxygen" data:d];
-        // 设备拒绝/不支持时回 -1，页面 onSwitchChange 的 catch 会回滚开关并提示
-        callback(resultWithCode(ok ? 200 : -1), NO);
-    };
-    [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose) result:^(VPSettingFunctionCompleteState state) {
-        finish(state);
-    }];
-
-    // 设备不回包时 6 秒兜底：否则页面开关一直停在忙碌态（Promise 永不结束）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
+    [self doSetOxygenAutoDetect:on event:@"allDayOxygen" callback:callback];
 }
 
 /**
@@ -7907,86 +7906,23 @@ UNI_EXPORT_METHOD(@selector(setTemperatureUnit:callback:))
 }
 
 /**
- 读取血氧自动检测（夜间自动监测）开关。
- JS：joemeWatch.readSpo2AutoDetect() -> resolve + on('spo2Auto')
-   { isOpen:1|0|-1, openState, ok }
- 实现：读基本开关 VPSettingAutomaticOxygenTest（枚举值 1000 那一档，Demo 用 tag=1000）。
-      读不到时退回 peripheralModel.oxygenAutoDetectType（1=开，其它=未知）。
+ 读取血氧自动检测（血氧页 spo2.vue 用）—— 与 readAllDayOxygen 共用 doReadOxygenAutoDetect。
+ JS：joemeWatch.readSpo2AutoDetect() -> resolve + on('spo2Auto') + on('allDayOxygen')
  */
 UNI_EXPORT_METHOD(@selector(readSpo2AutoDetect:callback:))
 - (void)readSpo2AutoDetect:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if (![self checkReady:callback]) return;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
-    __weak typeof(self) weakSelf = self;
-
-    __block BOOL emitted = NO;
-    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
-        if (emitted) return;
-        emitted = YES;
-        NSInteger open = -1;
-        if (state == VPFunctionCompleteOpen) open = 1;
-        else if (state == VPFunctionCompleteClose) open = 0;
-        // 读失败时退到握手能力位：判据是 oxygenType（有无血氧功能），
-        // 不能再用 oxygenAutoDetectType > 0 —— 关掉血氧时它就是 0，
-        // 会被误判成「读不到」，血氧页开关永远停在初值。
-        else if (model.oxygenType != 0) {
-            open = [weakSelf allDayOxygenStateFromModel:model] ? 1 : 0;
-        }
-
-        NSDictionary *d = @{ @"isOpen": @(open), @"openState": @(state), @"ok": @(open >= 0) };
-        [weakSelf sendEvent:@"spo2Auto" data:d];
-        NSMutableDictionary *r = [resultWithCode(open >= 0 ? 200 : -1) mutableCopy];
-        [r addEntriesFromDictionary:d];
-        callback(r, NO);
-    };
-
-    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
-                            settingState:VPReadFunctionState
-                           completeBlock:^(VPSettingFunctionCompleteState state) {
-        finish(state);
-    }];
-
-    // 设备不回包时 6 秒兜底：否则页面 readAutoMonitor 的 Promise 永久 pending，
-    // 血氧页开关一直停在初值。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
+    [self doReadOxygenAutoDetect:@"spo2Auto" callback:callback];
 }
 
 /**
- 设置血氧自动检测开关。options: { on }
- JS：joemeWatch.setSpo2AutoDetect({on}) -> resolve + on('spo2Auto') { isOpen, openState, ok }
- 实现：veepooSDKSettingAllDayOxygenTest:（与 setAllDayOxygen 同一底层接口，
-       iOS 侧这个接口就是「全天/夜间血氧自动检测」的总开关）。
+ 设置血氧自动检测开关（血氧页 spo2.vue 用）—— 与 setAllDayOxygen 共用 doSetOxygenAutoDetect。
+ options: { on }
+ JS：joemeWatch.setSpo2AutoDetect({on}) -> resolve + on('spo2Auto') + on('allDayOxygen')
  */
 UNI_EXPORT_METHOD(@selector(setSpo2AutoDetect:callback:))
 - (void)setSpo2AutoDetect:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    if (![self checkReady:callback]) return;
     BOOL on = options[@"on"] ? [options[@"on"] boolValue] : YES;
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    __weak typeof(self) weakSelf = self;
-    __block BOOL fired = NO;
-    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
-        if (fired) return;
-        fired = YES;
-        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
-                   || state == VPFunctionCompleteComplete);
-        // 与 setAllDayOxygen 共用同一底层接口，也共用同一份写入覆盖值
-        if (ok) weakSelf.allDayOxygenWritten = @(on);
-        NSDictionary *d = @{ @"isOpen": @(on ? 1 : 0), @"openState": @(state), @"ok": @(ok) };
-        [weakSelf sendEvent:@"spo2Auto" data:d];
-        NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
-        [r addEntriesFromDictionary:d];
-        callback(r, NO);
-    };
-    [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose)
-                                  result:^(VPSettingFunctionCompleteState state) {
-        finish(state);
-    }];
-
-    // 设备不回包时 6 秒兜底：否则血氧页开关一直停在 busy 态（Promise 永不结束）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
+    [self doSetOxygenAutoDetect:on event:@"spo2Auto" callback:callback];
 }
 
 /**
@@ -8061,17 +7997,26 @@ UNI_EXPORT_METHOD(@selector(readAutoMeasureSetting:callback:))
 }
 
 /**
- 读取全天血氧自动检测开关（AllSetSetting 通道）。
- JS：joemeWatch.readAllDayOxygen() -> resolve + on('allDayOxygen')
-   { ok, isOpen, openState, data: "AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=1}" }
- 说明：iOS 没有 AllSetData 回包，这里读基本开关 VPSettingAutomaticOxygenTest，
-      与 readSpo2AutoDetect 共用同一能力位（只是事件名不同，页面各自监听）。
-      **data 必须给**：monitor.vue 的 applyAllDayOxygen 先找 'AllSetData' 前缀，
-      找不到直接 return，allDayOxygenLoaded 永远为 false，血氧自动监测开关就一直是灰的。
-      读取失败（无回包/设备不支持）时故意不带 data，让页面保持「未读到」而不是显示成「关」。
+ 读取全天血氧自动检测开关（设备页 monitor.vue 用）—— 与 readSpo2AutoDetect 共用
+ doReadOxygenAutoDetect，两个事件名都发。
+ JS：joemeWatch.readAllDayOxygen() -> resolve + on('allDayOxygen') + on('spo2Auto')
  */
 UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
 - (void)readAllDayOxygen:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self doReadOxygenAutoDetect:@"allDayOxygen" callback:callback];
+}
+
+/* ---------------- 血氧自动监测：设备页 / 血氧页共用的读写实现 ---------------- */
+
+/**
+ 读血氧自动监测开关。
+ 官方 Demo VPBaseFunctionRemindController 里「血氧自动检测」这一档：
+   读：veepooSDKSettingBaseFunctionType(VPSettingAutomaticOxygenTest, .readFunctionState)
+   显示：peripheralModel.oxygenType != 0 才有此功能；oxygenAutoDetectType == 1 为开
+ 读命令失败时退到握手快照（oxygenType / oxygenAutoDetectType），
+ 不能用 oxygenAutoDetectType > 0 判「有没有功能」—— 关掉时它就是 0。
+ */
+- (void)doReadOxygenAutoDetect:(NSString *)event callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
@@ -8081,35 +8026,31 @@ UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
     void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
         if (emitted) return;
         emitted = YES;
-        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose);
-        BOOL isOpen = (state == VPFunctionCompleteOpen);
-        // 读命令失败时退到握手能力位。⚠ 判据是 oxygenType（有无血氧功能），
-        // 不是 oxygenAutoDetectType > 0 —— 后者是**开关状态**，关掉时就是 0，
-        // 用 > 0 判断会把「血氧已关闭」误判成「读不到」，页面永远停在「尚未读取到设备设置」。
-        // 官方 Demo VPBaseFunctionRemindController：
-        //   isEnabled = peripheralModel.oxygenType != 0
-        //   isOn      = peripheralModel.oxygenAutoDetectType == 1   // 0/2 都算关
-        if (!ok && model.oxygenType != 0) {
-            isOpen = [self allDayOxygenStateFromModel:model];
-            ok = YES;
+        NSInteger open = -1;
+        BOOL fromSnapshot = NO;
+        if (state == VPFunctionCompleteOpen) open = 1;
+        else if (state == VPFunctionCompleteClose) open = 0;
+        else if (model.oxygenType != 0) {
+            // 读失败（Unknown/Failure）：退到握手快照，页面至少能显示设备上次的状态。
+            // 带 fallback:YES，页面/日志能看出这不是设备本次回报的值。
+            open = [weakSelf allDayOxygenStateFromModel:model] ? 1 : 0;
+            fromSnapshot = YES;
         }
-        NSMutableDictionary *d = [@{ @"ok": @(ok),
-                                     @"isOpen": @(isOpen),
-                                     @"openState": @(state) } mutableCopy];
-        if (ok) {
-            // Android AllSetData.toString() 同形：页面按 isOpen=1/0 判断开/关。
-            // 同时给 data 与 summary：Android 的读接口用的是 summary 键，
-            // 页面的 _payload 对两者都能兜住。
-            NSString *text = [NSString stringWithFormat:
-                              @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, isOpen=%d}", isOpen ? 1 : 0];
-            d[@"data"] = text;
-            d[@"summary"] = text;
-        } else if (state == VPFunctionCompleteUnknown || model.oxygenType == 0) {
-            // 设备明确没有血氧功能：标记 unsupported，页面据此提示「不支持」
-            // 而不是「尚未读取到设备设置」（后者会让用户一直重试）。
-            d[@"unsupported"] = @YES;
+        BOOL ok = (open >= 0);
+        NSMutableDictionary *d = [weakSelf oxygenAutoPayloadOK:ok
+                                                     openState:state
+                                                        isOpen:open
+                                                       summary:nil];
+        if (fromSnapshot) d[@"fallback"] = @YES;
+        if (!ok) {
+            if (model.oxygenType == 0) {
+                // 设备明确没有血氧功能：提示「不支持」，别让用户反复重试
+                d[@"unsupported"] = @YES;
+            } else {
+                d[@"timeout"] = @YES;
+            }
         }
-        [weakSelf sendEvent:@"allDayOxygen" data:d];
+        [weakSelf sendOxygenAutoEvents:d primary:event];
         NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
@@ -8121,9 +8062,97 @@ UNI_EXPORT_METHOD(@selector(readAllDayOxygen:callback:))
         finish(state);
     }];
 
-    // 设备不回包时 6 秒兜底：否则 JS Promise 永久 pending，页面开关一直是灰的
+    // 设备不回包时 6 秒兜底：否则 JS 的 Promise 永久 pending，页面开关一直是灰的
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
+}
+
+/**
+ 写血氧自动监测开关。
+ 官方 Demo（VPBaseFunctionRemindController）里「血氧自动检测」这一档：
+   veepooSDKSettingBaseFunctionType(VPSettingAutomaticOxygenTest, .openFunctionState/.closeFunctionState)
+ 读也是同一个基础开关（settingState = .readFunctionState），所以这里优先用基础开关，
+ 保持读写同一条通道。部分固件对基础开关的写回 UNKNOWN，再退回专用的
+ veepooSDKSettingAllDayOxygenTest（SDK 注释：24-hour oxygen test switch），两条路都试一次。
+ 只有 Open / Close / Complete 才算成功（关掉时回 Close，不能只认 Open）。
+ */
+- (void)doSetOxygenAutoDetect:(BOOL)on event:(NSString *)event callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL fired = NO;
+
+    void (^finish)(VPSettingFunctionCompleteState) = ^(VPSettingFunctionCompleteState state) {
+        if (fired) return;
+        fired = YES;
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
+                   || state == VPFunctionCompleteComplete);
+        // 写入确认生效后记一笔：oxygenAutoDetectType 是握手快照，
+        // 写完回读若还读快照会把界面拨回去（与 switchWriteOverride 同理）。
+        if (ok) weakSelf.allDayOxygenWritten = @(on);
+        NSMutableDictionary *d = [weakSelf oxygenAutoPayloadOK:ok
+                                                     openState:state
+                                                        isOpen:ok ? (on ? 1 : 0) : -1
+                                                       summary:nil];
+        [weakSelf sendOxygenAutoEvents:d primary:event];
+        // 设备拒绝/不支持时回 -1，页面 catch 会回滚开关并提示
+        NSMutableDictionary *r = [resultWithCode(ok ? 200 : -1) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
+    };
+
+    // ① 与 Demo 一致：走基础开关（读写同一通道）
+    [pm veepooSDKSettingBaseFunctionType:VPSettingAutomaticOxygenTest
+                            settingState:(on ? VPSettingFunctionOpen : VPSettingFunctionClose)
+                           completeBlock:^(VPSettingFunctionCompleteState state) {
+        BOOL ok = (state == VPFunctionCompleteOpen || state == VPFunctionCompleteClose
+                   || state == VPFunctionCompleteComplete);
+        if (ok || fired) { finish(state); return; }
+        // ② 基础开关明确不支持/失败：退回专用的全天血氧接口再试一次
+        [pm veepooSDKSettingAllDayOxygenTest:(on ? VPSettingFunctionOpen : VPSettingFunctionClose)
+                                      result:^(VPSettingFunctionCompleteState s2) {
+            finish(s2);
+        }];
+    }];
+
+    // 设备两条路都不回包时 6 秒兜底：否则页面开关一直停在忙碌态（Promise 永不结束）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(VPFunctionCompleteFailure); });
+}
+
+/**
+ 血氧自动监测的统一回包（与 Android spo2AutoPayload 同形）：
+   ok / isOpen(1 开 0 关 -1 未知) / openState / data + summary
+ data/summary 是 Android AllSetData.toString() 的同形文本：monitor.vue 历史上按它解析，
+ 血氧页读 isOpen。两个键都给，页面不用分端。
+ 失败（ok=NO）时不给 data/summary —— 页面据此保持「未读到」而不是显示成「关」。
+ */
+- (NSMutableDictionary *)oxygenAutoPayloadOK:(BOOL)ok
+                                   openState:(NSInteger)openState
+                                      isOpen:(NSInteger)isOpen
+                                     summary:(NSString *)summary {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"ok"] = @(ok);
+    d[@"isOpen"] = @(isOpen);
+    d[@"openState"] = @(openState);
+    if (ok) {
+        NSString *text = summary;
+        if (!text.length) {
+            text = [NSString stringWithFormat:
+                    @"AllSetData{type=SPO2H_NIGHT_AUTO_DETECT, startHour=22, startMinute=0, endHour=8, endMinute=0, oprate=0, openState=0, isOpen=%d}",
+                    isOpen > 0 ? 1 : 0];
+        }
+        d[@"data"] = text;
+        d[@"summary"] = text;
+    }
+    return d;
+}
+
+/** 两个页面历史上各监听一个事件名，都发 —— 一边改完另一边立刻同步 */
+- (void)sendOxygenAutoEvents:(NSDictionary *)d primary:(NSString *)primary {
+    NSString *other = [@"allDayOxygen" isEqualToString:primary] ? @"spo2Auto" : @"allDayOxygen";
+    [self sendEvent:primary data:d];
+    [self sendEvent:other data:d];
 }
 
 // ==================== 批次 4：通知 / 通讯录 / SOS ====================
@@ -9680,7 +9709,7 @@ UNI_EXPORT_METHOD(@selector(musicControl:callback:))
 
 /**
  读取表盘列表。
- JL：打开文件系统 → 取 WATCH* 文件名 → 逐个读 describe 元数据分类 → 三组下发
+ JL：优先命中 dialPrepare 写入的缓存；否则开文件系统 → 取 WATCH* 文件名 → 逐个读 describe 元数据分类 → 三组下发
      事件 on('dial')：{ platform:'jl', init } → { platform:'jl', ok, sys, server, pic?, list,
                       currentServerName, currentPicName }
  非 JL：能力头 → 设备内置默认表盘 → 当前屏幕样式
@@ -9693,32 +9722,110 @@ UNI_EXPORT_METHOD(@selector(dialList:callback:))
 - (void)dialList:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     callback(resultWithCode(200), NO);
-    self.dialSeq++;
-    if ([self isJLDevice]) {
-        [self dialListJL:self.dialSeq];
-    } else {
+    if (![self isJLDevice]) {
+        self.dialSeq++;
         [self dialListNordic:self.dialSeq];
+        return;
     }
+    // JL：有新鲜缓存直接下发（不递增 seq，避免打断正在跑的链路）
+    if ([self dialCacheFresh]) {
+        [self sendEvent:@"dial" data:[self.dialPayloadCache copy]];
+        return;
+    }
+    if (self.dialChainRunning) {
+        // 预热还在跑：登记「跑完把结果发给页面」，页面继续等事件即可。
+        // 这里**不能**递增 dialSeq —— 否则正在飞的链路回调会因为 seq 不匹配全部作废，
+        // 页面会一直等不到结果。
+        self.dialEmitOnDone = YES;
+        return;
+    }
+    self.dialEmitOnDone = YES;
+    [self dialListJL:++self.dialSeq];
+}
+
+/** 缓存是否仍可用（同一次连接内、未超时） */
+- (BOOL)dialCacheFresh {
+    return self.dialPayloadCache != nil
+        && (CFAbsoluteTimeGetCurrent() - self.dialPayloadCacheAt) < 300.0;   // 5 分钟
+}
+
+/** 重连/断连作废缓存：换了设备，或设备上的表盘可能在别处被改过 */
+- (void)clearDialCache {
+    self.dialPayloadCache = nil;
+    self.dialPayloadCacheAt = 0;
+    self.dialChainRunning = NO;
+    self.dialEmitOnDone = NO;
+    self.dialSeq++;   // 让还在飞的看门狗/迟到回调失效
+}
+
+/** 切盘/上传成功后作废载荷缓存：文件系统仍就绪，下次只需重读元数据 */
+- (void)invalidateDialCache {
+    self.dialPayloadCache = nil;
+    self.dialPayloadCacheAt = 0;
+}
+
+/**
+ 表盘预热：连接握手完成后调一次，把 JL 的「开通知 → rcsp 认证 → 开 fatfs →
+ 逐个读表盘元数据」提前跑完并缓存结果。
+ JS: joemeWatch.dialPrepare() -> resolve
+   { code, platform, cached? | pending? | started? | skipped? }
+ 由 JS 在握手冷却后显式调用，而不是连接回调里自动发起：握手刚结束时 SDK 内部
+ 还在读电量/同步时间，这时抢通道会把两边都拖到超时。
+ 结果不发 dial 事件（页面可能还不存在），只落在缓存里。
+ */
+UNI_EXPORT_METHOD(@selector(dialPrepare:callback:))
+- (void)dialPrepare:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSMutableDictionary *r = [resultWithCode(200) mutableCopy];
+
+    if (![self isJLDevice]) {
+        // 非 JL 的列表读的是握手快照 + 一次 readScreenStyle，毫秒级，没有可预热的东西
+        r[@"platform"] = [self dialPlatformName];
+        r[@"skipped"] = @YES;
+        callback(r, NO);
+        return;
+    }
+    r[@"platform"] = @"jl";
+
+    if ([self dialCacheFresh]) {
+        r[@"cached"] = @YES;
+        callback(r, NO);
+        return;
+    }
+    if (self.dialChainRunning) {
+        r[@"pending"] = @YES;
+        callback(r, NO);
+        return;
+    }
+    r[@"started"] = @YES;
+    callback(r, NO);
+
+    self.dialSeq++;
+    self.dialEmitOnDone = NO;    // 预热不发给页面：此刻可能还没有页面在监听
+    [self dialListJL:self.dialSeq];
 }
 
 // ---------- 表盘列表：JL ----------
 
 - (void)dialListJL:(NSInteger)seq {
     __weak typeof(self) weakSelf = self;
+    self.dialChainRunning = YES;
     // 开文件系统要先做 rcsp 认证 + 遍历 fatfs，几秒起步；先给页面一个可读状态
-    [self sendEvent:@"dial" data:@{ @"platform": @"jl", @"init": @YES }];
+    if (self.dialEmitOnDone) {
+        [self sendEvent:@"dial" data:@{ @"platform": @"jl", @"init": @YES }];
+    }
 
     // 开文件系统没有超时回调（SDK 只给 BOOL success），认证卡住时整页会一直转。
-    // 45s 上限 + seq/settled 判重：真拿到结果后这条不会再把页面拉回失败态。
+    // 60s 上限 + seq/settled 判重：真拿到结果后这条不会再把页面拉回失败态。
     __block BOOL settled = NO;
     void (^failOnce)(NSString *) = ^(NSString *code) {
         __strong typeof(weakSelf) self = weakSelf;
-        if (!self || seq != self.dialSeq) return;
+        if (!self) return;
         if (settled) return;
         settled = YES;
-        [self emitDialFail:code];
+        [self finishDialChainFail:code seq:seq];
     };
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         failOnce(@"timeout");
     });
@@ -9728,7 +9835,8 @@ UNI_EXPORT_METHOD(@selector(dialList:callback:))
     VPMarketDialManager *mgr = [VPMarketDialManager share];
     [mgr openJLDialFileSystemWithAction:^(BOOL success) {
         __strong typeof(weakSelf) self = weakSelf;
-        if (!self || seq != self.dialSeq) return;
+        if (!self) return;
+        if (seq != self.dialSeq) return;
         if (!success) {
             failOnce(@"jlFileSystemFail");
             return;
@@ -9750,6 +9858,15 @@ UNI_EXPORT_METHOD(@selector(dialList:callback:))
                                   seq:seq];
         }];
     }];
+}
+
+/** 链路失败收尾：清 running 标志，只在有人在等时下发失败（预热失败不打扰页面） */
+- (void)finishDialChainFail:(NSString *)code seq:(NSInteger)seq {
+    if (seq != self.dialSeq) return;
+    BOOL emit = self.dialEmitOnDone;
+    self.dialChainRunning = NO;
+    self.dialEmitOnDone = NO;
+    if (emit) [self emitDialFail:code];
 }
 
 /** 从文件系统清单里挑表盘文件：杰理的约定是 WATCH 前缀（大小写不敏感） */
@@ -9885,7 +10002,14 @@ UNI_EXPORT_METHOD(@selector(dialList:callback:))
     d[@"currentPicName"] = photoName;
     if (pic) d[@"pic"] = pic;
 
-    [self sendEvent:@"dial" data:d];
+    // 链路收尾：落载荷缓存（预热时页面可能不在，靠它让下次 dialList 秒回），
+    // 只有「有人在等」（页面首读或页面在预热期间进来）才下发事件。
+    BOOL emit = self.dialEmitOnDone;
+    self.dialPayloadCache = [d copy];
+    self.dialPayloadCacheAt = CFAbsoluteTimeGetCurrent();
+    self.dialChainRunning = NO;
+    self.dialEmitOnDone = NO;
+    if (emit) [self sendEvent:@"dial" data:d];
 }
 
 // ---------- 表盘列表：非 JL ----------
@@ -10065,6 +10189,8 @@ UNI_EXPORT_METHOD(@selector(setDial:callback:))
 
     [[VPDialTransformManager share] switchToCustomWatchWithName:name
                                                         success:^{
+        // 切盘后「使用中」标记变了，下次读列表必须重取（文件系统仍就绪，只需重读元数据）
+        [self invalidateDialCache];
         finish(@{ @"ok": @YES, @"complete": @YES, @"name": name });
     } failure:^{
         finish(@{ @"ok": @NO, @"fail": @YES, @"name": name, @"message": @"switchDialFailed" });
@@ -10331,6 +10457,8 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
                                          dialType:VPDeviceDialTypeMarket
                                            result:^(VPDeviceDialType dt, int screenStyle, BOOL ok) {
                 if (ok) {
+                    // 新装/换了表盘：列表内容与「使用中」都变了
+                    [self invalidateDialCache];
                     finish(@{ @"ok": @YES, @"complete": @YES, @"name": name ?: @"",
                               @"kind": @"server", @"screenType": @"MARKET",
                               @"screenIndex": @(screenStyle), @"style": @(screenStyle) });
