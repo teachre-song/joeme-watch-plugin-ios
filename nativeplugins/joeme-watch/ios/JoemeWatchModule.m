@@ -1448,21 +1448,25 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     [self stopCuffProgressTimer];
     self.bpCuffLocalProgress = 0;
     __weak typeof(self) weakSelf = self;
-    self.bpCuffProgressTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                               repeats:YES
-                                                                 block:^(NSTimer *t) {
-        typeof(self) s = weakSelf;
-        if (!s) { [t invalidate]; return; }
-        if (!s.bpCuffActive) { [t invalidate]; s.bpCuffProgressTimer = nil; return; }
-        if (s.bpCuffLocalProgress < 99) s.bpCuffLocalProgress += 2;
+    // 必须显式挂到主线程 RunLoop 的 common modes（与 ECG 波形定时器同一处理）：
+    //   - UNI_EXPORT_METHOD 的调用线程不保证有 RunLoop 在跑，scheduledTimer 挂在当前
+    //     RunLoop 上可能永远不触发；
+    //   - 默认模式在页面滚动时会被暂停，进度条会卡住。
+    NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [t invalidate]; return; }
+        if (!strongSelf.bpCuffActive) { [t invalidate]; strongSelf.bpCuffProgressTimer = nil; return; }
+        if (strongSelf.bpCuffLocalProgress < 99) strongSelf.bpCuffLocalProgress += 2;
 
-        NSMutableDictionary *d = [s measureEvent:@"bp" phase:@"testing" isDone:NO];
-        d[@"progress"] = @(s.bpCuffLocalProgress);
+        NSMutableDictionary *d = [strongSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
+        d[@"progress"] = @(strongSelf.bpCuffLocalProgress);
         d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
         d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
                          @"cuff": @YES, @"haveProgress": @YES };
-        [s sendEvent:@"measure" data:d];
+        [strongSelf sendEvent:@"measure" data:d];
     }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.bpCuffProgressTimer = timer;
 }
 
 - (void)stopCuffProgressTimer {
