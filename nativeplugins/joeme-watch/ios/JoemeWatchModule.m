@@ -66,10 +66,14 @@
 #import <VeepooBleSDK/VPPttValueModel.h>
 #import <VeepooBleSDK/VPDeviceSportWithGPSModel.h>
 #import <VeepooBleSDK/VPDeviceSportModel.h>
-// 微体检（公版）：iOS 上唯一能拿到「气泵血压」高低压的模型。
+// 微体检：iOS 上唯一能拿到「气泵血压」高低压的两套模型。
+//   VPHealthGlanceTestModel → 公版微体检（healthGlanceType == 2 或 4）
+//   VPMicroTestModel        → 定制微体检（healthGlanceType == 1）
 // VPPeripheralBaseManage.h 里有 import，但它是 SDK 内部头，模块直接写字段时最好自己再引一次。
 #import <VeepooBleSDK/VPHealthGlanceTestModel.h>
 #import <VeepooBleSDK/VPManualHealthGlanceModel.h>
+#import <VeepooBleSDK/VPMicroTestModel.h>
+#import <VeepooBleSDK/VPManualMeasurementMicroTestModel.h>
 
 /** 微体检终态枚举名（healthGlance 事件用；页面按名字判终态，不依赖数值顺序） */
 static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state);
@@ -99,13 +103,32 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 血压测量模式（0 通用 / 1 私人），start/stop 必须一致 */
 @property (nonatomic, assign) NSInteger bpTestMode;
 
-/** 本次 bp 测量是否走「微体检」通道（而不是光电 veepooSDKTestBloodStart）。
-    气泵机型（bloodPressureType 3/5）不能用光电接口，只能从微体检结果里取高低压；
-    stopMeasure('bp') 要靠它决定停哪个接口。 */
-@property (nonatomic, assign) BOOL bpViaHealthGlance;
+/** 本次 bp 测量走的是哪条通道：
+      0 = 光电 veepooSDKTestBloodStart
+      1 = 公版微体检 veepooSDK_healthGlanceTestStart
+      2 = 定制微体检 veepooSDKMicroTestOpenState
+    气泵机型不能用光电接口，只能从微体检结果里取高低压；
+    stopMeasure('bp') 靠它决定停哪个接口。 */
+@property (nonatomic, assign) NSInteger bpChannel;
 
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
+/** 本次血糖测量最后一次有效读数（上报值的 100 倍，0 = 还没测到）。
+    SDK 的 Close 帧 value 可能为 0（真值在 Open 帧里给过），
+    不兜底的话「测到 5.6 再结束」会被判成「测量结束（无有效值）」。
+    每次 startMeasure('bloodGlucose') 归零。 */
+@property (nonatomic, assign) NSUInteger lastBloodGlucoseValue;
+/** 本次血糖测量最后一次有效风险等级（1/2/3 = 低/中/高，0 = 设备没给）。
+    仅 bloodGlucoseType == 5 的机型才有效；Close 帧常带 0，与读数一起兜底。 */
+@property (nonatomic, assign) NSUInteger lastBloodGlucoseLevel;
+/** 本轮血糖是否已向 JS 发出终态。
+    progress>=100 的 Open 帧与紧随的 Close 帧都会收尾，我方补发 stop 后设备还会再回一帧
+    Close —— 没有这个标志就会重复发 result/stop，页面弹两次保存框。 */
+@property (nonatomic, assign) BOOL bloodGlucoseFinished;
+/** 本轮是否已向设备补发过停止命令，保证一次测量只发一次 */
+@property (nonatomic, assign) BOOL bloodGlucoseDeviceStopped;
+/** 血糖测量看门狗（可取消）。设备把命令吃掉时页面会永远停在「测量中」，到点自己收尾 */
+@property (nonatomic, copy) dispatch_block_t bloodGlucoseWatchdog;
 
 /** 本次血氧测量最后一次有效值（0 = 还没测到）。
     SDK 的 Over（正常结束 / 人为结束）回调里 oxygenValue 可能给 0，而真正的血氧值
@@ -316,8 +339,16 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 - (void)handleSpo2State:(VPTestOxygenState)state value:(NSUInteger)value;
 - (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
                  high:(NSUInteger)high low:(NSUInteger)low;
-// 气泵机型（bloodPressureType 3/5）走微体检测血压：实现在 handleBpState 之后
+// 气泵机型走微体检测血压（公版 / 定制两条）：实现在 handleBpState 之后
 - (void)startBpViaHealthGlance;
+- (void)startBpViaMicroTest;
+// 血糖（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
+- (void)handleBloodGlucoseState:(VPDeviceBloodGlucoseTestState)state progress:(NSUInteger)progress
+                          value:(NSUInteger)value level:(NSUInteger)level;
+- (void)armBloodGlucoseWatchdog;
+- (void)cancelBloodGlucoseWatchdog;
+- (void)stopBloodGlucoseSession;
+- (NSString *)bloodGlucoseStateName:(VPDeviceBloodGlucoseTestState)state;
 - (void)armTemperatureWatchdog;
 - (void)cancelTemperatureWatchdog;
 - (void)stopTemperatureSession;
@@ -384,6 +415,8 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 @interface VMutablePointsHolder : NSObject
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary *> *byKey;
 - (void)addPoint:(NSDictionary *)p;
+/** 取 (h,m) 那一格；不存在就建一个只带 h/m 的点并返回（血氧有数据、原始数据没有的窗口要用） */
+- (NSMutableDictionary *)ensureAtHour:(NSInteger)h minute:(NSInteger)m;
 - (void)mergeAtHour:(NSInteger)h minute:(NSInteger)m values:(NSDictionary *)values;
 - (NSArray<NSDictionary *> *)sortedPoints;
 @end
@@ -398,6 +431,18 @@ static NSInteger leadProgressPercent(NSProgress *progress);
     NSString *key = [NSString stringWithFormat:@"%02ld:%02ld",
                      (long)[p[@"h"] integerValue], (long)[p[@"m"] integerValue]];
     if (!self.byKey[key]) self.byKey[key] = [p mutableCopy];
+}
+- (NSMutableDictionary *)ensureAtHour:(NSInteger)h minute:(NSInteger)m {
+    if (h < 0 || h > 23 || m < 0 || m > 59) return nil;
+    NSString *key = [NSString stringWithFormat:@"%02ld:%02ld", (long)h, (long)m];
+    NSMutableDictionary *p = self.byKey[key];
+    if (!p) {
+        p = [NSMutableDictionary dictionary];
+        p[@"h"] = @(h);
+        p[@"m"] = @(m);
+        self.byKey[key] = p;
+    }
+    return p;
 }
 - (void)mergeAtHour:(NSInteger)h minute:(NSInteger)m values:(NSDictionary *)values {
     NSString *key = [NSString stringWithFormat:@"%02ld:%02ld", (long)h, (long)m];
@@ -949,38 +994,46 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleSpo2State:state value:oxygenValue];
         }];
     } else if ([type isEqualToString:@"bp"]) {
-        // iOS 只有光电血压（veepooSDKTestBloodStart），没有 Android 的 startDetectCuffBP
-        // 气囊实时通路。但机型分两类（反汇编 VPPeripheralModel.isSupportBPTest，0x1068）：
-        //   bloodPressureType ∈ {1,4} → 光电血压，veepooSDKTestBloodStart 可用
-        //   bloodPressureType ∈ {3,5} → **气泵血压**，veepooSDKTestBloodStart 会立刻回
-        //                              NoFunction（isSupportBPTest 恒 false）
-        // 气泵机型在 iOS 上唯一能测的方式是微体检（healthGlance），它的结果模型
-        // VPHealthGlanceTestModel 带 cuffBloodPressureHigh/Low。
-        // 所以这里按能力位自动分流，页面无感：on('measure', type='bp') 的字段完全一致。
+        // iOS 上没有 Android 的 startDetectCuffBP（气囊实时通路），血压只有三条可能的路，
+        // 由机型能力位决定（反汇编 VPPeripheralModel 确认判据）：
+        //
+        //   bloodPressureType ∈ {1,4}  → 光电血压，veepooSDKTestBloodStart 可用
+        //                                （isSupportBPTest 就是 `==1 || ==4`，0x1068）
+        //   bloodPressureType ∈ {3,5} 或 0 → 光电接口必回 NoFunction
+        //       此时只能走微体检，两种微体检按 healthGlanceType 区分：
+        //         healthGlanceType == 1 → 定制微体检 veepooSDKMicroTestOpenState
+        //                                 （该接口内部硬判 ==1，否则回 error 2000）
+        //         healthGlanceType == 2 / 4 → 公版 veepooSDK_healthGlanceTestStart
+        //                                 （内部无能力位判断，直接拼包）
+        //       两条微体检的结果模型都带收缩压/舒张压，公版还额外有专门的气泵字段
+        //       cuffBloodPressureHigh/Low。
+        // 统一包成 on('measure', type='bp')，页面无需感知走的是哪条。
         VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
-        // 判据用 SDK 自己的 isSupportBPTest（= bloodPressureType 1/4），它决定
-        // veepooSDKTestBloodStart 会不会直接回 NoFunction。只要它 false 就说明光电通路不可用
-        // （气泵机型 3/5、或能力位没解析出来的机型都落在这一类），此时若支持微体检就走微体检。
-        BOOL photoBpOk = info.isSupportBPTest;
-        // supportHealthGlanceTest 的 SDK 实现就是 healthGlanceType == 2 || == 4（反汇编 0x10d8）
-        BOOL hgOk = info.supportHealthGlanceTest;
-        if (!photoBpOk && hgOk) {
-            NSLog(@"[joeme-watch] bp: isSupportBPTest=NO (type=%lu), 改走微体检 healthGlance",
-                  (unsigned long)info.bloodPressureType);
+        NSUInteger bpType = info.bloodPressureType;
+        NSUInteger hgType = info.healthGlanceType;
+        BOOL photoBpOk = info.isSupportBPTest;   // 等价于 bpType == 1 || bpType == 4
+        NSLog(@"[joeme-watch] bp 路由: bloodPressureType=%lu healthGlanceType=%lu isSupportBPTest=%d",
+              (unsigned long)bpType, (unsigned long)hgType, (int)photoBpOk);
+
+        if (!photoBpOk && hgType == 1) {
+            NSLog(@"[joeme-watch] bp: 走定制微体检 veepooSDKMicroTestOpenState");
+            [self startBpViaMicroTest];
+            callback(resultWithCode(200), NO);
+            return;
+        }
+        if (!photoBpOk) {
+            // hgType 2/4 是公版微体检；为 0（能力位没解析出来）也照发 ——
+            // 公版接口内部不判能力位，直接拼包下发，让设备自己回答行不行，
+            // 比走光电接口被 SDK 硬拒（一个字节都不发）多一次机会。
+            NSLog(@"[joeme-watch] bp: 光电不可用(hgType=%lu)，走公版微体检 veepooSDK_healthGlanceTestStart",
+                  (unsigned long)hgType);
             [self startBpViaHealthGlance];
             callback(resultWithCode(200), NO);
             return;
         }
-        if (!photoBpOk && !hgOk) {
-            // 两条明确通路都没命中：**不拦**，让 SDK 自己回 NoFunction。
-            // 抢先拦会误伤「能力位解析时机未到」的机型（真不支持时 SDK 一样回 NoFunction，
-            // 结果相同但少了 SDK 侧的诊断信息），这里只打一行日志便于真机定位。
-            NSLog(@"[joeme-watch] bp: 能力位均未命中 bloodPressureType=%lu healthGlanceType=%lu，仍尝试光电通路",
-                  (unsigned long)info.bloodPressureType, (unsigned long)info.healthGlanceType);
-        }
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
-        self.bpViaHealthGlance = NO;
+        self.bpChannel = 0;   // 光电
         [pm veepooSDKTestBloodStart:YES
                            testMode:(NSUInteger)self.bpTestMode
                          testResult:^(VPTestBloodState state, NSUInteger progress,
@@ -1042,8 +1095,16 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleBreathState:state progress:progress value:value];
         }];
     } else if ([type isEqualToString:@"bloodGlucose"]) {
+        // 每次开始清上一轮的兜底值与终态标志，并挂上看门狗（设备吃掉命令时页面才不会停在「测量中」）。
+        // 不按 peripheralModel.bloodGlucoseType 提前拦截：握手能力位漏报是已知问题
+        // （README 里天气/血压/体温同款坑），不支持由 SDK 的 Unsupported 帧或看门狗收尾。
         BOOL personal = [options[@"personalMode"] boolValue];
         self.bloodGlucosePersonal = personal;
+        self.lastBloodGlucoseValue = 0;
+        self.lastBloodGlucoseLevel = 0;
+        self.bloodGlucoseFinished = NO;
+        self.bloodGlucoseDeviceStopped = NO;
+        [self armBloodGlucoseWatchdog];
         [pm veepooSDKTestBloodGlucoseStart:YES
                            isPersonalModel:personal
                                 testResult:^(VPDeviceBloodGlucoseTestState state, NSUInteger progress,
@@ -1255,7 +1316,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
    - 失败/中止：phase=failed/stop，message 带微体检原因
  */
 - (void)startBpViaHealthGlance {
-    self.bpViaHealthGlance = YES;
+    self.bpChannel = 1;   // 公版微体检
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
 
@@ -1289,7 +1350,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
                              @"viaHealthGlance": @YES, @"haveProgress": @NO };
             [weakSelf sendEvent:@"measure" data:d];
             [weakSelf endMeasuring];
-            weakSelf.bpViaHealthGlance = NO;
+            weakSelf.bpChannel = 0;
             return;
         }
         // 其余终态：Over/NoFunction/NotWear/Busy/LowPower/Failure/NotLead
@@ -1312,7 +1373,74 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
                          @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @NO };
         [weakSelf sendEvent:@"measure" data:d];
         [weakSelf endMeasuring];
-        weakSelf.bpViaHealthGlance = NO;
+        weakSelf.bpChannel = 0;
+    }];
+}
+
+/**
+ 定制微体检（healthGlanceType == 1 的机型）：veepooSDKMicroTestOpenState:...
+ 这是官方 Demo「微体检(定制项目)」用的接口，结果模型 VPMicroTestModel 带
+ systolicBloodPressure / diastolicBloodPressure —— 气泵机型在 iOS 上唯一能测的另一种方式。
+
+ 与公版 healthGlance 的差别（反汇编确认）：
+   - 定制接口内部先判 `peripheralModel.healthGlanceType == 1`，不等就回 error(code 2000)
+     并调 fail block —— 所以只有 type==1 才能走这条路；
+   - 公版接口内部不判能力位，直接拼包。
+   - 定制的成功回调是 (BOOL endState, VPMicroTestModel *)，没有「状态枚举」，
+     失败走独立 fail block（NSError），语义比公版更简单。
+
+ 事件：与公版那条完全一致 —— 只发 on('measure') { type:'bp', phase, progress, value,
+ extra.systolic/diastolic }，页面无需区分。
+ */
+- (void)startBpViaMicroTest {
+    self.bpChannel = 2;   // 定制微体检
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+
+    [pm veepooSDKMicroTestOpenState:YES
+                        andProgress:^(int progress) {
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
+        d[@"progress"] = @(MAX(0, MIN(100, progress)));
+        d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @YES };
+        [weakSelf sendEvent:@"measure" data:d];
+    } andFail:^(NSError *error) {
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"failed" isDone:YES];
+        d[@"progress"] = @0;
+        d[@"value"] = @0;
+        d[@"success"] = @NO;
+        d[@"message"] = error.localizedDescription.length
+            ? [NSString stringWithFormat:@"血压测量失败：%@", error.localizedDescription]
+            : @"血压测量失败";
+        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @NO };
+        [weakSelf sendEvent:@"measure" data:d];
+        [weakSelf endMeasuring];
+        weakSelf.bpChannel = 0;
+    } andSuccess:^(BOOL endState, VPMicroTestModel *model) {
+        // endState=YES 才是正常结束；NO 只表示本轮被中止（下面按无值处理）
+        NSUInteger sys = model ? (NSUInteger)MAX(0, model.systolicBloodPressure) : 0;
+        NSUInteger dia = model ? (NSUInteger)MAX(0, model.diastolicBloodPressure) : 0;
+        BOOL valid = endState && sys > 0 && dia > 0;
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
+                                                  phase:(valid ? @"result" : @"stop")
+                                                 isDone:YES];
+        d[@"progress"] = @(valid ? 100 : 0);
+        d[@"value"] = @(sys);
+        d[@"success"] = @(valid);
+        d[@"message"] = valid ? @"血压测量完成" : @"血压测量结束（无有效值）";
+        d[@"extra"] = @{ @"systolic": @(sys), @"diastolic": @(dia),
+                         @"model": @"public", @"cuff": @YES,
+                         @"viaHealthGlance": @YES, @"haveProgress": @NO };
+        [weakSelf sendEvent:@"measure" data:d];
+        [weakSelf endMeasuring];
+        weakSelf.bpChannel = 0;
+    } andHeartRate:^(int heartRate) {
+        // 测量中的瞬时心率：塞进当前测试帧的业务字段没有意义（页面不展示），
+        // 但保留回调，避免 SDK 因为 block 为 nil 而跳过整个成功回调链。
+    } andPPG:^(NSMutableArray *ppgArray) {
+        // PPG 原始采样：本页不需要（算法优化才用）
     }];
 }
 
@@ -1829,47 +1957,190 @@ static BOOL JoemeTempPhaseIsDone(NSString *phase) {
     if (isDone) [self endMeasuring];
 }
 
-/** 血糖：上报值是 100 倍，这里换算成 mmol/L；Open 期间回进度，Close 为正常结束 */
+/**
+ 血糖状态名（字符串枚举名，与 Android 的 EBloodGlucoseStatus/RiskLevel 口径区分开）。
+ 页面只需要「是不是终态 / 原因」，原始数值同时放在 stateCode 里便于排查。
+ */
+- (NSString *)bloodGlucoseStateName:(VPDeviceBloodGlucoseTestState)state {
+    switch (state) {
+        case VPDeviceBloodGlucoseTestStateUnsupported: return @"UNSUPPORT";
+        case VPDeviceBloodGlucoseTestStateOpen:        return @"BLOOD_GLUCOSE_OPEN";
+        case VPDeviceBloodGlucoseTestStateClose:       return @"BLOOD_GLUCOSE_CLOSE";
+        case VPDeviceBloodGlucoseTestStateLowPower:    return @"LOW_POWER";
+        case VPDeviceBloodGlucoseTestStateDeviceBusy:  return @"DEVICE_BUSY";
+        case VPDeviceBloodGlucoseTestStateNotWear:     return @"NOT_WEAR";
+        default:                                       return @"UNKNOWN";
+    }
+}
+
+/**
+ 血糖状态映射。
+
+ iOS 的 VPDeviceBloodGlucoseTestState 只有 6 个值，而且语义要自己补；
+ 官方 Demo（VPBloodGlucoseViewController）只把 Open 当进度、Close 当结束，
+ 四个真实故障都出在这套极简判定上（与体温/压力/血液成分是同一类问题）：
+
+ 1) **Close 帧的 value 经常是 0**。真正读数在 Open 帧里给过，不兜底的话
+    「测到 5.6 之后设备自己结束」会被判成「测量结束（无有效值）」，页面弹失败。
+    用 lastBloodGlucoseValue / lastBloodGlucoseLevel 兜（与血氧 lastSpo2Value 同一套做法）。
+ 2) **完成判据不能只看 Close**。部分固件 progress 到 100 后不再回 Close，页面会一直停在
+    「测量中」；所以 progress >= 100 也按结束处理，两条路都走。
+ 3) **收尾要补发停止**。设备侧状态机不复位，下一次测量会直接失败
+    （官方 Demo 是让用户手动再点一次开关，App 侧没有这个交互）。
+ 4) **终态会重复**。我们补发的 stop 会引出 Close，设备也可能重复回包，
+    没有 bloodGlucoseFinished 页面会弹两次保存框。
+
+ 风险等级只有 bloodGlucoseType == 5 的机型才有效，其余机型 level 恒为 0
+（头文件原文：The level parameters were only working for bloodGlucoseType == 5）。
+ */
 - (void)handleBloodGlucoseState:(VPDeviceBloodGlucoseTestState)state progress:(NSUInteger)progress
                           value:(NSUInteger)value level:(NSUInteger)level {
+    // 本轮最后一次有效读数 / 风险等级（Close 帧、无值帧靠它兜底）
+    if (value > 0) self.lastBloodGlucoseValue = value;
+    if (level > 0) self.lastBloodGlucoseLevel = level;
+
+    // 终态只发一次
+    if (self.bloodGlucoseFinished) return;
+
+    // 每来一帧就重置看门狗：慢设备不会被误判，真卡住也能收尾
+    [self armBloodGlucoseWatchdog];
+
     NSString *phase = @"testing";
-    BOOL isDone = NO, success = NO;
+    BOOL isDone = NO, success = NO, stopDevice = NO;
     NSString *message = @"血糖测量中";
+
     switch (state) {
-        case VPDeviceBloodGlucoseTestStateOpen:
+        case VPDeviceBloodGlucoseTestStateOpen: {
+            // Open 是唯一会带进度的帧；progress 到 100 说明设备这一轮已经算完了。
+            // 只在 progress >= 100 时收尾：Open + 小进度就是纯进度帧。
+            if (progress >= 100) {
+                BOOL hasValue = self.lastBloodGlucoseValue > 0;
+                phase = hasValue ? @"result" : @"stop";
+                isDone = YES; success = hasValue; stopDevice = YES;
+                message = hasValue ? @"血糖测量完成" : @"血糖测量结束（无有效值）";
+            }
             break;
-        case VPDeviceBloodGlucoseTestStateClose:
-            phase = value > 0 ? @"result" : @"stop";
-            isDone = YES;
-            success = value > 0;
-            message = success ? @"血糖测量完成" : @"血糖测量结束（无有效值）";
+        }
+        case VPDeviceBloodGlucoseTestStateClose: {
+            // 设备自己结束（也可能是我方 stop 的回帧）。有值就是正常结果，
+            // 没值才按「结束无结果」处理 —— 不能一律当 stop，否则永远看不到结果。
+            BOOL hasValue = self.lastBloodGlucoseValue > 0;
+            phase = hasValue ? @"result" : @"stop";
+            isDone = YES; success = hasValue;
+            message = hasValue ? @"血糖测量完成" : @"血糖测量结束（无有效值）";
             break;
+        }
         case VPDeviceBloodGlucoseTestStateUnsupported:
-            phase = @"failed"; isDone = YES; message = @"血糖测量失败：设备不支持该功能";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血糖测量失败：设备不支持该功能";
             break;
         case VPDeviceBloodGlucoseTestStateLowPower:
-            phase = @"failed"; isDone = YES; message = @"血糖测量失败：设备电量过低";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血糖测量失败：设备电量过低";
             break;
         case VPDeviceBloodGlucoseTestStateDeviceBusy:
-            phase = @"failed"; isDone = YES; message = @"血糖测量失败：设备正忙";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血糖测量失败：设备正忙";
             break;
         case VPDeviceBloodGlucoseTestStateNotWear:
-            phase = @"failed"; isDone = YES; message = @"血糖测量失败：佩戴检测未通过";
+            phase = @"failed"; isDone = YES; stopDevice = YES;
+            message = @"血糖测量失败：佩戴检测未通过";
             break;
         default:
-            break;
+            // 未知状态不打扰页面（保持「测量中」，等后续帧）
+            return;
     }
+
+    if (isDone) {
+        self.bloodGlucoseFinished = YES;
+        [self cancelBloodGlucoseWatchdog];
+    }
+
     NSMutableDictionary *d = [self measureEvent:@"bloodGlucose" phase:phase isDone:isDone];
-    d[@"progress"] = @(progress);
-    d[@"value"] = @(value / 100.0);                 // mmol/L
+    NSInteger pct = MIN(MAX((NSInteger)progress, (NSInteger)0), (NSInteger)100);
+    // 出结果才把进度补满；stop / failed 一律归 0，页面不会在失败态画出一个满格圆环
+    d[@"progress"] = @([phase isEqualToString:@"result"] ? 100 : ([phase isEqualToString:@"testing"] ? pct : 0));
+    d[@"value"] = @(self.lastBloodGlucoseValue / 100.0);   // mmol/L
     d[@"success"] = @(success);
-    d[@"state"] = @(state);
+    d[@"state"] = [self bloodGlucoseStateName:state];      // 与体温/压力同口径：字符串枚举名
+    d[@"stateCode"] = @(state);
     d[@"message"] = message;
-    d[@"extra"] = @{ @"rawValue": @(value),
-                     @"riskLevel": @(level),
-                     @"model": self.bloodGlucosePersonal ? @"private" : @"public" };
+    d[@"extra"] = @{ @"rawValue": @(self.lastBloodGlucoseValue),
+                     // 风险等级：0 无 / 1 低 / 2 中 / 3 高（仅 bloodGlucoseType==5 有效）
+                     @"riskLevel": @(self.lastBloodGlucoseLevel),
+                     @"model": self.bloodGlucosePersonal ? @"private" : @"public",
+                     // 进度是否来自设备（Open 帧才有），便于页面区分「设备真实进度」与「按时间估算」
+                     @"haveProgress": @(state == VPDeviceBloodGlucoseTestStateOpen && progress > 0) };
     [self sendEvent:@"measure" data:d];
-    if (isDone) [self endMeasuring];
+
+    if (isDone) {
+        [self endMeasuring];
+        if (stopDevice) [self stopBloodGlucoseSession];
+    }
+}
+
+/**
+ 血糖测量看门狗：一次手动测量官方 UI 约 30~60 秒，iOS 上超过 90 秒没有任何帧就说明
+ 设备把命令吃掉了（不支持 / 状态机没复位 / 被别的测量占着）。到点收尾，页面才不会
+ 永远停在「测量中」。
+ 收尾口径：本轮已拿到过读数 → 当 result 交出去（与 Over 帧同一套兜底，「进度到 100
+ 但设备没再回结束帧」不该把有效结果判成失败）；一个值都没拿到 → failed。
+ 每来一帧都重新计时：慢设备不会被误判，真卡住也不会无限等。
+ */
+- (void)armBloodGlucoseWatchdog {
+    [self cancelBloodGlucoseWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t blk = dispatch_block_create(0, ^{
+        JoemeWatchModule *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.bloodGlucoseFinished) return;
+        // 本 block 就是当前看门狗，先摘掉引用再收尾，别在 stopBloodGlucoseSession
+        // 里对自己再 cancel 一次
+        strongSelf.bloodGlucoseWatchdog = nil;
+        strongSelf.bloodGlucoseFinished = YES;
+        BOOL hasValue = strongSelf.lastBloodGlucoseValue > 0;
+        NSMutableDictionary *d = [strongSelf measureEvent:@"bloodGlucose"
+                                                    phase:(hasValue ? @"result" : @"failed")
+                                                   isDone:YES];
+        d[@"progress"] = @(hasValue ? 100 : 0);
+        d[@"value"] = @(strongSelf.lastBloodGlucoseValue / 100.0);
+        d[@"success"] = @(hasValue);
+        d[@"state"] = hasValue ? @"TIMEOUT_RESULT" : @"TIMEOUT";
+        d[@"message"] = hasValue ? @"血糖测量完成" : @"血糖测量超时：设备未响应，请重试";
+        d[@"extra"] = @{ @"rawValue": @(strongSelf.lastBloodGlucoseValue),
+                         @"riskLevel": @(strongSelf.lastBloodGlucoseLevel),
+                         @"model": strongSelf.bloodGlucosePersonal ? @"private" : @"public",
+                         @"timeout": @YES };
+        [strongSelf sendEvent:@"measure" data:d];
+        [strongSelf endMeasuring];
+        [strongSelf stopBloodGlucoseSession];
+    });
+    self.bloodGlucoseWatchdog = blk;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), blk);
+}
+
+/** 取消血糖看门狗（终态、手动停止、开始新一轮时都要调） */
+- (void)cancelBloodGlucoseWatchdog {
+    if (self.bloodGlucoseWatchdog) {
+        dispatch_block_cancel(self.bloodGlucoseWatchdog);
+        self.bloodGlucoseWatchdog = nil;
+    }
+}
+
+/**
+ 释放设备侧血糖会话（官方 Demo 的开关复位行为）。
+ 幂等：同一轮只下发一次；回调换成空 block，避免自己补发的 stop 引出 Close 再回灌页面。
+ */
+- (void)stopBloodGlucoseSession {
+    [self cancelBloodGlucoseWatchdog];
+    if (self.bloodGlucoseDeviceStopped) return;
+    self.bloodGlucoseDeviceStopped = YES;
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    [pm veepooSDKTestBloodGlucoseStart:NO
+                       isPersonalModel:self.bloodGlucosePersonal
+                            testResult:^(VPDeviceBloodGlucoseTestState state, NSUInteger progress,
+                                         NSUInteger value, NSUInteger level) {}];
 }
 
 /**
@@ -2718,13 +2989,22 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
     if ([type isEqualToString:@"spo2"]) {
         [pm veepooSDKTestOxygenStart:NO testResult:^(VPTestOxygenState state, NSUInteger value) {}];
     } else if ([type isEqualToString:@"bp"]) {
-        if (self.bpViaHealthGlance) {
-            // 气泵机型：本次走的是微体检，停的也得是微体检
+        if (self.bpChannel == 2) {
+            // 定制微体检：同一个接口传 NO 停止（五个 block 都可以给 nil）
+            [pm veepooSDKMicroTestOpenState:NO
+                                andProgress:nil
+                                   andFail:^(NSError *error) {}
+                                 andSuccess:^(BOOL endState, VPMicroTestModel *model) {}
+                                andHeartRate:^(int heartRate) {}
+                                    andPPG:^(NSMutableArray *ppgArray) {}];
+            self.bpChannel = 0;
+        } else if (self.bpChannel == 1) {
+            // 公版微体检
             [pm veepooSDK_healthGlanceTestStart:NO
                                     andProgress:nil
                                       andResult:^(VPDeviceHealthGlanceState state,
                                                   VPHealthGlanceTestModel *model) {}];
-            self.bpViaHealthGlance = NO;
+            self.bpChannel = 0;
         } else {
             [pm veepooSDKTestBloodStart:NO
                                testMode:(NSUInteger)self.bpTestMode
@@ -2769,10 +3049,23 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
                                  testResult:^(VPTestBreathingRateState state, NSUInteger progress,
                                               NSUInteger value) {}];
     } else if ([type isEqualToString:@"bloodGlucose"]) {
+        // 与血氧同口径：**不**把本轮提前置成已收尾。iOS 的进度帧不一定带读数，真值往往
+        // 就挂在我们下发停止所引出的那帧 Close 上（原生用 lastBloodGlucoseValue 兜底）；
+        // 提前置 bloodGlucoseFinished 会把这条 result 丢掉，表现为「测到一半点停止就白测」。
+        // ⚠ 这里的回调**不能**用空 block：SDK 把 testResult 存成实例属性，每次调用都会覆盖，
+        //   传空 block 的话设备随后回的 Close（带兜底读数与风险等级）就进了黑洞，
+        //   页面只能拿到自己本地那份值、永远没有风险等级。原样转发给 handleBloodGlucoseState。
+        // 页面侧 _bgManualStop 已置位，所以这条 result 只停在结果页、不再弹保存确认。
+        // bloodGlucoseDeviceStopped 置位：停止命令已经由这里下发，终态处理里不必再补一次。
+        self.bloodGlucoseDeviceStopped = YES;
+        [self cancelBloodGlucoseWatchdog];
+        __weak typeof(self) weakSelf = self;
         [pm veepooSDKTestBloodGlucoseStart:NO
                            isPersonalModel:self.bloodGlucosePersonal
                                 testResult:^(VPDeviceBloodGlucoseTestState state, NSUInteger progress,
-                                             NSUInteger value, NSUInteger level) {}];
+                                             NSUInteger value, NSUInteger level) {
+            [weakSelf handleBloodGlucoseState:state progress:progress value:value level:level];
+        }];
     } else if ([type isEqualToString:@"bodyComposition"]) {
         // 用户手动停止：先置终态标志，设备回的那帧 Over 就不会再回灌一条 result，
         // 页面的 stop 已按「有完整结果→详情页 / 无结果→待机」收过尾了。
@@ -2889,6 +3182,12 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
             self.bodyCompositionFinished = YES;
             self.bodyCompositionDeviceStopped = YES;
             self.lastBodyCompositionModel = nil;
+            // 血糖同理：撤看门狗 + 置已收尾，别让 90 秒后的 block 对着断开的设备补发停止
+            [self cancelBloodGlucoseWatchdog];
+            self.bloodGlucoseFinished = YES;
+            self.bloodGlucoseDeviceStopped = YES;
+            self.lastBloodGlucoseValue = 0;
+            self.lastBloodGlucoseLevel = 0;
             // ECG 同理：停掉 100ms 波形轮询（断连后没有新点，定时器只会空转），
             // 并把本轮置为已收尾，页面不会再收到半截 result。
             [self stopEcgWaveTimer];
@@ -6737,24 +7036,52 @@ UNI_EXPORT_METHOD(@selector(readActivityByDay:callback:))
         [holder addPoint:[weakSelf activityPointFromDict:src]];
     }
 
-    // ── (2) 血氧：每分钟一条 → 按 5 分钟窗口聚合进 oxygens 数组 ──
+    // ── (2) 血氧：每分钟一条 → 按 5 分钟窗口聚合 ──
+    // 血氧记录里除了 OxygenValue 还带 5 组衍生指标（VPApneaResultKey / VPIsHypoxiaKey /
+    // VPHypoxiaTimeKey / VPCardiacLoadKey / VPRespirationRateKey），血氧页的 4 个子指标
+    // （呼吸暂停 / 呼吸率 / 低氧时间 / 心脏负荷）与 OSAHS 分级全靠它们。以前这里只搬了
+    // OxygenValue，iOS 上那 4 个格子永远是 '--' —— 与 Android OriginData3 的
+    // resRates/hypoxiaTimes/cardiacLoads/apneaResults/isHypoxias 是同一批字段。
     NSArray *oxygenArr = [VPDataBaseOperation veepooSDKGetDeviceOxygenDataWithDate:dateStr andTableID:mac];
     for (NSDictionary *d in oxygenArr) {
         if (![d isKindOfClass:[NSDictionary class]]) continue;
         NSInteger h = 0, m = 0;
         JoemeTimeOfDict(d, &h, &m);
         NSInteger wm = m - m % 5;
-        NSString *key = [NSString stringWithFormat:@"%02ld:%02ld", (long)h, (long)wm];
-        NSMutableDictionary *p = holder.byKey[key];
+        NSMutableDictionary *p = [holder ensureAtHour:h minute:wm];
         if (!p) continue;
+
         double ov = JoemeDouble(JoemeFirstValue(d, @[ @"OxygenValue", @"oxygenValue" ]));
-        if (ov <= 0) continue;
-        NSMutableArray *arr = p[@"oxygens"];
-        if (![arr isKindOfClass:[NSMutableArray class]]) {
-            arr = [NSMutableArray array];
-            p[@"oxygens"] = arr;
+        if (ov > 0) {
+            NSMutableArray *arr = p[@"oxygens"];
+            if (![arr isKindOfClass:[NSMutableArray class]]) {
+                arr = [NSMutableArray array];
+                p[@"oxygens"] = arr;
+            }
+            [arr addObject:@(ov)];
         }
-        [arr addObject:@(ov)];
+
+        // 衍生指标：键名对齐 Android 的 OriginData3 数组（页面/spo2-stats 只认这一套）。
+        // 设备没给这个字段（老固件/基础机型）时不建数组，别用 0 伪造 —— isHypoxias 的 0
+        // 是「无低氧」这种有效语义，凭空补 0 会让 OSAHS 分级显示成「正常」。
+        NSArray<NSArray<NSString *> *> *keyGroups = @[
+            @[ @"resRates", @"RespirationRate", @"respirationRate" ],
+            @[ @"hypoxiaTimes", @"HypoxiaTime", @"hypoxiaTime" ],
+            @[ @"cardiacLoads", @"CardiacLoad", @"cardiacLoad" ],
+            @[ @"apneaResults", @"ApneaResult", @"apneaResult" ],
+            @[ @"isHypoxias", @"IsHypoxia", @"isHypoxia" ]
+        ];
+        for (NSArray<NSString *> *group in keyGroups) {
+            id raw = JoemeFirstValue(d, [group subarrayWithRange:NSMakeRange(1, group.count - 1)]);
+            if (raw == nil) continue;
+            NSString *target = group.firstObject;
+            NSMutableArray *arr = p[target];
+            if (![arr isKindOfClass:[NSMutableArray class]]) {
+                arr = [NSMutableArray array];
+                p[target] = arr;
+            }
+            [arr addObject:@(JoemeInt(raw))];
+        }
     }
 
     // ── (3) 体温/体表温度：每 5 分钟一条（value=体温℃, originalValue=体表温度℃）──
@@ -10439,8 +10766,15 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
         d[@"isOpen"] = @(m ? m.open : NO);
+        // 多校准能力：SDK 的 Demo 判定是 bloodGlucoseType ∈ {4,5,7}（VPBloodGlucoseViewController）。
+        // 页面据此决定「私人模式」入口是否可用；能力位漏报时不硬拦（命令能否生效以回包为准）。
+        VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
+        NSUInteger gtype = info ? info.bloodGlucoseType : 0;
+        d[@"supported"] = @(gtype == 4 || gtype == 5 || gtype == 7 || success);
+        d[@"bloodGlucoseType"] = @(gtype);
         if (m) {
-            // 六餐点：模型没给的项回 0（页面按 >0 判断是否已填）
+            // 六餐点：模型没给的项回 0（页面按 >0 判断是否已填）；
+            // 时间同时给分钟值（*BeforeTime / *AfterTime），页面可据此回填时间不丢。
             VPMultiBloodGlucoseItemModel *items[6] = {
                 m.beforeBreakfast, m.afterBreakfast, m.beforeLunch,
                 m.afterLunch, m.beforeDinner, m.afterDinner
@@ -10452,6 +10786,8 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
                 VPMultiBloodGlucoseItemModel *it = items[i];
                 double v = it ? it.value / 100.0 : 0;
                 d[keys[i]] = @(v);
+                // 分钟值：SDK 没有现成的「分钟」字段，用 hour*60+minute 拼，-1 表示该项没设置
+                d[[keys[i] stringByAppendingString:@"Time"]] = @(it ? (NSInteger)it.hour * 60 + it.minute : -1);
                 [summary appendFormat:@"%@=%02u:%02u/%.2f%@",
                  keys[i], it ? it.hour : 0, it ? it.minute : 0, v, i == 5 ? @"" : @", "];
             }
@@ -10470,6 +10806,100 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
     }];
 
     // 设备不回包时 6 秒兜底，否则 JS Promise 永久 pending
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(NO, nil); });
+}
+
+/** 分钟(0~1439) -> 模型项；value 是 mmol/L，模型要 ×100 的整数（[3.00,15.00] -> [300,1500]） */
+static VPMultiBloodGlucoseItemModel *JoemeBgItem(NSInteger minutes, double mmol) {
+    NSInteger mm = MIN(MAX(minutes, (NSInteger)0), (NSInteger)1439);
+    // 模型内部按 uint16 存，超范围会被截断成乱值；这里按头文件区间 [300,1500] 夹紧
+    NSInteger raw = (NSInteger)llround(mmol * 100.0);
+    raw = MIN(MAX(raw, (NSInteger)300), (NSInteger)1500);
+    return [[VPMultiBloodGlucoseItemModel alloc] initWithHour:(uint8_t)(mm / 60)
+                                                       minute:(uint8_t)(mm % 60)
+                                                        value:(uint16_t)raw];
+}
+
+/**
+ 写入血糖多校准（三餐餐前/餐后 + 开关），即官方「私人模式」的校准数据。
+ options: { isOpen, breakfastBefore/After, lunchBefore/After, dinnerBefore/After,
+            breakfastBeforeTime/AfterTime, lunch*, dinner* }（时间单位分钟，缺省用官方默认时刻）
+ iOS SDK：veepooSDKBloodGlucoseMultiPersonalWithOpCode:model:result:（opCode=1 设置）
+ Android：settingMultipleCalibrationBGValue；JS：joemeWatch.setGlucoseCalibration({...})
+ 事件：on('glucoseCalibSet') -> { ok, isOpen, message? }
+
+ ⚠ 与「单点校准」veepooSDKBloodGlucosePersonalWithOpCode:value:open:result: **互斥**
+   （头文件原文），多校准机型只能走这条；页面只提供多校准这一套。
+ */
+UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
+- (void)setGlucoseCalibration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    if (![self checkReady:callback]) return;
+    NSDictionary *o = options ?: @{};
+    BOOL isOpen = o[@"isOpen"] ? [o[@"isOpen"] boolValue] : NO;
+
+    // 时间：缺省用官方 Demo 的 08:00/09:00、12:00/13:10、18:00/19:00
+    NSArray<NSNumber *> *defTimes = @[ @480, @540, @720, @790, @1080, @1140 ];
+    NSArray<NSString *> *keys = @[ @"breakfastBefore", @"breakfastAfter", @"lunchBefore",
+                                   @"lunchAfter", @"dinnerBefore", @"dinnerAfter" ];
+    NSMutableArray<VPMultiBloodGlucoseItemModel *> *items = [NSMutableArray arrayWithCapacity:6];
+    for (NSInteger i = 0; i < 6; i++) {
+        NSString *key = keys[i];
+        double mmol = o[key] ? [o[key] doubleValue] : 0;
+        NSInteger mins = o[[key stringByAppendingString:@"Time"]]
+                ? [o[[key stringByAppendingString:@"Time"]] integerValue] : defTimes[i].integerValue;
+        [items addObject:JoemeBgItem(mins, mmol)];
+    }
+
+    // 官方校验：同一餐「餐前时间 < 餐后时间」「餐前值 < 餐后值」；整餐都没填时跳过（只切开关）
+    NSArray<NSString *> *mealNames = @[ @"早餐", @"午餐", @"晚餐" ];
+    for (NSInteger m = 0; m < 3; m++) {
+        double bv = o[keys[m * 2]] ? [o[keys[m * 2]] doubleValue] : 0;
+        double av = o[keys[m * 2 + 1]] ? [o[keys[m * 2 + 1]] doubleValue] : 0;
+        if (bv <= 0 && av <= 0) continue;
+        VPMultiBloodGlucoseItemModel *bItem = items[m * 2];
+        VPMultiBloodGlucoseItemModel *aItem = items[m * 2 + 1];
+        NSInteger bt = (NSInteger)bItem.hour * 60 + bItem.minute;
+        NSInteger at = (NSInteger)aItem.hour * 60 + aItem.minute;
+        if (bt >= at) {
+            callback(@{ @"code": @(-1), @"message": [NSString stringWithFormat:@"%@：餐前时间不能晚于餐后时间", mealNames[m]] }, NO);
+            return;
+        }
+        if (bv >= av) {
+            callback(@{ @"code": @(-1), @"message": [NSString stringWithFormat:@"%@：餐前血糖必须小于餐后血糖", mealNames[m]] }, NO);
+            return;
+        }
+    }
+
+    VPMultiBloodGlucoseModel *model = [[VPMultiBloodGlucoseModel alloc] init];
+    model.open = isOpen;
+    model.beforeBreakfast = items[0];
+    model.afterBreakfast = items[1];
+    model.beforeLunch = items[2];
+    model.afterLunch = items[3];
+    model.beforeDinner = items[4];
+    model.afterDinner = items[5];
+
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL fired = NO;
+    void (^finish)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        if (fired) return;
+        fired = YES;
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"ok"] = @(success);
+        d[@"isOpen"] = @(m ? m.open : isOpen);
+        if (!success) d[@"message"] = @"写入血糖校准失败";
+        [weakSelf sendEvent:@"glucoseCalibSet" data:d];
+        NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
+        [r addEntriesFromDictionary:d];
+        callback(r, NO);
+    };
+    [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:1 model:model result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        finish(success, m);
+    }];
+
+    // 设备不回包时 6 秒兜底，否则页面保存按钮会一直转圈
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ finish(NO, nil); });
 }
