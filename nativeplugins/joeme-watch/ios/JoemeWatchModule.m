@@ -105,11 +105,15 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 
 /** 本次 bp 测量走的是哪条通道：
       0 = 光电 veepooSDKTestBloodStart（testMode 0/1）
-      3 = 气泵（cuff）：同样走 veepooSDKTestBloodStart，但 testMode 传 5
+      5 = 气泵（cuff）：同样走 veepooSDKTestBloodStart，但 testMode 传 5
     气泵机型（bloodPressureType 3/5）的 isSupportBPTest 恒为 false，SDK 会直接拦截不发包，
     所以调用前后要把 bloodPressureType 临时顶成 1（与 weatherCapability 同一套路）。
     stopMeasure('bp') 靠它决定停哪个接口、以及要不要再取一次手动记录。 */
 @property (nonatomic, assign) NSInteger bpChannel;
+
+/** 本轮是否是气泵测量。与 bpChannel 分开存：stopMeasure 会把 bpChannel 清 0，
+    但设备随后仍可能补一帧终态回调，那时还得按气泵语义处理（不能当成光电）。 */
+@property (nonatomic, assign) BOOL bpCuffActive;
 
 /** 气泵测量的发起时刻（秒级），用于从设备手动记录里挑出本次结果 */
 @property (nonatomic, assign) NSTimeInterval bpCuffStartTs;
@@ -119,6 +123,14 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 气泵通道的能力位改写（成对使用）：见 bpChannel 注释 */
 @property (nonatomic, assign) NSInteger bpPhotoCapabilityDepth;
 @property (nonatomic, assign) NSUInteger bpPhotoCapabilitySaved;
+
+/** 气泵测量的本地进度（0~100）。
+    SDK 的气泵帧字段偏移与它自己的解析器不匹配（byte5 是它判「有没有进度」的闸，
+    气泵帧那个字节通常为 0 → 整帧被丢弃），所以测量中拿不到任何回调，
+    页面上的数字会从头到尾不动。这里用 55 秒匀速推进，回调若真来了以设备为准。 */
+@property (nonatomic, assign) NSInteger bpCuffLocalProgress;
+/** 本地进度定时器（气泵通道专用） */
+@property (nonatomic, strong) NSTimer *bpCuffProgressTimer;
 
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
@@ -374,6 +386,9 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 气泵测量结束后，从设备手动记录里取本次结果 */
 - (void)fetchCuffBpResult;
 - (void)readLatestCuffBpSince:(NSTimeInterval)since retry:(BOOL)retry;
+/** 气泵通道的本地进度推进（SDK 不回进度帧时用，见 bpCuffLocalProgress 注释） */
+- (void)startCuffProgressTimer;
+- (void)stopCuffProgressTimer;
 // 血糖（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
 - (void)handleBloodGlucoseState:(VPDeviceBloodGlucoseTestState)state progress:(NSUInteger)progress
                           value:(NSUInteger)value level:(NSUInteger)level;
@@ -990,6 +1005,7 @@ static NSString *JoemeHealthGlanceStateName(VPDeviceHealthGlanceState state) {
 
 /** 一次测量结束，释放占用 */
 - (void)endMeasuring {
+    [self stopCuffProgressTimer];
     self.measuringType = nil;
 }
 
@@ -1055,6 +1071,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
         self.bpChannel = cuffBp ? 5 : 0;
+        self.bpCuffActive = cuffBp;
         self.bpCuffFetched = NO;
 
         if (cuffBp) {
@@ -1071,6 +1088,9 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         } @finally {
             if (cuffBp) [self exitBpPhotoCapability];
         }
+        // 气泵通道 SDK 基本不回进度帧（字段偏移对不上，整帧被它自己丢掉），
+        // 本地起一条 55 秒匀速进度，否则页面数字从头到尾不动。
+        if (cuffBp) [self startCuffProgressTimer];
     } else if ([type isEqualToString:@"temperature"]) {
         // ⚠ 不按 peripheralModel.temperatureType 提前拦截：握手能力位漏报是已知问题
         // （README 里天气同款坑，weatherType 漏报导致读写被吃），这里照「命令照发、
@@ -1284,17 +1304,22 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 
 /** 血压：一次约 50-55 秒，TestMode 0/1 光电，5 气泵（cuff）。
     气泵通道的收包解析在 iOS SDK 里是错位的（只实现光电偏移），所以：
-      - 测量中只透出进度，不透出 high/low；
+      - 测量中进度用本地定时器推（SDK 那帧会被它自己丢掉，见 startCuffProgressTimer）；
       - 走到终态就触发 fetchCuffBpResult，从设备手动记录里取正确结果。 */
 - (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
                  high:(NSUInteger)high low:(NSUInteger)low {
-    BOOL cuff = (self.bpChannel == 5);
+    // 用 bpCuffActive 而不是 bpChannel：stopMeasure 已经清 0，但设备还会补终态帧
+    BOOL cuff = self.bpCuffActive;
 
     if (cuff) {
         BOOL terminal = (state != VPTestBloodStateTesting);
         if (!terminal) {
+            // 万一 SDK 真给了进度，就顺手对一下本地定时器的值（以设备为准）
+            if (progress > 0 && progress <= 100) {
+                self.bpCuffLocalProgress = MAX(self.bpCuffLocalProgress, (NSInteger)progress);
+            }
             NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"testing" isDone:NO];
-            d[@"progress"] = @(MIN((NSUInteger)100, progress));
+            d[@"progress"] = @(MAX(0, MIN(100, self.bpCuffLocalProgress)));
             d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
             d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
                              @"cuff": @YES, @"haveProgress": @YES };
@@ -1305,6 +1330,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         // 只有 Complete 才值得取（其它状态设备没存记录）。
         NSLog(@"[joeme-watch] 气泵血压终态 state=%lu，转去读手动记录",
               (unsigned long)state);
+        [self stopCuffProgressTimer];
         [self endMeasuring];
         if (state == VPTestBloodStateComplete || state == VPTestBloodStateTestInterrupt) {
             [self fetchCuffBpResult];
@@ -1408,6 +1434,45 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 }
 
 /**
+ 气泵通道的本地进度。
+
+ 为什么必须有：iOS SDK 的 BP 收包解析只实现了光电偏移，气泵帧进来先看 byte5 当「有没有进度」
+ （0x81e4: ldrb w8,[x20,#5]; cbz → return），而气泵帧的 byte5 不是那个语义、通常是 0
+ → 整帧在 SDK 内部就被丢掉，我们一个回调都收不到，页面数字自然从头到尾不动。
+ 官方 Android 是有真实充气压力的（ICuffBPDetectDataListener.pressureValue），iOS 没有。
+
+ 采用 55 秒匀速（与官方 Demo「一次约 50-55 秒」一致），每秒 2 格；
+ 如果设备偶尔真回了进度帧，handleBpState 会取两者较大值，不会倒退。
+ */
+- (void)startCuffProgressTimer {
+    [self stopCuffProgressTimer];
+    self.bpCuffLocalProgress = 0;
+    __weak typeof(self) weakSelf = self;
+    self.bpCuffProgressTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                               repeats:YES
+                                                                 block:^(NSTimer *t) {
+        typeof(self) s = weakSelf;
+        if (!s) { [t invalidate]; return; }
+        if (!s.bpCuffActive) { [t invalidate]; s.bpCuffProgressTimer = nil; return; }
+        if (s.bpCuffLocalProgress < 99) s.bpCuffLocalProgress += 2;
+
+        NSMutableDictionary *d = [s measureEvent:@"bp" phase:@"testing" isDone:NO];
+        d[@"progress"] = @(s.bpCuffLocalProgress);
+        d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                         @"cuff": @YES, @"haveProgress": @YES };
+        [s sendEvent:@"measure" data:d];
+    }];
+}
+
+- (void)stopCuffProgressTimer {
+    if (self.bpCuffProgressTimer) {
+        [self.bpCuffProgressTimer invalidate];
+        self.bpCuffProgressTimer = nil;
+    }
+}
+
+/**
  气泵测量收尾后取结果：从设备手动测量记录里捞最近一条。
 
  为什么不直接用 measure 回调的值：iOS SDK 的 BP 收包解析只实现了光电那套偏移
@@ -1469,8 +1534,10 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
                              @"cuff": @YES, @"haveProgress": @NO };
             [weakSelf sendEvent:@"measure" data:d];
+            weakSelf.bpCuffActive = NO;
             return;
         }
+        weakSelf.bpCuffActive = NO;
         NSUInteger sys = [hit[@"sys"] unsignedIntegerValue];
         NSUInteger dia = [hit[@"dia"] unsignedIntegerValue];
         NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"result" isDone:YES];
@@ -3046,7 +3113,13 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         } @finally {
             if (cuff) [self exitBpPhotoCapability];
         }
-        self.bpChannel = 0;
+        [self stopCuffProgressTimer];
+        // 气泵通道：用户手动停止后设备同样会把手动记录写进库，也去取一次结果
+        // （否则「测完立刻点停止」会拿不到值）。bpCuffFetched 保证不会重复读。
+        if (cuff && !self.bpCuffFetched) {
+            [self fetchCuffBpResult];
+        }
+        self.bpChannel = 0;   // 通道标记清掉，但 bpCuffActive 留着接设备补的终态帧
     } else if ([type isEqualToString:@"temperature"]) {
         // 用户手动停止：先置终态标志，设备回的那帧 Close 就不会再回灌一条 result，
         // 页面的 stop() 已经按「有值→结果页 / 无值→已停止」收过尾了。
