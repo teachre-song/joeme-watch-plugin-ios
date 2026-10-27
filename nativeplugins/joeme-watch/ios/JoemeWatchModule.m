@@ -3292,11 +3292,13 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
         @"bloodGlucoseType": @(pm.bloodGlucoseType),
         @"bloodAnalysis": @(pm.bloodAnalysisType != 0),
         @"bp": @(pm.bloodPressureType != 0 || pm.isSupportBPTest),
-        // 气泵(cuff)血压：iOS 没有独立的 cuff 实时测量接口，只能从微体检结果里拿到
-        // （VPHealthGlanceTypeCuffBp）。页面要展示「气囊血压」就必须走 healthGlance。
-        @"bpCuff": @(pm.supportHealthGlanceTest && (pm.healthGlanceType != 0)),
+        // 能不能经微体检拿到血压（含气泵）：
+        //   healthGlanceType 1（定制）/ 2 / 4（公版）都算支持 —— 注意不能只看
+        //   supportHealthGlanceTest，它的实现是 `type == 2 || type == 4`，把定制款 1 排除了。
+        @"bpCuff": @(pm.healthGlanceType != 0),
         @"healthGlance": @(pm.healthGlanceType != 0),
         @"healthGlanceType": @(pm.healthGlanceType),
+        // SDK 原名保留：只代表「公版」微体检（2/4），页面做区分时用
         @"supportHealthGlanceTest": @(pm.supportHealthGlanceTest),
         @"heartRate": @(pm.heartRateType != 0),
         @"worldClock": @(pm.worldClockType != 0),
@@ -8805,8 +8807,8 @@ UNI_EXPORT_METHOD(@selector(readBpFunction:callback:))
     // 判据与 startMeasure 的 bp 分支保持一致：两个能力位任一为真即视为支持
     BOOL supported = (m.bloodPressureType > 0 || m.isSupportBPTest);
     // 有没有「独立的 cuff 实时测量接口」：iOS 永远没有（SDK 里不存在这类符号）。
-    // 但支持微体检的设备能从 healthGlance 结果里拿到气泵高低压，故单列一个能力位。
-    BOOL cuffViaHG = (m.supportHealthGlanceTest && m.healthGlanceType != 0);
+    // 但支持微体检的设备能从微体检结果里拿到高低压（定制 1 / 公版 2、4），故单列一个能力位。
+    BOOL cuffViaHG = (m.healthGlanceType != 0);
     NSDictionary *d = @{
         @"ok": @YES,
         @"supported": @(supported),
