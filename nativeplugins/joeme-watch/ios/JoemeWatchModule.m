@@ -1279,7 +1279,16 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             phase = @"failed"; isDone = YES; message = @"血压测量失败：设备正忙";
             break;
         case VPTestBloodStateNoFunction:
-            phase = @"failed"; isDone = YES; message = @"血压测量失败：设备不支持该功能";
+            phase = @"failed"; isDone = YES;
+            // 把三个能力位一起带上：iOS 上「不支持」几乎都是能力位判据不匹配导致的，
+            // 不带数值的话现场只能看到一句「不支持该功能」，没法定位该走哪条通道。
+            {
+                VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+                message = [NSString stringWithFormat:
+                           @"血压测量失败：设备不支持该功能（血压类型 %lu，微体检 %lu）",
+                           (unsigned long)(m ? m.bloodPressureType : 0),
+                           (unsigned long)(m ? m.healthGlanceType : 0)];
+            }
             break;
         default:
             phase = @"failed"; isDone = YES; message = @"血压测量失败";
