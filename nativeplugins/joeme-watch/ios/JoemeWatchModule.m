@@ -104,12 +104,21 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 @property (nonatomic, assign) NSInteger bpTestMode;
 
 /** 本次 bp 测量走的是哪条通道：
-      0 = 光电 veepooSDKTestBloodStart
-      1 = 公版微体检 veepooSDK_healthGlanceTestStart
-      2 = 定制微体检 veepooSDKMicroTestOpenState
-    气泵机型不能用光电接口，只能从微体检结果里取高低压；
-    stopMeasure('bp') 靠它决定停哪个接口。 */
+      0 = 光电 veepooSDKTestBloodStart（testMode 0/1）
+      3 = 气泵（cuff）：同样走 veepooSDKTestBloodStart，但 testMode 传 5
+    气泵机型（bloodPressureType 3/5）的 isSupportBPTest 恒为 false，SDK 会直接拦截不发包，
+    所以调用前后要把 bloodPressureType 临时顶成 1（与 weatherCapability 同一套路）。
+    stopMeasure('bp') 靠它决定停哪个接口、以及要不要再取一次手动记录。 */
 @property (nonatomic, assign) NSInteger bpChannel;
+
+/** 气泵测量的发起时刻（秒级），用于从设备手动记录里挑出本次结果 */
+@property (nonatomic, assign) NSTimeInterval bpCuffStartTs;
+/** 是否已经为本次气泵测量取过结果（防止回调重复触发时重复读） */
+@property (nonatomic, assign) BOOL bpCuffFetched;
+
+/** 气泵通道的能力位改写（成对使用）：见 bpChannel 注释 */
+@property (nonatomic, assign) NSInteger bpPhotoCapabilityDepth;
+@property (nonatomic, assign) NSUInteger bpPhotoCapabilitySaved;
 
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
@@ -359,9 +368,12 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 - (void)handleSpo2State:(VPTestOxygenState)state value:(NSUInteger)value;
 - (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
                  high:(NSUInteger)high low:(NSUInteger)low;
-// 气泵机型走微体检测血压（公版 / 定制两条）：实现在 handleBpState 之后
-- (void)startBpViaHealthGlance;
-- (void)startBpViaMicroTest;
+// 气泵通道的能力位改写（成对使用，见 bpChannel 注释）
+- (void)enterBpPhotoCapability;
+- (void)exitBpPhotoCapability;
+/** 气泵测量结束后，从设备手动记录里取本次结果 */
+- (void)fetchCuffBpResult;
+- (void)readLatestCuffBpSince:(NSTimeInterval)since retry:(BOOL)retry;
 // 血糖（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
 - (void)handleBloodGlucoseState:(VPDeviceBloodGlucoseTestState)state progress:(NSUInteger)progress
                           value:(NSUInteger)value level:(NSUInteger)level;
@@ -1019,52 +1031,46 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             [weakSelf handleSpo2State:state value:oxygenValue];
         }];
     } else if ([type isEqualToString:@"bp"]) {
-        // iOS 上没有 Android 的 startDetectCuffBP（气囊实时通路），血压只有三条可能的路，
-        // 由机型能力位决定（反汇编 VPPeripheralModel 确认判据）：
+        // ── iOS 血压的三条事实（全部由反汇编 VeepooBleSDK 2.2 得到）──────────────
+        // 1) SDK 只有一个血压发送接口 veepooSDKTestBloodStart:testMode:testResult:，
+        //    它拼的包是 [0x90, start, testMode]，**testMode 原样写进 byte2，不做任何范围校验**。
+        //    Android 侧气泵包是 [0x90, start, 5, ...]（vp_t），所以 testMode=5 就是气泵命令。
+        // 2) 它在写包前判 peripheralModel.isSupportBPTest，而这个属性的实现是
+        //    `bloodPressureType == 1 || bloodPressureType == 4`（0x1068）。
+        //    气泵机型上报的是 3/5 → 恒 false → **一个字节都不发**，只回 state=5(NoFunction)。
+        //    这就是之前「进去就提示不支持」的真正原因。
+        // 3) 收包解析只实现了光电那一套（high=byte1/low=byte2），气泵帧的偏移完全不同
+        //    （sbp=byte1-2, dbp=byte3-4, status=byte6, pressure=byte9-10），回调值不可信。
         //
-        //   bloodPressureType ∈ {1,4}  → 光电血压，veepooSDKTestBloodStart 可用
-        //                                （isSupportBPTest 就是 `==1 || ==4`，0x1068）
-        //   bloodPressureType ∈ {3,5} 或 0 → 光电接口必回 NoFunction
-        //       此时只能走微体检，两种微体检按 healthGlanceType 区分：
-        //         healthGlanceType == 1 → 定制微体检 veepooSDKMicroTestOpenState
-        //                                 （该接口内部硬判 ==1，否则回 error 2000）
-        //         healthGlanceType == 2 / 4 → 公版 veepooSDK_healthGlanceTestStart
-        //                                 （内部无能力位判断，直接拼包）
-        //       两条微体检的结果模型都带收缩压/舒张压，公版还额外有专门的气泵字段
-        //       cuffBloodPressureHigh/Low。
-        // 统一包成 on('measure', type='bp')，页面无需感知走的是哪条。
+        // 所以气泵机型走：临时把 bloodPressureType 顶成 1 让包发出去（weatherType 同款套路），
+        // testMode 传 5；测量结束后**从设备手动记录里取结果**
+        // （VPManualBloodPressureModel 带 testModel=1 与 h_bp/l_bp，SDK 那边解析是对的）。
         VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
         NSUInteger bpType = info.bloodPressureType;
-        NSUInteger hgType = info.healthGlanceType;
-        BOOL photoBpOk = info.isSupportBPTest;   // 等价于 bpType == 1 || bpType == 4
-        NSLog(@"[joeme-watch] bp 路由: bloodPressureType=%lu healthGlanceType=%lu isSupportBPTest=%d",
-              (unsigned long)bpType, (unsigned long)hgType, (int)photoBpOk);
+        BOOL cuffBp = (bpType == 3 || bpType == 5);
+        NSLog(@"[joeme-watch] bp 路由: bloodPressureType=%lu isSupportBPTest=%d → %@",
+              (unsigned long)bpType, (int)info.isSupportBPTest,
+              cuffBp ? @"气泵(testMode=5)" : @"光电(testMode 0/1)");
 
-        if (!photoBpOk && hgType == 1) {
-            NSLog(@"[joeme-watch] bp: 走定制微体检 veepooSDKMicroTestOpenState");
-            [self startBpViaMicroTest];
-            callback(resultWithCode(200), NO);
-            return;
-        }
-        if (!photoBpOk) {
-            // hgType 2/4 是公版微体检；为 0（能力位没解析出来）也照发 ——
-            // 公版接口内部不判能力位，直接拼包下发，让设备自己回答行不行，
-            // 比走光电接口被 SDK 硬拒（一个字节都不发）多一次机会。
-            NSLog(@"[joeme-watch] bp: 光电不可用(hgType=%lu)，走公版微体检 veepooSDK_healthGlanceTestStart",
-                  (unsigned long)hgType);
-            [self startBpViaHealthGlance];
-            callback(resultWithCode(200), NO);
-            return;
-        }
         NSString *model = options[@"model"];
         self.bpTestMode = [@"private" isEqualToString:model] ? 1 : 0;
-        self.bpChannel = 0;   // 光电
-        [pm veepooSDKTestBloodStart:YES
-                           testMode:(NSUInteger)self.bpTestMode
-                         testResult:^(VPTestBloodState state, NSUInteger progress,
-                                      NSUInteger highBlood, NSUInteger lowBlood) {
-            [weakSelf handleBpState:state progress:progress high:highBlood low:lowBlood];
-        }];
+        self.bpChannel = cuffBp ? 5 : 0;
+        self.bpCuffFetched = NO;
+
+        if (cuffBp) {
+            self.bpCuffStartTs = [[NSDate date] timeIntervalSince1970];
+            [self enterBpPhotoCapability];   // 只为让 SDK 放行，发完立刻还原
+        }
+        @try {
+            [pm veepooSDKTestBloodStart:YES
+                               testMode:(NSUInteger)(cuffBp ? 5 : self.bpTestMode)
+                             testResult:^(VPTestBloodState state, NSUInteger progress,
+                                          NSUInteger highBlood, NSUInteger lowBlood) {
+                [weakSelf handleBpState:state progress:progress high:highBlood low:lowBlood];
+            }];
+        } @finally {
+            if (cuffBp) [self exitBpPhotoCapability];
+        }
     } else if ([type isEqualToString:@"temperature"]) {
         // ⚠ 不按 peripheralModel.temperatureType 提前拦截：握手能力位漏报是已知问题
         // （README 里天气同款坑，weatherType 漏报导致读写被吃），这里照「命令照发、
@@ -1276,9 +1282,50 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     if (isDone) [self endMeasuring];
 }
 
-/** 血压：一次约 50-55 秒，TestMode 0 通用 / 1 私人，结果只在结束时给一次 */
+/** 血压：一次约 50-55 秒，TestMode 0/1 光电，5 气泵（cuff）。
+    气泵通道的收包解析在 iOS SDK 里是错位的（只实现光电偏移），所以：
+      - 测量中只透出进度，不透出 high/low；
+      - 走到终态就触发 fetchCuffBpResult，从设备手动记录里取正确结果。 */
 - (void)handleBpState:(VPTestBloodState)state progress:(NSUInteger)progress
                  high:(NSUInteger)high low:(NSUInteger)low {
+    BOOL cuff = (self.bpChannel == 5);
+
+    if (cuff) {
+        BOOL terminal = (state != VPTestBloodStateTesting);
+        if (!terminal) {
+            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"testing" isDone:NO];
+            d[@"progress"] = @(MIN((NSUInteger)100, progress));
+            d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                             @"cuff": @YES, @"haveProgress": @YES };
+            [self sendEvent:@"measure" data:d];
+            return;
+        }
+        // 终态：SDK 给的高低压不可信（偏移错位），改从手动记录里取。
+        // 只有 Complete 才值得取（其它状态设备没存记录）。
+        NSLog(@"[joeme-watch] 气泵血压终态 state=%lu，转去读手动记录",
+              (unsigned long)state);
+        [self endMeasuring];
+        if (state == VPTestBloodStateComplete || state == VPTestBloodStateTestInterrupt) {
+            [self fetchCuffBpResult];
+        } else {
+            NSString *msg = @"血压测量失败";
+            if (state == VPTestBloodStateDeviceBusy) msg = @"血压测量失败：设备正忙";
+            else if (state == VPTestBloodStateNoFunction) msg = @"血压测量失败：设备不支持该功能";
+            else if (state == VPTestBloodStateTestFail) msg = @"血压测量失败：测试无效";
+            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
+            d[@"progress"] = @0;
+            d[@"value"] = @0;
+            d[@"success"] = @NO;
+            d[@"state"] = @(state);
+            d[@"message"] = msg;
+            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                             @"cuff": @YES, @"haveProgress": @NO };
+            [self sendEvent:@"measure" data:d];
+        }
+        return;
+    }
+
     NSString *phase = @"testing";
     BOOL isDone = NO, success = NO;
     NSString *message = @"血压测量中（约需 50-55 秒）";
@@ -1305,14 +1352,13 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             break;
         case VPTestBloodStateNoFunction:
             phase = @"failed"; isDone = YES;
-            // 把三个能力位一起带上：iOS 上「不支持」几乎都是能力位判据不匹配导致的，
-            // 不带数值的话现场只能看到一句「不支持该功能」，没法定位该走哪条通道。
+            // 把能力位一起带上：iOS 上「不支持」几乎都是能力位判据不匹配导致的，
+            // 不带数值的话现场只能看到一句「不支持该功能」，没法定位。
             {
                 VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
                 message = [NSString stringWithFormat:
-                           @"血压测量失败：设备不支持该功能（血压类型 %lu，微体检 %lu）",
-                           (unsigned long)(m ? m.bloodPressureType : 0),
-                           (unsigned long)(m ? m.healthGlanceType : 0)];
+                           @"血压测量失败：设备不支持该功能（血压类型 %lu）",
+                           (unsigned long)(m ? m.bloodPressureType : 0)];
             }
             break;
         default:
@@ -1325,8 +1371,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
     d[@"success"] = @(success);
     d[@"state"] = @(state);
     d[@"message"] = message;
-    // iOS 没有气囊实时通路：只有 progress(0~100)，永远没有 pressure。
-    // 页面靠 extra.cuff=false 把仪表盘切成「进度」量程，别把 0~100 当 mmHg 显示。
+    // 光电通道没有实时压力：只有 progress，页面按进度量程画。
     d[@"extra"] = @{ @"systolic": @(high), @"diastolic": @(low),
                      @"model": self.bpTestMode == 1 ? @"private" : @"public",
                      @"cuff": @NO,
@@ -1336,145 +1381,113 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 }
 
 /**
- 气泵机型（bloodPressureType 3/5）的血压测量：走微体检，把结果重新包成 type='bp' 的
- 标准 measure 事件，页面无需区分走的是哪条通道。
-
- 为什么必须这样：iOS SDK 的 veepooSDKTestBloodStart 内部先判 isSupportBPTest，而这个属性
- 的真实实现是 `bloodPressureType == 1 || bloodPressureType == 4`（反汇编 0x1068），
- 气泵机型恒为 false → 一定回 NoFunction。气泵高低压只出现在
- VPHealthGlanceTestModel.cuffBloodPressureHigh/Low（VPHealthGlanceTypeCuffBp = 1<<3）。
-
- 事件：仍然只发 on('measure') { type:'bp', phase, progress, value, extra.systolic/diastolic }
-   - 测量中：phase=testing, progress=微体检进度(0~100)
-   - 出结果：phase=result，取 cuff 高低压；设备只给光电血压时退回 systolic/diastolic
-   - 失败/中止：phase=failed/stop，message 带微体检原因
+ 气泵通道的能力位改写：SDK 的 veepooSDKTestBloodStart 在写包前判 isSupportBPTest，
+ 而它的实现是 `bloodPressureType == 1 || == 4`（反汇编 0x1068）—— 气泵机型（3/5）恒 false，
+ 于是【一个字节都不发】只回 NoFunction。这与天气的 weatherType 漏报是同一类问题，
+ 用同一套办法：调用前后临时把能力位顶成 1，命令照发，是否支持以设备回包为准。
+ 用 depth 计数是为了并发/嵌套调用时只还原最后一次。
  */
-- (void)startBpViaHealthGlance {
-    self.bpChannel = 1;   // 公版微体检
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-    __weak typeof(self) weakSelf = self;
+- (void)enterBpPhotoCapability {
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    if (!m) return;
+    if (self.bpPhotoCapabilityDepth == 0) {
+        self.bpPhotoCapabilitySaved = m.bloodPressureType;
+    }
+    self.bpPhotoCapabilityDepth++;
+    if (m.bloodPressureType != 1) m.bloodPressureType = 1;   // 1 = isSupportBPTest 的放行值
+}
 
-    [pm veepooSDK_healthGlanceTestStart:YES
-                            andProgress:^(NSInteger progress) {
-        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
-        d[@"progress"] = @(MAX((NSInteger)0, MIN((NSInteger)100, progress)));
-        d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
-        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @YES };
-        [weakSelf sendEvent:@"measure" data:d];
-    } andResult:^(VPDeviceHealthGlanceState state, VPHealthGlanceTestModel *model) {
-        if (state == VPDeviceHealthGlanceStateComplete) {
-            NSUInteger sys = model ? model.cuffBloodPressureHigh : 0;
-            NSUInteger dia = model ? model.cuffBloodPressureLow : 0;
-            // 设备只开了光电血压位时，微体检把值放在通用 systolic/diastolic 里
-            if ((sys == 0 || dia == 0) && model) {
-                if (sys == 0) sys = model.systolicBloodPressure;
-                if (dia == 0) dia = model.diastolicBloodPressure;
-            }
-            BOOL valid = (sys > 0 && dia > 0);
-            NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
-                                                      phase:(valid ? @"result" : @"stop")
-                                                     isDone:YES];
-            d[@"progress"] = @100;
-            d[@"value"] = @(sys);
-            d[@"success"] = @(valid);
-            d[@"message"] = valid ? @"血压测量完成" : @"血压测量结束（无有效值）";
-            d[@"extra"] = @{ @"systolic": @(sys), @"diastolic": @(dia),
-                             @"model": @"public", @"cuff": @YES,
-                             @"viaHealthGlance": @YES, @"haveProgress": @NO };
-            [weakSelf sendEvent:@"measure" data:d];
-            [weakSelf endMeasuring];
-            weakSelf.bpChannel = 0;
-            return;
-        }
-        // 其余终态：Over/NoFunction/NotWear/Busy/LowPower/Failure/NotLead
-        NSString *msg = JoemeHealthGlanceStateName(state);
-        BOOL interrupted = [msg isEqualToString:@"OVER"];
-        if ([msg isEqualToString:@"NO_FUNCTION"]) msg = @"血压测量失败：设备不支持该功能";
-        else if ([msg isEqualToString:@"NOT_WEAR"]) msg = @"血压测量失败：佩戴检测未通过";
-        else if ([msg isEqualToString:@"DEVICE_BUSY"]) msg = @"血压测量失败：设备正忙";
-        else if ([msg isEqualToString:@"LOW_POWER"]) msg = @"血压测量失败：设备电量过低";
-        else if (interrupted) msg = @"血压测量已中断";
-        else msg = @"血压测量失败";
-        NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
-                                                  phase:(interrupted ? @"stop" : @"failed")
-                                                 isDone:YES];
-        d[@"progress"] = @0;
-        d[@"value"] = @0;
-        d[@"success"] = @NO;
-        d[@"message"] = msg;
-        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @NO };
-        [weakSelf sendEvent:@"measure" data:d];
-        [weakSelf endMeasuring];
-        weakSelf.bpChannel = 0;
-    }];
+- (void)exitBpPhotoCapability {
+    if (self.bpPhotoCapabilityDepth <= 0) return;
+    self.bpPhotoCapabilityDepth--;
+    if (self.bpPhotoCapabilityDepth > 0) return;
+    VPPeripheralModel *m = [VPBleCentralManage sharedBleManager].peripheralModel;
+    NSUInteger saved = self.bpPhotoCapabilitySaved;
+    self.bpPhotoCapabilitySaved = 0;
+    if (m) m.bloodPressureType = saved;
 }
 
 /**
- 定制微体检（healthGlanceType == 1 的机型）：veepooSDKMicroTestOpenState:...
- 这是官方 Demo「微体检(定制项目)」用的接口，结果模型 VPMicroTestModel 带
- systolicBloodPressure / diastolicBloodPressure —— 气泵机型在 iOS 上唯一能测的另一种方式。
+ 气泵测量收尾后取结果：从设备手动测量记录里捞最近一条。
 
- 与公版 healthGlance 的差别（反汇编确认）：
-   - 定制接口内部先判 `peripheralModel.healthGlanceType == 1`，不等就回 error(code 2000)
-     并调 fail block —— 所以只有 type==1 才能走这条路；
-   - 公版接口内部不判能力位，直接拼包。
-   - 定制的成功回调是 (BOOL endState, VPMicroTestModel *)，没有「状态枚举」，
-     失败走独立 fail block（NSError），语义比公版更简单。
+ 为什么不直接用 measure 回调的值：iOS SDK 的 BP 收包解析只实现了光电那套偏移
+ （high=byte1 / low=byte2，见 0x66e4），气泵帧是 sbp=byte1-2 / dbp=byte3-4 / status=byte6 /
+ pressure=byte9-10，偏移完全不同 → 回调里给的 high/low 是错位数据，不能当结果。
 
- 事件：与公版那条完全一致 —— 只发 on('measure') { type:'bp', phase, progress, value,
- extra.systolic/diastolic }，页面无需区分。
+ 手动记录这条链是 SDK 内部的 VPManualBloodPressureModel，字段语义正确：
+   testModel  0=光电 1=气囊
+   state      2/9 = 测量完成（可取值）
+   h_bp/l_bp  收缩压/舒张压
+ 所以气泵机型测完再从 readManualData 里挑 testModel==1 且 timestamp >= 开始的记录。
+ 落库有延迟（设备要先写自己的 flash），这里先等 1.5s 再读，读不到就再补一次。
  */
-- (void)startBpViaMicroTest {
-    self.bpChannel = 2;   // 定制微体检
-    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+- (void)fetchCuffBpResult {
+    if (self.bpCuffFetched) return;
+    self.bpCuffFetched = YES;
     __weak typeof(self) weakSelf = self;
+    NSTimeInterval since = self.bpCuffStartTs - 60;   // 容一点时钟漂移
+    // 设备写完自己的 flash 才会出现在手动记录里，先等 1.5s；
+    // 一次读不到就 3s 后再补一次（共两次），避免偶发落库慢被判失败。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf readLatestCuffBpSince:since retry:YES];
+    });
+}
 
-    [pm veepooSDKMicroTestOpenState:YES
-                        andProgress:^(int progress) {
-        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
-        d[@"progress"] = @(MAX(0, MIN(100, progress)));
-        d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
-        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @YES };
-        [weakSelf sendEvent:@"measure" data:d];
-    } andFail:^(NSError *error) {
-        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"failed" isDone:YES];
-        d[@"progress"] = @0;
-        d[@"value"] = @0;
-        d[@"success"] = @NO;
-        d[@"message"] = error.localizedDescription.length
-            ? [NSString stringWithFormat:@"血压测量失败：%@", error.localizedDescription]
-            : @"血压测量失败";
-        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                         @"cuff": @YES, @"viaHealthGlance": @YES, @"haveProgress": @NO };
-        [weakSelf sendEvent:@"measure" data:d];
-        [weakSelf endMeasuring];
-        weakSelf.bpChannel = 0;
-    } andSuccess:^(BOOL endState, VPMicroTestModel *model) {
-        // endState=YES 才是正常结束；NO 只表示本轮被中止（下面按无值处理）
-        NSUInteger sys = model ? (NSUInteger)MAX(0, model.systolicBloodPressure) : 0;
-        NSUInteger dia = model ? (NSUInteger)MAX(0, model.diastolicBloodPressure) : 0;
-        BOOL valid = endState && sys > 0 && dia > 0;
-        NSMutableDictionary *d = [weakSelf measureEvent:@"bp"
-                                                  phase:(valid ? @"result" : @"stop")
-                                                 isDone:YES];
-        d[@"progress"] = @(valid ? 100 : 0);
+- (void)readLatestCuffBpSince:(NSTimeInterval)since retry:(BOOL)retry {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    __weak typeof(self) weakSelf = self;
+    uint32_t startTs = (uint32_t)MAX(0, since);
+    [pm readManualTestDataWithTimestamp:startTs
+                               dataType:VPManualTestDataBloodPressure
+                                 result:^(VPManualTestDataModel *m) {
+        NSDictionary *hit = nil;
+        for (VPManualBloodPressureModel *r in m.bloodPressureArr) {
+            if (r.testModel != 1) continue;                       // 只要气囊记录
+            if (r.h_bp == 0 || r.l_bp == 0) continue;             // 无有效值
+            if ((NSTimeInterval)r.timestamp < since) continue;
+            hit = @{ @"sys": @(r.h_bp), @"dia": @(r.l_bp),
+                     @"heart": @(r.heart), @"ts": @((long long)r.timestamp * 1000LL) };
+            break;
+        }
+        if (!hit && retry) {
+            NSLog(@"[joeme-watch] 气泵血压：手动记录暂未命中，3s 后重试一次");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf readLatestCuffBpSince:since retry:NO];
+            });
+            return;
+        }
+        if (!hit) {
+            NSLog(@"[joeme-watch] 气泵血压：两次读取都没拿到手动记录");
+            NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"stop" isDone:YES];
+            d[@"progress"] = @0;
+            d[@"value"] = @0;
+            d[@"success"] = @NO;
+            d[@"message"] = @"血压测量结束，但设备未返回有效值";
+            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                             @"cuff": @YES, @"haveProgress": @NO };
+            [weakSelf sendEvent:@"measure" data:d];
+            return;
+        }
+        NSUInteger sys = [hit[@"sys"] unsignedIntegerValue];
+        NSUInteger dia = [hit[@"dia"] unsignedIntegerValue];
+        NSMutableDictionary *d = [weakSelf measureEvent:@"bp" phase:@"result" isDone:YES];
+        d[@"progress"] = @100;
         d[@"value"] = @(sys);
-        d[@"success"] = @(valid);
-        d[@"message"] = valid ? @"血压测量完成" : @"血压测量结束（无有效值）";
-        d[@"extra"] = @{ @"systolic": @(sys), @"diastolic": @(dia),
-                         @"model": @"public", @"cuff": @YES,
-                         @"viaHealthGlance": @YES, @"haveProgress": @NO };
+        d[@"success"] = @YES;
+        d[@"message"] = @"血压测量完成";
+        NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+        extra[@"systolic"] = @(sys);
+        extra[@"diastolic"] = @(dia);
+        extra[@"heart"] = hit[@"heart"];
+        extra[@"model"] = @"public";
+        extra[@"cuff"] = @YES;
+        extra[@"haveProgress"] = @NO;
+        d[@"extra"] = extra;
         [weakSelf sendEvent:@"measure" data:d];
-        [weakSelf endMeasuring];
-        weakSelf.bpChannel = 0;
-    } andHeartRate:^(int heartRate) {
-        // 测量中的瞬时心率：塞进当前测试帧的业务字段没有意义（页面不展示），
-        // 但保留回调，避免 SDK 因为 block 为 nil 而跳过整个成功回调链。
-    } andPPG:^(NSMutableArray *ppgArray) {
-        // PPG 原始采样：本页不需要（算法优化才用）
+        NSLog(@"[joeme-watch] 气泵血压结果: %lu/%lu", (unsigned long)sys, (unsigned long)dia);
     }];
 }
 
@@ -3023,28 +3036,17 @@ UNI_EXPORT_METHOD(@selector(stopMeasure:callback:))
     if ([type isEqualToString:@"spo2"]) {
         [pm veepooSDKTestOxygenStart:NO testResult:^(VPTestOxygenState state, NSUInteger value) {}];
     } else if ([type isEqualToString:@"bp"]) {
-        if (self.bpChannel == 2) {
-            // 定制微体检：同一个接口传 NO 停止（五个 block 都可以给 nil）
-            [pm veepooSDKMicroTestOpenState:NO
-                                andProgress:nil
-                                   andFail:^(NSError *error) {}
-                                 andSuccess:^(BOOL endState, VPMicroTestModel *model) {}
-                                andHeartRate:^(int heartRate) {}
-                                    andPPG:^(NSMutableArray *ppgArray) {}];
-            self.bpChannel = 0;
-        } else if (self.bpChannel == 1) {
-            // 公版微体检
-            [pm veepooSDK_healthGlanceTestStart:NO
-                                    andProgress:nil
-                                      andResult:^(VPDeviceHealthGlanceState state,
-                                                  VPHealthGlanceTestModel *model) {}];
-            self.bpChannel = 0;
-        } else {
+        BOOL cuff = (self.bpChannel == 5);
+        if (cuff) [self enterBpPhotoCapability];   // 停止命令同样要过 SDK 的能力位门
+        @try {
             [pm veepooSDKTestBloodStart:NO
-                               testMode:(NSUInteger)self.bpTestMode
+                               testMode:(NSUInteger)(cuff ? 5 : self.bpTestMode)   // 起停同一个 testMode
                              testResult:^(VPTestBloodState state, NSUInteger progress,
                                           NSUInteger high, NSUInteger low) {}];
+        } @finally {
+            if (cuff) [self exitBpPhotoCapability];
         }
+        self.bpChannel = 0;
     } else if ([type isEqualToString:@"temperature"]) {
         // 用户手动停止：先置终态标志，设备回的那帧 Close 就不会再回灌一条 result，
         // 页面的 stop() 已经按「有值→结果页 / 无值→已停止」收过尾了。
@@ -10957,12 +10959,19 @@ UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
                    dispatch_get_main_queue(), ^{ finish(NO, nil); });
 }
 
-/** 分钟(0~1439) -> 模型项；value 是 mmol/L，模型要 ×100 的整数（[3.00,15.00] -> [300,1500]） */
+/**
+ 分钟(0~1439) -> 模型项；value 是 mmol/L，模型要 ×100 的整数（[3.00,15.00] -> [300,1500]）。
+ ⚠ mmol <= 0 表示「这一餐没填」，必须原样给 0：若也夹到 300(=3.0)，设备侧会把
+   未填写的餐当成基准 3.0 存下来，读回来全是 3.0，用户以为校准值被改了。
+ */
 static VPMultiBloodGlucoseItemModel *JoemeBgItem(NSInteger minutes, double mmol) {
     NSInteger mm = MIN(MAX(minutes, (NSInteger)0), (NSInteger)1439);
-    // 模型内部按 uint16 存，超范围会被截断成乱值；这里按头文件区间 [300,1500] 夹紧
-    NSInteger raw = (NSInteger)llround(mmol * 100.0);
-    raw = MIN(MAX(raw, (NSInteger)300), (NSInteger)1500);
+    NSInteger raw = 0;
+    if (mmol > 0) {
+        // 模型内部按 uint16 存，超范围会被截断成乱值；这里按头文件区间 [300,1500] 夹紧
+        raw = (NSInteger)llround(mmol * 100.0);
+        raw = MIN(MAX(raw, (NSInteger)300), (NSInteger)1500);
+    }
     return [[VPMultiBloodGlucoseItemModel alloc] initWithHour:(uint8_t)(mm / 60)
                                                        minute:(uint8_t)(mm % 60)
                                                         value:(uint16_t)raw];
@@ -11035,7 +11044,10 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
         fired = YES;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
-        d[@"isOpen"] = @(m ? m.open : isOpen);
+        // 成功时以「我们下发的值」为准，不取回包模型的 open：
+        // 部分固件设置成功仍回上一份 model（open 还是旧值），页面据此会把刚打开的
+        // 开关又拨回关闭，用户看到的就是「打开后自己跳回关闭」。
+        d[@"isOpen"] = @(success ? isOpen : (m ? m.open : isOpen));
         if (!success) d[@"message"] = @"写入血糖校准失败";
         [weakSelf sendEvent:@"glucoseCalibSet" data:d];
         NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
