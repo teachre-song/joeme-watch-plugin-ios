@@ -132,6 +132,31 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 本地进度定时器（气泵通道专用） */
 @property (nonatomic, strong) NSTimer *bpCuffProgressTimer;
 
+/* ── 气泵原始帧解析（C 方案）─────────────────────────────────────────────
+   iOS SDK 的 BP 收包解析只实现光电偏移，气泵帧的字段位置完全不同，所以它自己
+   解析出来的 high/low/状态全是错的（见 handleBpState 注释）。
+   但 SDK 收包尾部有一个**私有钩子** ValueDataBlock：didUpdate 里若它非空，
+   就会把收到的原始 NSData 原样回调（反汇编 0x6a80；头文件没声明这个属性，
+   二进制里是 `ValueDataBlock` / `setValueDataBlock:`）。
+   我们用 KVC 挂上它，按 Android 的偏移自己解析：
+     byte0      0x90 命令头
+     byte1..2   收缩压 = b1 | b2<<8
+     byte3..4   舒张压 = b3 | b4<<8
+     byte6      状态：0 测量中 / 1 成功 / 2 姿势 3 气囊松 4 未佩戴 5 超时
+                6 心率异常 7 放气慢 8 压力过大 9 信号差 10 未静止 / 253 充电 / 254 低电 / 255 忙
+     byte8      心率
+     byte9..10  实时充气压力 = b9 | b10<<8   ← 官方 App 图表上那个值
+   ──────────────────────────────────────────────────────────────────── */
+/** 最近一帧原始气泵帧的时间；本地定时器据此决定还要不要自己推进度 */
+@property (nonatomic, assign) NSTimeInterval bpCuffLastRawAt;
+/** 本轮是否真的收到过原始气泵帧（收到过就以原始帧为准，忽略 SDK 的错位回调） */
+@property (nonatomic, assign) BOOL bpCuffRawSeen;
+/** 原始帧解析出的最新值 */
+@property (nonatomic, assign) NSUInteger bpCuffRawSbp;
+@property (nonatomic, assign) NSUInteger bpCuffRawDbp;
+@property (nonatomic, assign) NSUInteger bpCuffRawPressure;
+@property (nonatomic, assign) NSUInteger bpCuffRawHeart;
+
 /** 血糖是否私人模式，start/stop 必须一致 */
 @property (nonatomic, assign) BOOL bloodGlucosePersonal;
 /** 本次血糖测量最后一次有效读数（上报值的 100 倍，0 = 还没测到）。
@@ -389,6 +414,15 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 气泵通道的本地进度推进（SDK 不回进度帧时用，见 bpCuffLocalProgress 注释） */
 - (void)startCuffProgressTimer;
 - (void)stopCuffProgressTimer;
+/** 安装 / 卸载气泵原始帧钩子（KVC 挂 ValueDataBlock），见属性区注释 */
+- (void)installCuffRawHook;
+- (void)uninstallCuffRawHook;
+/** 解析一帧原始气泵帧（偏移与 Android VPCuffBPTestData 一致） */
+- (void)handleCuffRawFrame:(NSData *)data;
+/** 气泵状态码 -> 中文 */
+- (NSString *)cuffStatusText:(NSUInteger)status;
+- (void)emitCuffResultSbp:(NSUInteger)sbp dbp:(NSUInteger)dbp heart:(NSUInteger)heart;
+- (void)emitCuffFailure:(NSString *)text;
 // 血糖（第 13 节）：状态映射与收尾辅助，块里回调、实现在后，先声明
 - (void)handleBloodGlucoseState:(VPDeviceBloodGlucoseTestState)state progress:(NSUInteger)progress
                           value:(NSUInteger)value level:(NSUInteger)level;
@@ -1076,6 +1110,8 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 
         if (cuffBp) {
             self.bpCuffStartTs = [[NSDate date] timeIntervalSince1970];
+            // 先挂原始帧钩子（要早于下发，设备的初始帧可能在命令回执后立刻到）
+            [self installCuffRawHook];
             [self enterBpPhotoCapability];   // 只为让 SDK 放行，发完立刻还原
         }
         @try {
@@ -1088,8 +1124,8 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         } @finally {
             if (cuffBp) [self exitBpPhotoCapability];
         }
-        // 气泵通道 SDK 基本不回进度帧（字段偏移对不上，整帧被它自己丢掉），
-        // 本地起一条 55 秒匀速进度，否则页面数字从头到尾不动。
+        // 气泵通道：原始帧钩子能拿到压力就由它驱动；拿不到（钩子挂不上/设备不回帧）
+        // 时用本地 55 秒匀速进度兜底，否则页面数字从头到尾不动。
         if (cuffBp) [self startCuffProgressTimer];
     } else if ([type isEqualToString:@"temperature"]) {
         // ⚠ 不按 peripheralModel.temperatureType 提前拦截：握手能力位漏报是已知问题
@@ -1318,19 +1354,32 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
             if (progress > 0 && progress <= 100) {
                 self.bpCuffLocalProgress = MAX(self.bpCuffLocalProgress, (NSInteger)progress);
             }
-            NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"testing" isDone:NO];
-            d[@"progress"] = @(MAX(0, MIN(100, self.bpCuffLocalProgress)));
-            d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
-            d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                             @"cuff": @YES, @"haveProgress": @YES };
-            [self sendEvent:@"measure" data:d];
+            // 有原始帧时压力/结果由 handleCuffRawFrame 负责发，这里别重复发一帧空的
+            if (!self.bpCuffRawSeen) {
+                NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"testing" isDone:NO];
+                d[@"progress"] = @(MAX(0, MIN(100, self.bpCuffLocalProgress)));
+                d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+                d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                                 @"cuff": @YES, @"haveProgress": @YES };
+                [self sendEvent:@"measure" data:d];
+            }
             return;
         }
-        // 终态：SDK 给的高低压不可信（偏移错位），改从手动记录里取。
-        // 只有 Complete 才值得取（其它状态设备没存记录）。
-        NSLog(@"[joeme-watch] 气泵血压终态 state=%lu，转去读手动记录",
-              (unsigned long)state);
+        // 终态。
+        // 若原始帧钩子已经拿到过气泵帧，结果/失败在上面的 handleCuffRawFrame 里
+        // 就用真实偏移解析并发出去了（bpCuffActive 也已置 NO），这里收到的是 SDK
+        // 按光电偏移错位解析出来的回调，必须忽略，否则会把正确结果覆盖成垃圾值。
         [self stopCuffProgressTimer];
+        if (!self.bpCuffActive) {
+            NSLog(@"[joeme-watch] 气泵血压终态回调（已被原始帧处理，忽略）state=%lu",
+                  (unsigned long)state);
+            [self endMeasuring];
+            return;
+        }
+        NSLog(@"[joeme-watch] 气泵血压终态 state=%lu 且没收到原始帧，回退读手动记录",
+              (unsigned long)state);
+        self.bpCuffActive = NO;
+        [self uninstallCuffRawHook];
         [self endMeasuring];
         if (state == VPTestBloodStateComplete || state == VPTestBloodStateTestInterrupt) {
             [self fetchCuffBpResult];
@@ -1458,11 +1507,33 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         if (!strongSelf.bpCuffActive) { [t invalidate]; strongSelf.bpCuffProgressTimer = nil; return; }
         if (strongSelf.bpCuffLocalProgress < 99) strongSelf.bpCuffLocalProgress += 2;
 
+        // 原始帧钩子已经能拿到真实充气压力时，就不要再用本地进度盖掉它
+        // （handleCuffRawFrame 每帧都会带 pressure 发事件，这里只补进度数值即可）。
+        if (strongSelf.bpCuffRawSeen) {
+            if (strongSelf.bpCuffLastRawAt > 0 &&
+                [[NSDate date] timeIntervalSince1970] - strongSelf.bpCuffLastRawAt > 3.0) {
+                // 3 秒没新帧：设备可能只在关键节点回包，继续用本地进度兜底
+            } else {
+                return;
+            }
+        }
+
         NSMutableDictionary *d = [strongSelf measureEvent:@"bp" phase:@"testing" isDone:NO];
         d[@"progress"] = @(strongSelf.bpCuffLocalProgress);
+        if (strongSelf.bpCuffRawPressure > 0) {
+            // 有真实压力就继续带着，别让仪表盘掉回「进度 %」量程
+            d[@"pressure"] = @(strongSelf.bpCuffRawPressure);
+        }
         d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
-        d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
-                         @"cuff": @YES, @"haveProgress": @YES };
+        NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+        extra[@"systolic"] = @0;
+        extra[@"diastolic"] = @0;
+        extra[@"model"] = @"public";
+        extra[@"cuff"] = @YES;
+        extra[@"haveProgress"] = @YES;
+        extra[@"rawFrame"] = @(strongSelf.bpCuffRawSeen);
+        if (strongSelf.bpCuffRawPressure > 0) extra[@"pressure"] = @(strongSelf.bpCuffRawPressure);
+        d[@"extra"] = extra;
         [strongSelf sendEvent:@"measure" data:d];
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
@@ -1474,6 +1545,153 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         [self.bpCuffProgressTimer invalidate];
         self.bpCuffProgressTimer = nil;
     }
+}
+
+/* ── 气泵原始帧钩子（C 方案）───────────────────────────────────────────── */
+
+/**
+ 挂上 SDK 收包尾部的私有钩子 ValueDataBlock。
+ 反汇编证据：didUpdateValueForCharacteristic 的尾部（0x6a80）会判断
+ `ValueDataBlock` 是否为空，非空则把本次收到的 NSData 原样回调给它。
+ 这个属性头文件没声明（VPPeripheralBaseManage.h 里完全没有），只能用 KVC 设。
+ 只有气泵测量期间才挂，测完立刻卸掉 —— 别的功能不需要原始帧，留着只是白拷贝。
+ */
+- (void)installCuffRawHook {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    self.bpCuffLastRawAt = 0;
+    self.bpCuffRawSeen = NO;
+    self.bpCuffRawSbp = 0;
+    self.bpCuffRawDbp = 0;
+    self.bpCuffRawPressure = 0;
+    self.bpCuffRawHeart = 0;
+    __weak typeof(self) weakSelf = self;
+    void (^handler)(NSData *) = ^(NSData *data) {
+        [weakSelf handleCuffRawFrame:data];
+    };
+    @try {
+        [pm setValueForKey:@"ValueDataBlock" value:[handler copy]];
+    } @catch (NSException *e) {
+        NSLog(@"[joeme-watch] 挂气泵原始帧钩子失败（KVC 不支持？）：%@", e.reason);
+    }
+}
+
+- (void)uninstallCuffRawHook {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    if (!pm) return;
+    @try {
+        [pm setValue:nil forKey:@"ValueDataBlock"];
+    } @catch (NSException *e) {}
+}
+
+/**
+ 解析一帧原始气泵帧。偏移与 Android 的 VPCuffBPTestData 完全一致
+（vp_t.handler：sbp=b1|b2<<8, dbp=b3|b4<<8, status=b6, heart=b8, pressure=b9|b10<<8）。
+
+ 只认 byte0 == 0x90（血压命令头），其余帧直接忽略。
+ 状态码非 0/1 时（2~10 / 253~255）当作本轮失败，与 Android 的映射一致。
+ */
+- (void)handleCuffRawFrame:(NSData *)data {
+    if (!self.bpCuffActive) return;                    // 不在气泵测量期间，忽略
+    if (![data isKindOfClass:[NSData class]] || data.length < 11) return;
+    const uint8_t *p = (const uint8_t *)data.bytes;
+    if (p[0] != 0x90) return;                          // 不是血压帧
+
+    NSUInteger sbp = (NSUInteger)p[1] | ((NSUInteger)p[2] << 8);
+    NSUInteger dbp = (NSUInteger)p[3] | ((NSUInteger)p[4] << 8);
+    NSUInteger status = p[6];
+    NSUInteger heart = p[8];
+    NSUInteger pressure = (NSUInteger)p[9] | ((NSUInteger)p[10] << 8);
+
+    self.bpCuffLastRawAt = [[NSDate date] timeIntervalSince1970];
+    self.bpCuffRawSeen = YES;
+    self.bpCuffRawSbp = sbp;
+    self.bpCuffRawDbp = dbp;
+    self.bpCuffRawPressure = pressure;
+    self.bpCuffRawHeart = heart;
+
+    NSLog(@"[joeme-watch] 气泵原始帧 status=%lu sbp=%lu dbp=%lu pressure=%lu heart=%lu",
+          (unsigned long)status, (unsigned long)sbp, (unsigned long)dbp,
+          (unsigned long)pressure, (unsigned long)heart);
+
+    // 终态：1=成功 / 2~10、253~255=各类失败
+    if (status != 0) {
+        if (status == 1 && sbp > 0 && dbp > 0) {
+            [self stopCuffProgressTimer];
+            [self emitCuffResultSbp:sbp dbp:dbp heart:heart];
+            return;
+        }
+        if (status != 1) {
+            [self stopCuffProgressTimer];
+            [self emitCuffFailure:[self cuffStatusText:status]];
+            return;
+        }
+    }
+
+    // 测量中：压力值直接给页面（这才是官方 App 图表上的那个数字）
+    // 进度按压力换算（0~300mmHg → 0~100%），与压力同步推进，而不是只靠定时器匀速跑。
+    if (pressure > 0) {
+        NSInteger pct = (NSInteger)(pressure * 100 / 300);
+        if (pct > self.bpCuffLocalProgress && pct <= 100) self.bpCuffLocalProgress = pct;
+    }
+    NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"testing" isDone:NO];
+    d[@"progress"] = @(MAX(0, MIN(100, self.bpCuffLocalProgress)));
+    d[@"pressure"] = @(pressure);
+    d[@"message"] = @"血压测量中（气囊充气中，请保持静止）";
+    d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"pressure": @(pressure),
+                     @"heart": @(heart), @"model": @"public",
+                     @"cuff": @YES, @"haveProgress": @YES };
+    [self sendEvent:@"measure" data:d];
+}
+
+/** 气泵状态码 -> 中文（对齐 Android 的 cuffStatusName） */
+- (NSString *)cuffStatusText:(NSUInteger)status {
+    switch (status) {
+        case 1: return @"血压测量完成";
+        case 2: return @"姿势错误，请坐直并保持手臂稳定";
+        case 3: return @"气囊松脱，请重新佩戴";
+        case 4: return @"未佩戴好手表";
+        case 5: return @"测量超时";
+        case 6: return @"心率信号异常";
+        case 7: return @"放气异常，请重试";
+        case 8: return @"充气压力过大";
+        case 9: return @"信号质量差，请保持静止";
+        case 10: return @"请保持静止";
+        case 253: return @"设备正在充电，请取下后测量";
+        case 254: return @"电量过低，请先充电";
+        case 255: return @"设备正忙，请稍后重试";
+        default: return @"血压测量失败";
+    }
+}
+
+- (void)emitCuffResultSbp:(NSUInteger)sbp dbp:(NSUInteger)dbp heart:(NSUInteger)heart {
+    NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"result" isDone:YES];
+    d[@"progress"] = @100;
+    d[@"value"] = @(sbp);
+    d[@"success"] = @YES;
+    d[@"message"] = @"血压测量完成";
+    d[@"extra"] = @{ @"systolic": @(sbp), @"diastolic": @(dbp),
+                     @"heart": @(heart), @"pressure": @(self.bpCuffRawPressure),
+                     @"model": @"public", @"cuff": @YES, @"haveProgress": @NO };
+    [self sendEvent:@"measure" data:d];
+    NSLog(@"[joeme-watch] 气泵血压完成: %lu/%lu", (unsigned long)sbp, (unsigned long)dbp);
+    self.bpCuffActive = NO;
+    [self endMeasuring];
+    [self uninstallCuffRawHook];
+}
+
+- (void)emitCuffFailure:(NSString *)text {
+    NSMutableDictionary *d = [self measureEvent:@"bp" phase:@"failed" isDone:YES];
+    d[@"progress"] = @0;
+    d[@"value"] = @0;
+    d[@"success"] = @NO;
+    d[@"message"] = text;
+    d[@"extra"] = @{ @"systolic": @0, @"diastolic": @0, @"model": @"public",
+                     @"cuff": @YES, @"haveProgress": @NO };
+    [self sendEvent:@"measure" data:d];
+    self.bpCuffActive = NO;
+    [self endMeasuring];
+    [self uninstallCuffRawHook];
 }
 
 /**
@@ -1493,6 +1711,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
 - (void)fetchCuffBpResult {
     if (self.bpCuffFetched) return;
     self.bpCuffFetched = YES;
+    [self uninstallCuffRawHook];
     __weak typeof(self) weakSelf = self;
     NSTimeInterval since = self.bpCuffStartTs - 60;   // 容一点时钟漂移
     // 设备写完自己的 flash 才会出现在手动记录里，先等 1.5s；
@@ -11060,10 +11279,26 @@ static VPMultiBloodGlucoseItemModel *JoemeBgItem(NSInteger minutes, double mmol)
             breakfastBeforeTime/AfterTime, lunch*, dinner* }（时间单位分钟，缺省用官方默认时刻）
  iOS SDK：veepooSDKBloodGlucoseMultiPersonalWithOpCode:model:result:（opCode=1 设置）
  Android：settingMultipleCalibrationBGValue；JS：joemeWatch.setGlucoseCalibration({...})
- 事件：on('glucoseCalibSet') -> { ok, isOpen, message? }
+ 事件：on('glucoseCalibSet') -> { ok, verified, isOpen, message? }
 
- ⚠ 与「单点校准」veepooSDKBloodGlucosePersonalWithOpCode:value:open:result: **互斥**
-   （头文件原文），多校准机型只能走这条；页面只提供多校准这一套。
+ ⚠ 为什么 ok=true 不等于写成功（**这就是「提示已开启、实际没改」的根因**）：
+   反编译 VeepooBleSDK 2.2（VPMultiBloodGlucoseHandle / VPPeripheralBaseManage）后确认：
+
+     1) opCode=1 时 SDK 只是把「我方传进去的 model」和「我方 block」存到实例属性
+        （setTempMultiBloodGlucoseModel: / setVPMultiBloodGlucosePersonalOpBlock:）；
+     2) 设备回包命中 cmd=3 / sub=1 / sub2=1 / cur==total 后，回调里
+        **w1(成功)=常量 1、x2(model)=tempMultiBloodGlucoseModel（即我们自己传进去的那份）**。
+        也就是说：这个回调只表示「设备对这条写命令回了 ACK」，既不解析回包内容，
+        也不回读确认，更不会因为设备拒绝而给 success=NO。
+     3) 失败分支（w1=0）只在分包校验不通过（cur!=total）时走到。
+
+   旧实现直接把这个 ACK 当成功、还顺手拿回显的 model.open 当设备真值 ——
+   于是界面一定显示「已开启」，而设备侧可能根本没落库（固件拒绝、字节越界、
+   或 bloodGlucoseType 不支持多校准）。
+
+   所以这里写完必须**再读一次**（opCode=2）做校验：
+     - 只有回读成功、且 open 与三餐值/时刻都对得上，才给 verified=YES；
+     - 设备拒绝时 verified=NO，页面必须回滚开关并把原因告诉用户。
  */
 UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
 - (void)setGlucoseCalibration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -11115,29 +11350,101 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
 
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
-    __block BOOL fired = NO;
-    void (^finish)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
-        if (fired) return;
-        fired = YES;
+
+    // 最终只发一次事件 + 一次回调
+    __block BOOL answered = NO;
+    // 写命令是否已回 ACK：回 ACK 后写看门狗就失效（后面的回读有自己的 6 秒兜底），
+    // 否则「ACK 0.5s 到、回读 6s 才超时」会被写看门狗抢先判成「写入超时」。
+    __block BOOL ackReceived = NO;
+    void (^answer)(BOOL, BOOL, NSDictionary *, NSString *) =
+        ^(BOOL ackOk, BOOL verified, NSDictionary *device, NSString *message) {
+        if (answered) return;
+        answered = YES;
+        BOOL deviceOpen = device[@"isOpen"] ? [device[@"isOpen"] boolValue] : isOpen;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        d[@"ok"] = @(success);
-        // 成功时以「我们下发的值」为准，不取回包模型的 open：
-        // 部分固件设置成功仍回上一份 model（open 还是旧值），页面据此会把刚打开的
-        // 开关又拨回关闭，用户看到的就是「打开后自己跳回关闭」。
-        d[@"isOpen"] = @(success ? isOpen : (m ? m.open : isOpen));
-        if (!success) d[@"message"] = @"写入血糖校准失败";
+        // ok 只表示「写命令发出并收到 ACK」；**能不能用要看 verified**
+        d[@"ok"] = @(ackOk);
+        d[@"verified"] = @(verified);
+        // isOpen：有设备回读就用回读值（校验失败时它才是设备真值），读不回来才退回请求值
+        d[@"isOpen"] = @(device ? deviceOpen : isOpen);
+        if (device) d[@"device"] = device;
+        if (message) d[@"message"] = message;
         [weakSelf sendEvent:@"glucoseCalibSet" data:d];
-        NSMutableDictionary *r = [resultWithCode(success ? 200 : -1) mutableCopy];
+        NSMutableDictionary *r = [resultWithCode(ackOk ? 200 : -1) mutableCopy];
         [r addEntriesFromDictionary:d];
         callback(r, NO);
     };
+
+    // 写完 → 回读 → 逐项比对（值 + 时刻 + open）。这是唯一能判定「设备真的存了」的办法。
+    void (^readBack)(void) = ^{
+        __block BOOL readDone = NO;
+        void (^onRead)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
+            if (readDone) return;
+            readDone = YES;
+            if (!success || !m) {
+                // 回读失败：设备回了 ACK 但读不回来，不能当成功（无法证明落库）
+                answer(YES, NO, nil, @"设备未确认保存，请重试");
+                return;
+            }
+            NSMutableDictionary *device = [NSMutableDictionary dictionary];
+            device[@"isOpen"] = @(m.open);
+            VPMultiBloodGlucoseItemModel *devItems[6] = {
+                m.beforeBreakfast, m.afterBreakfast, m.beforeLunch,
+                m.afterLunch, m.beforeDinner, m.afterDinner
+            };
+            BOOL mismatch = NO;
+            for (NSInteger i = 0; i < 6; i++) {
+                VPMultiBloodGlucoseItemModel *want = items[i];
+                VPMultiBloodGlucoseItemModel *got = devItems[i];
+                device[keys[i]] = @(got ? got.value / 100.0 : 0);
+                device[[keys[i] stringByAppendingString:@"Time"]]
+                    = @(got ? (NSInteger)got.hour * 60 + got.minute : -1);
+                // 期望值 0 表示「这一餐没填」：设备回 0 或该项缺失都算一致
+                if (want.value == 0) {
+                    if (got && got.value != 0) mismatch = YES;
+                    continue;
+                }
+                if (!got
+                    || got.value != want.value
+                    || got.hour != want.hour
+                    || got.minute != want.minute) {
+                    mismatch = YES;
+                }
+            }
+            BOOL openOk = (m.open == isOpen);
+            BOOL verified = !mismatch && openOk;
+            NSString *msg = nil;
+            if (!verified) {
+                msg = openOk ? @"设备未保存校准值，请重试"
+                             : (isOpen ? @"设备未开启私人模式，请重试" : @"设备未关闭私人模式，请重试");
+            }
+            answer(YES, verified, device, msg);
+        };
+        [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:2 model:nil result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+            onRead(success, m);
+        }];
+        // 回读也有 6 秒兜底（设备不回包时不能把页面吊死）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ onRead(NO, nil); });
+    };
+
     [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:1 model:model result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
-        finish(success, m);
+        // ⚠ 这里的 success 只是「设备回了写 ACK」，m 是 SDK 原样回显的**我方 model**，
+        // 不是设备真值 —— 所以无论 success 与否都去回读一次确认。
+        // （success=NO 说明分包没通过，写命令根本没发全，也没必要回读。）
+        ackReceived = YES;
+        if (!success) { answer(NO, NO, nil, @"写入血糖校准失败"); return; }
+        // 给设备一点落库时间再回读（部分固件 ACK 早于写入持久化）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), readBack);
     }];
 
-    // 设备不回包时 6 秒兜底，否则页面保存按钮会一直转圈
+    // 写命令本身 6 秒无回包 → 直接失败（不再回读）；已收到 ACK 时交给回读自己的兜底
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ finish(NO, nil); });
+                   dispatch_get_main_queue(), ^{
+        if (ackReceived) return;
+        answer(NO, NO, nil, @"写入血糖校准超时，设备未响应");
+    });
 }
 
 /**
