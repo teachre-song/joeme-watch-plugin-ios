@@ -1570,7 +1570,7 @@ UNI_EXPORT_METHOD(@selector(startMeasure:callback:))
         [weakSelf handleCuffRawFrame:data];
     };
     @try {
-        [pm setValueForKey:@"ValueDataBlock" value:[handler copy]];
+        [pm setValue:[handler copy] forKey:@"ValueDataBlock"];
     } @catch (NSException *e) {
         NSLog(@"[joeme-watch] 挂气泵原始帧钩子失败（KVC 不支持？）：%@", e.reason);
     }
