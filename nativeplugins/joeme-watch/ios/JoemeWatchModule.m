@@ -176,6 +176,17 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 /** 血糖测量看门狗（可取消）。设备把命令吃掉时页面会永远停在「测量中」，到点自己收尾 */
 @property (nonatomic, copy) dispatch_block_t bloodGlucoseWatchdog;
 
+/** 血糖多校准的读写串行队列（FIFO）。
+    为什么必须有：反编译 VeepooBleSDK 2.2 的 veepooSDKBloodGlucoseMultiPersonalWithOpCode 后确认，
+    它把「回调 block」和「本次 model」各存一份到 VPPeripheralBaseManage 的**实例属性**上
+    （setVPMultiBloodGlucosePersonalOpBlock: / setTempMultiBloodGlucoseModel:），回调没有按命令区分。
+    于是「写命令刚发、还没收到设备 ACK 就发读命令」会把写的回调槽位顶掉：
+      - 写 ACK 到达时跑到的是**读**的 block，且 temp model 已被读命令清成 nil → 读被当成失败；
+      - 读回包又跑到读的 block，拿到的是设备真值，但写那一步永远等不到回调，页面只能等超时。
+    页面 onShow/onLoad 的读、开关的写、保存都走这个队列，一次只允许一条命令在飞。 */
+@property (nonatomic, strong) NSMutableArray *bgMultiQueue;
+@property (nonatomic, assign) BOOL bgMultiRunning;
+
 /** 本次血氧测量最后一次有效值（0 = 还没测到）。
     SDK 的 Over（正常结束 / 人为结束）回调里 oxygenValue 可能给 0，而真正的血氧值
     早在 Testing 帧里给过了；不兜底的话「测到 97% 再点停止」会被判成「无有效值」。
@@ -430,6 +441,21 @@ static NSInteger leadProgressPercent(NSProgress *progress);
 - (void)cancelBloodGlucoseWatchdog;
 - (void)stopBloodGlucoseSession;
 - (NSString *)bloodGlucoseStateName:(VPDeviceBloodGlucoseTestState)state;
+// 血糖多校准（第 13 节）：读写内部实现与串行队列，先声明避免后向调用告警
+- (void)doReadGlucoseCalibration:(UniModuleKeepAliveCallback)callback;
+- (void)doSetGlucoseCalibrationWithItems:(NSArray<VPMultiBloodGlucoseItemModel *> *)items
+                                    keys:(NSArray<NSString *> *)keys
+                                  isOpen:(BOOL)isOpen
+                                callback:(UniModuleKeepAliveCallback)callback;
+- (void)bgVerifyItems:(NSArray<VPMultiBloodGlucoseItemModel *> *)items
+                 keys:(NSArray<NSString *> *)keys
+               isOpen:(BOOL)isOpen
+              attempt:(NSInteger)attempt
+            cancelled:(BOOL (^)(void))cancelled
+               answer:(void (^)(BOOL, BOOL, BOOL, BOOL, NSDictionary *, NSString *))answer;
+- (void)bgMultiEnqueue:(dispatch_block_t)block;
+- (void)bgMultiPump;
+- (void)bgMultiDone;
 - (void)armTemperatureWatchdog;
 - (void)cancelTemperatureWatchdog;
 - (void)stopTemperatureSession;
@@ -11202,21 +11228,40 @@ UNI_EXPORT_METHOD(@selector(setBloodComponentCalibration:callback:))
 UNI_EXPORT_METHOD(@selector(readGlucoseCalibration:callback:))
 - (void)readGlucoseCalibration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    // 必须排队：SDK 的读写共用 VPMultiBloodGlucosePersonalOpBlock 与 tempMultiBloodGlucoseModel，
+    // 两个命令同时在飞时后发的会把先发的回调槽位顶掉（先发的永远等不到回调）。
+    // 这里捕获强引用：块进队列后必须真的执行（执行尾才 bgMultiDone 放行），
+    // weak 化会让模块释放时队列永久卡在 running。
+    [self bgMultiEnqueue:^{ [self doReadGlucoseCalibration:callback]; }];
+}
+
+- (void)doReadGlucoseCalibration:(UniModuleKeepAliveCallback)callback {
     VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
     __weak typeof(self) weakSelf = self;
     __block BOOL fired = NO;
     void (^finish)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
         if (fired) return;
         fired = YES;
+        [weakSelf bgMultiDone];
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"ok"] = @(success);
         d[@"isOpen"] = @(m ? m.open : NO);
         // 多校准能力：SDK 的 Demo 判定是 bloodGlucoseType ∈ {4,5,7}（VPBloodGlucoseViewController）。
-        // 页面据此决定「私人模式」入口是否可用；能力位漏报时不硬拦（命令能否生效以回包为准）。
+        // 但反编译 veepooSDKBloodGlucoseMultiPersonalWithOpCode 后确认：这个接口**没有**任何
+        // 能力位门控，命令照发。所以能力位只作为「提示」参考，判据按更可靠的一方：
+        //   读成功（设备真回了 25 字节模型）→ 一定支持；
+        //   有能力位（非 0）→ 按 {4,5,7} 判定；
+        //   能力位 0 且读失败 → **不下结论**（字段不传），页面保持「未知」，
+        //   开关照常可点 —— 之前这里是 supported=NO，一次超时就把开关永久置灰，
+        //   用户看到的就是「点了没反应」。
         VPPeripheralModel *info = [VPBleCentralManage sharedBleManager].peripheralModel;
         NSUInteger gtype = info ? info.bloodGlucoseType : 0;
-        d[@"supported"] = @(gtype == 4 || gtype == 5 || gtype == 7 || success);
         d[@"bloodGlucoseType"] = @(gtype);
+        if (success) {
+            d[@"supported"] = @YES;
+        } else if (gtype != 0) {
+            d[@"supported"] = @(gtype == 4 || gtype == 5 || gtype == 7);
+        }
         if (m) {
             // 六餐点：模型没给的项回 0（页面按 >0 判断是否已填）；
             // 时间同时给分钟值（*BeforeTime / *AfterTime），页面可据此回填时间不丢。
@@ -11279,26 +11324,32 @@ static VPMultiBloodGlucoseItemModel *JoemeBgItem(NSInteger minutes, double mmol)
             breakfastBeforeTime/AfterTime, lunch*, dinner* }（时间单位分钟，缺省用官方默认时刻）
  iOS SDK：veepooSDKBloodGlucoseMultiPersonalWithOpCode:model:result:（opCode=1 设置）
  Android：settingMultipleCalibrationBGValue；JS：joemeWatch.setGlucoseCalibration({...})
- 事件：on('glucoseCalibSet') -> { ok, verified, isOpen, message? }
+ 事件：on('glucoseCalibSet') ->
+        { ok, verified, openVerified, valuesVerified, isOpen, device?, message? }
 
- ⚠ 为什么 ok=true 不等于写成功（**这就是「提示已开启、实际没改」的根因**）：
+ ⚠ 为什么 ok=true 不能当成功（这是「提示已开启、退出重进又是关闭」的根因）：
    反编译 VeepooBleSDK 2.2（VPMultiBloodGlucoseHandle / VPPeripheralBaseManage）后确认：
 
-     1) opCode=1 时 SDK 只是把「我方传进去的 model」和「我方 block」存到实例属性
-        （setTempMultiBloodGlucoseModel: / setVPMultiBloodGlucosePersonalOpBlock:）；
+     1) opCode=1 时 SDK 只把「我方传进去的 model」和「我方 block」存到实例属性
+        （setTempMultiBloodGlucoseModel: / setVPMultiBloodGlucosePersonalOpBlock:），
+        然后把 model 序列化成 25 字节、拆两包（每包 ≤15 字节）逐包写特征值；
      2) 设备回包命中 cmd=3 / sub=1 / sub2=1 / cur==total 后，回调里
-        **w1(成功)=常量 1、x2(model)=tempMultiBloodGlucoseModel（即我们自己传进去的那份）**。
-        也就是说：这个回调只表示「设备对这条写命令回了 ACK」，既不解析回包内容，
-        也不回读确认，更不会因为设备拒绝而给 success=NO。
-     3) 失败分支（w1=0）只在分包校验不通过（cur!=total）时走到。
+        **success=常量 1、model=tempMultiBloodGlucoseModel（就是我自己传进去的那份）**。
+        也就是说这个回调只表示「设备对这条写命令回了 ACK」，既不解析回包内容，
+        也不回读确认，更不会因为设备拒绝（固件不支持、写入被丢弃）而给 NO；
+     3) 失败分支（success=0）只在分包校验不通过（cur != total）时走到。
 
-   旧实现直接把这个 ACK 当成功、还顺手拿回显的 model.open 当设备真值 ——
-   于是界面一定显示「已开启」，而设备侧可能根本没落库（固件拒绝、字节越界、
-   或 bloodGlucoseType 不支持多校准）。
+   旧实现直接把这个 ACK 当成功、还拿回显的 model.open 当设备真值 —— 于是界面一定
+   显示「已开启」，而设备侧可能根本没落库。所以写完必须**再读一次**（opCode=2）做校验。
 
-   所以这里写完必须**再读一次**（opCode=2）做校验：
-     - 只有回读成功、且 open 与三餐值/时刻都对得上，才给 verified=YES；
-     - 设备拒绝时 verified=NO，页面必须回滚开关并把原因告诉用户。
+ 校验分两档，页面按用途各取所需：
+   openVerified   —— 设备回读的 open 是否等于本次请求（开关成败只看这个）
+   valuesVerified —— 六个校准点的值+时刻是否都对得上（保存成败看这个）
+   两个都成立时 verified=YES。
+
+ ⚠ 值比较要留容差：设备把 value 当 uint16 整数存（×100），部分固件会按 0.1 mmol/L
+   或 1 mg/dL 量化，拿「逐字节相等」当判据会把正常落库判成失败（这正是
+   「保存一直提示设备未保存」的来源）。这里值按 ±0.05 mmol/L 比、时刻按分钟精确比。
  */
 UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
 - (void)setGlucoseCalibration:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -11310,6 +11361,7 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
     NSArray<NSNumber *> *defTimes = @[ @480, @540, @720, @790, @1080, @1140 ];
     NSArray<NSString *> *keys = @[ @"breakfastBefore", @"breakfastAfter", @"lunchBefore",
                                    @"lunchAfter", @"dinnerBefore", @"dinnerAfter" ];
+    NSArray<NSString *> *mealNames = @[ @"早餐", @"午餐", @"晚餐" ];
     NSMutableArray<VPMultiBloodGlucoseItemModel *> *items = [NSMutableArray arrayWithCapacity:6];
     for (NSInteger i = 0; i < 6; i++) {
         NSString *key = keys[i];
@@ -11319,12 +11371,14 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
         [items addObject:JoemeBgItem(mins, mmol)];
     }
 
-    // 官方校验：同一餐「餐前时间 < 餐后时间」「餐前值 < 餐后值」；整餐都没填时跳过（只切开关）
-    NSArray<NSString *> *mealNames = @[ @"早餐", @"午餐", @"晚餐" ];
-    for (NSInteger m = 0; m < 3; m++) {
+    // 官方校验：同一餐「餐前时间 < 餐后时间」「餐前值 < 餐后值」。
+    // 只在**两个值都填了**时才校验：只填一项时（用户刚开页面在补数据）没得比，
+    // 这时卡住会让「改一个值」直接失败 —— 也是之前保存/开关失败的一个来源。
+    // 关闭时一律不校验：关私人模式不该因为旧数据不合规就关不掉。
+    for (NSInteger m = 0; isOpen && m < 3; m++) {
         double bv = o[keys[m * 2]] ? [o[keys[m * 2]] doubleValue] : 0;
         double av = o[keys[m * 2 + 1]] ? [o[keys[m * 2 + 1]] doubleValue] : 0;
-        if (bv <= 0 && av <= 0) continue;
+        if (bv <= 0 || av <= 0) continue;
         VPMultiBloodGlucoseItemModel *bItem = items[m * 2];
         VPMultiBloodGlucoseItemModel *aItem = items[m * 2 + 1];
         NSInteger bt = (NSInteger)bItem.hour * 60 + bItem.minute;
@@ -11339,6 +11393,15 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
         }
     }
 
+    // 与读同理：块进队列后必须真的执行（执行尾才 bgMultiDone 放行），
+    // weak 化会让模块释放时队列永久卡在 running，后续所有血糖命令全部静默不执行。
+    [self bgMultiEnqueue:^{ [self doSetGlucoseCalibrationWithItems:items keys:keys isOpen:isOpen callback:callback]; }];
+}
+
+- (void)doSetGlucoseCalibrationWithItems:(NSArray<VPMultiBloodGlucoseItemModel *> *)items
+                                    keys:(NSArray<NSString *> *)keys
+                                  isOpen:(BOOL)isOpen
+                                callback:(UniModuleKeepAliveCallback)callback {
     VPMultiBloodGlucoseModel *model = [[VPMultiBloodGlucoseModel alloc] init];
     model.open = isOpen;
     model.beforeBreakfast = items[0];
@@ -11353,18 +11416,20 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
 
     // 最终只发一次事件 + 一次回调
     __block BOOL answered = NO;
-    // 写命令是否已回 ACK：回 ACK 后写看门狗就失效（后面的回读有自己的 6 秒兜底），
-    // 否则「ACK 0.5s 到、回读 6s 才超时」会被写看门狗抢先判成「写入超时」。
-    __block BOOL ackReceived = NO;
-    void (^answer)(BOOL, BOOL, NSDictionary *, NSString *) =
-        ^(BOOL ackOk, BOOL verified, NSDictionary *device, NSString *message) {
+    void (^answer)(BOOL, BOOL, BOOL, BOOL, NSDictionary *, NSString *) =
+        ^(BOOL ackOk, BOOL openVerified, BOOL valuesVerified, BOOL deviceRead,
+          NSDictionary *device, NSString *message) {
         if (answered) return;
         answered = YES;
+        [weakSelf bgMultiDone];
         BOOL deviceOpen = device[@"isOpen"] ? [device[@"isOpen"] boolValue] : isOpen;
+        BOOL verified = ackOk && deviceRead && openVerified && valuesVerified;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        // ok 只表示「写命令发出并收到 ACK」；**能不能用要看 verified**
+        // ok 只表示「写命令发出并收到 ACK」；能不能用要看 verified / openVerified
         d[@"ok"] = @(ackOk);
         d[@"verified"] = @(verified);
+        d[@"openVerified"] = @(ackOk && deviceRead && openVerified);
+        d[@"valuesVerified"] = @(ackOk && deviceRead && valuesVerified);
         // isOpen：有设备回读就用回读值（校验失败时它才是设备真值），读不回来才退回请求值
         d[@"isOpen"] = @(device ? deviceOpen : isOpen);
         if (device) d[@"device"] = device;
@@ -11375,75 +11440,145 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
         callback(r, NO);
     };
 
-    // 写完 → 回读 → 逐项比对（值 + 时刻 + open）。这是唯一能判定「设备真的存了」的办法。
-    void (^readBack)(void) = ^{
-        __block BOOL readDone = NO;
-        void (^onRead)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
-            if (readDone) return;
-            readDone = YES;
-            if (!success || !m) {
-                // 回读失败：设备回了 ACK 但读不回来，不能当成功（无法证明落库）
-                answer(YES, NO, nil, @"设备未确认保存，请重试");
-                return;
-            }
-            NSMutableDictionary *device = [NSMutableDictionary dictionary];
-            device[@"isOpen"] = @(m.open);
-            VPMultiBloodGlucoseItemModel *devItems[6] = {
-                m.beforeBreakfast, m.afterBreakfast, m.beforeLunch,
-                m.afterLunch, m.beforeDinner, m.afterDinner
-            };
-            BOOL mismatch = NO;
-            for (NSInteger i = 0; i < 6; i++) {
-                VPMultiBloodGlucoseItemModel *want = items[i];
-                VPMultiBloodGlucoseItemModel *got = devItems[i];
-                device[keys[i]] = @(got ? got.value / 100.0 : 0);
-                device[[keys[i] stringByAppendingString:@"Time"]]
-                    = @(got ? (NSInteger)got.hour * 60 + got.minute : -1);
-                // 期望值 0 表示「这一餐没填」：设备回 0 或该项缺失都算一致
-                if (want.value == 0) {
-                    if (got && got.value != 0) mismatch = YES;
-                    continue;
-                }
-                if (!got
-                    || got.value != want.value
-                    || got.hour != want.hour
-                    || got.minute != want.minute) {
-                    mismatch = YES;
-                }
-            }
-            BOOL openOk = (m.open == isOpen);
-            BOOL verified = !mismatch && openOk;
-            NSString *msg = nil;
-            if (!verified) {
-                msg = openOk ? @"设备未保存校准值，请重试"
-                             : (isOpen ? @"设备未开启私人模式，请重试" : @"设备未关闭私人模式，请重试");
-            }
-            answer(YES, verified, device, msg);
-        };
-        [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:2 model:nil result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
-            onRead(success, m);
-        }];
-        // 回读也有 6 秒兜底（设备不回包时不能把页面吊死）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ onRead(NO, nil); });
-    };
-
+    // 写命令是否已回 ACK：回 ACK 后写看门狗就失效（后面的回读有自己的兜底），
+    // 否则「ACK 0.5s 到、回读 6s 才超时」会被写看门狗抢先判成「写入超时」。
+    __block BOOL ackReceived = NO;
     [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:1 model:model result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        // 看门狗先收尾了（已 answer、队列已放行）：这次迟到的回调不能再发读命令，
+        // 否则会和队列里的下一条命令同时飞，把 SDK 的回调槽位顶掉。
+        if (answered) return;
         // ⚠ 这里的 success 只是「设备回了写 ACK」，m 是 SDK 原样回显的**我方 model**，
-        // 不是设备真值 —— 所以无论 success 与否都去回读一次确认。
+        // 不是设备真值 —— 所以无论 success 与否都要回读确认。
         // （success=NO 说明分包没通过，写命令根本没发全，也没必要回读。）
         ackReceived = YES;
-        if (!success) { answer(NO, NO, nil, @"写入血糖校准失败"); return; }
+        if (!success) { answer(NO, NO, NO, NO, nil, @"写入血糖校准失败"); return; }
         // 给设备一点落库时间再回读（部分固件 ACK 早于写入持久化）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), readBack);
+                       dispatch_get_main_queue(), ^{
+            // 这 0.6 秒里若已被看门狗收尾，队列已放行，再发读命令会顶掉下一条的槽位
+            if (answered) return;
+            [weakSelf bgVerifyItems:items keys:keys isOpen:isOpen attempt:0
+                          cancelled:^BOOL{ return answered; } answer:answer];
+        });
     }];
 
     // 写命令本身 6 秒无回包 → 直接失败（不再回读）；已收到 ACK 时交给回读自己的兜底
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (ackReceived) return;
-        answer(NO, NO, nil, @"写入血糖校准超时，设备未响应");
+        answer(NO, NO, NO, NO, nil, @"写入血糖校准超时，设备未响应");
+    });
+}
+
+/** 写后回读校验（最多 2 次）。answer 的签名见 doSetGlucoseCalibrationWithItems。
+    cancelled 用于判断这条写命令是否已被看门狗收尾 —— 已收尾时绝不能再发读命令，
+    否则会和队列里的下一条命令同时飞，把 SDK 的回调槽位顶掉。 */
+- (void)bgVerifyItems:(NSArray<VPMultiBloodGlucoseItemModel *> *)items
+                 keys:(NSArray<NSString *> *)keys
+               isOpen:(BOOL)isOpen
+              attempt:(NSInteger)attempt
+            cancelled:(BOOL (^)(void))cancelled
+               answer:(void (^)(BOOL, BOOL, BOOL, BOOL, NSDictionary *, NSString *))answer {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+    __block BOOL readDone = NO;
+    void (^onRead)(BOOL, VPMultiBloodGlucoseModel *) = ^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        if (readDone) return;
+        readDone = YES;
+        if ((!success || !m) && attempt < 1) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                // 这 0.8 秒里看门狗可能已收尾并放行了队列，再发读命令就会顶掉别人的槽位
+                if (cancelled && cancelled()) return;
+                [weakSelf bgVerifyItems:items keys:keys isOpen:isOpen attempt:attempt + 1
+                              cancelled:cancelled answer:answer];
+            });
+            return;
+        }
+        if (!success || !m) {
+            // 回读失败：设备回了 ACK 但读不回来，不能当成功（无法证明落库）
+            answer(YES, NO, NO, NO, nil, @"设备未确认保存，请重试");
+            return;
+        }
+        NSMutableDictionary *device = [NSMutableDictionary dictionary];
+        device[@"isOpen"] = @(m.open);
+        VPMultiBloodGlucoseItemModel *devItems[6] = {
+            m.beforeBreakfast, m.afterBreakfast, m.beforeLunch,
+            m.afterLunch, m.beforeDinner, m.afterDinner
+        };
+        BOOL valuesOk = YES;
+        for (NSInteger i = 0; i < 6; i++) {
+            VPMultiBloodGlucoseItemModel *want = items[i];
+            VPMultiBloodGlucoseItemModel *got = devItems[i];
+            device[keys[i]] = @(got ? got.value / 100.0 : 0);
+            device[[keys[i] stringByAppendingString:@"Time"]]
+                = @(got ? (NSInteger)got.hour * 60 + got.minute : -1);
+            // 只校验本次真有值的项：期望 0 表示「这一餐没填」，设备侧留旧值也不算错
+            // （拿它判失败会把「只改一项」的保存直接判死）。
+            if (want.value == 0) continue;
+            if (!got) { valuesOk = NO; continue; }
+            // 值容差 ±0.1 mmol/L（设备按 ×100 整数存，个别固件会量化到 0.1），
+            // 时刻按分钟精确比 —— 时刻不对就是真没落库，不能糊过去。
+            NSInteger diff = (NSInteger)got.value - (NSInteger)want.value;
+            if (diff < 0) diff = -diff;
+            if (diff > 10) valuesOk = NO;
+            if (got.hour != want.hour || got.minute != want.minute) valuesOk = NO;
+        }
+        BOOL openOk = (m.open == isOpen);
+        NSString *msg = nil;
+        if (!openOk) {
+            msg = isOpen ? @"设备未开启私人模式，请重试" : @"设备未关闭私人模式，请重试";
+        } else if (!valuesOk) {
+            msg = @"设备未保存校准值，请重试";
+        }
+        answer(YES, openOk, valuesOk, YES, device, msg);
+    };
+    [pm veepooSDKBloodGlucoseMultiPersonalWithOpCode:2 model:nil result:^(BOOL success, VPMultiBloodGlucoseModel *m) {
+        onRead(success, m);
+    }];
+    // 回读也有 6 秒兜底（设备不回包时不能把页面吊死）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ onRead(NO, nil); });
+}
+
+#pragma mark - 血糖多校准读写串行队列
+
+/**
+ 入队一条血糖多校准命令。所有 opCode=1/2 的调用都必须走这里：
+ SDK 把回调和 temp model 存在**实例属性**上，两条命令同时在飞会互相顶掉回调槽位
+ （详见 bgMultiQueue 属性注释）。
+ */
+- (void)bgMultiEnqueue:(dispatch_block_t)block {
+    if (!block) return;
+    // 队列读写统一回主线程：JS 侧调用可能落在任意线程，SDK 回包也在主队列，
+    // 只在一处收口才不会出现两个线程同时改 bgMultiRunning。
+    dispatch_block_t copied = [block copy];
+    void (^append)(void) = ^{
+        if (!self.bgMultiQueue) self.bgMultiQueue = [NSMutableArray array];
+        [self.bgMultiQueue addObject:copied];
+        [self bgMultiPump];
+    };
+    if ([NSThread isMainThread]) append();
+    else dispatch_async(dispatch_get_main_queue(), append);
+}
+
+- (void)bgMultiPump {
+    if (self.bgMultiRunning) return;
+    if (self.bgMultiQueue.count == 0) return;
+    dispatch_block_t next = self.bgMultiQueue.firstObject;
+    [self.bgMultiQueue removeObjectAtIndex:0];
+    self.bgMultiRunning = YES;
+    next();
+}
+
+/** 一条命令收尾（成功/失败/超时都要调）：放行队列里的下一条。
+    始终异步放行：本方法常在 SDK 回调栈里被调用，立刻发下一条命令会在 SDK 自己
+    的回调中途重入它的状态机（回调槽位还没清），异步一拍最稳。 */
+- (void)bgMultiDone {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.bgMultiRunning) return;
+        self.bgMultiRunning = NO;
+        [self bgMultiPump];
     });
 }
 
