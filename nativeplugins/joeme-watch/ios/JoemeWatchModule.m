@@ -11343,9 +11343,18 @@ static VPMultiBloodGlucoseItemModel *JoemeBgItem(NSInteger minutes, double mmol)
    显示「已开启」，而设备侧可能根本没落库。所以写完必须**再读一次**（opCode=2）做校验。
 
  校验分两档，页面按用途各取所需：
-   openVerified   —— 设备回读的 open 是否等于本次请求（开关成败只看这个）
+   openVerified   —— 设备回读的 open 是否等于本次请求（开关成败看这个）
    valuesVerified —— 六个校准点的值+时刻是否都对得上（保存成败看这个）
    两个都成立时 verified=YES。
+
+ ⚠⚠ 回读**没有结果**时不能判失败（2026-10-28 真机结论）：
+   写完立刻 opCode=2 回读，实测部分固件对这条读命令不应答（不报错、也不回 25 字节）。
+   之前把「回读超时」直接当 verified=NO，于是页面永远提示「设备未开启私人模式」
+   并把开关拨回去 —— 而写命令其实已经落库了。现在的口径：
+     · 回读**有结果**：以设备回读为准，open/值不一致就是真的没落库 → 失败；
+     · 回读**无结果**：改用写命令的 ACK 作为判据（此时无证据说它失败），
+       同时给 deviceVerified=NO，页面与日志能区分「确认过」和「没确认」。
+   这样既不会把真失败放过（能读的机型照旧校验），也不会把不答读的机型锁死。
 
  ⚠ 值比较要留容差：设备把 value 当 uint16 整数存（×100），部分固件会按 0.1 mmol/L
    或 1 mg/dL 量化，拿「逐字节相等」当判据会把正常落库判成失败（这正是
@@ -11423,13 +11432,17 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
         answered = YES;
         [weakSelf bgMultiDone];
         BOOL deviceOpen = device[@"isOpen"] ? [device[@"isOpen"] boolValue] : isOpen;
-        BOOL verified = ackOk && deviceRead && openVerified && valuesVerified;
+        // deviceVerified=NO 表示这次没有拿到设备回读（见方法头注释），
+        // 此时 open/值 的判定退回写 ACK，不把「读不出来」当成「没写进去」。
+        BOOL verified = ackOk && openVerified && valuesVerified;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        // ok 只表示「写命令发出并收到 ACK」；能不能用要看 verified / openVerified
+        // ok 只表示「写命令发出并收到 ACK」
         d[@"ok"] = @(ackOk);
         d[@"verified"] = @(verified);
-        d[@"openVerified"] = @(ackOk && deviceRead && openVerified);
-        d[@"valuesVerified"] = @(ackOk && deviceRead && valuesVerified);
+        d[@"openVerified"] = @(ackOk && openVerified);
+        d[@"valuesVerified"] = @(ackOk && valuesVerified);
+        // 回读是否真的发生过（false = 设备没答这条读命令，判定只依据 ACK）
+        d[@"deviceVerified"] = @(ackOk && deviceRead);
         // isOpen：有设备回读就用回读值（校验失败时它才是设备真值），读不回来才退回请求值
         d[@"isOpen"] = @(device ? deviceOpen : isOpen);
         if (device) d[@"device"] = device;
@@ -11496,8 +11509,11 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
             return;
         }
         if (!success || !m) {
-            // 回读失败：设备回了 ACK 但读不回来，不能当成功（无法证明落库）
-            answer(YES, NO, NO, NO, nil, @"设备未确认保存，请重试");
+            // 回读没拿到结果：**不判失败**。部分固件对 opCode=2 根本不应答，
+            // 拿它当「没落库」会让写成功的开关被拨回去（真机就是这样）。
+            // 这里把判定权交回页面：ok=YES（写命令已 ACK）、deviceVerified=NO（没读到设备），
+            // open/values 一律报 NO 表示「未校验」而不是「校验不通过」。
+            answer(YES, NO, NO, NO, nil, nil);
             return;
         }
         NSMutableDictionary *device = [NSMutableDictionary dictionary];
@@ -11506,6 +11522,27 @@ UNI_EXPORT_METHOD(@selector(setGlucoseCalibration:callback:))
             m.beforeBreakfast, m.afterBreakfast, m.beforeLunch,
             m.afterLunch, m.beforeDinner, m.afterDinner
         };
+        // 判定「这是一份真模型」还是「SDK 解析失败后回的全默认模型」。
+        // 反编译 VPMultiBloodGlucoseHandle 的 getModelWithData: 后可确认：
+        //   回包不足 25 字节（`length < 0x19` 分支）时它**直接返回刚 init 的模型**，
+        //   open=NO、六项 hour/minute/value 全是 0，但 success 仍然是 YES。
+        // 若不区分，这种「空模型」会被当成设备真值 —— 请求 isOpen=YES 时必然判成
+        // 「设备未开启私人模式」，开关被拨回去，而实际上设备可能只是回包格式不同
+        // （或根本不支持多校准）。所以全空时按「没读到」处理，不当作写失败的证据。
+        BOOL allEmpty = !m.open;
+        for (NSInteger i = 0; i < 6 && allEmpty; i++) {
+            VPMultiBloodGlucoseItemModel *it = devItems[i];
+            if (it && (it.value != 0 || it.hour != 0 || it.minute != 0)) allEmpty = NO;
+        }
+        BOOL expectsData = isOpen;
+        for (NSInteger i = 0; i < 6 && !expectsData; i++) {
+            if (items[i].value > 0) expectsData = YES;
+        }
+        if (allEmpty && expectsData) {
+            // 设备回了「空模型」：说明回读没给出可用信息，不判失败（同读不到的情况）
+            answer(YES, NO, NO, NO, nil, nil);
+            return;
+        }
         BOOL valuesOk = YES;
         for (NSInteger i = 0; i < 6; i++) {
             VPMultiBloodGlucoseItemModel *want = items[i];
