@@ -10613,18 +10613,22 @@ UNI_EXPORT_METHOD(@selector(dialCapability:callback:))
  JS：joemeWatch.dialOnline() -> on('dial') { kind:'online', ok, count, list:[{crc,name,fileUrl,previewUrl,...}] }
  实现：先用 veepooSDK_dialChannelWithChannelModel:Read 拿设备侧市场表盘信息（VPDeviceMarketDialModel），
       再调 VPMarketDialManager.getVeepooServerAllMarketDialsWithDeviceInfo: 拉服务器列表。
- JL 设备没有 HTTP 市场（表盘都在设备 fatfs 里）→ 与 Android 一样回 jlUseDialList，
- 页面据此把「在线市场」页签的失败文案换成「请用已装表盘列表」。
+
+ ⚠ 不要按 CPUType（杰理与否）拦截：官方 iOS Demo 对 K 系列走的就是同一条
+   dialChannel Read → getVeepooServerAllMarketDials → startTransferWithFilePath 链路，
+   判据只有 marketDialCount>0（等价于 Android 只看 isSupportChangeServerUi 不看平台）。
+   这里曾按 JL 拦过，结果杰理设备进「服务器表盘」页永远是空的，而官方 App 在同一台
+   机器上能列出表盘市场 —— 与 Android 端的同一处修正保持一致。
+
+ 事件字段与 Android 对齐：deviceNumber / appPackName / appVersion / dialShape / maxLength /
+ binDataType 都是页面诊断条的内容，「服务器一个表盘都不返回」九成要靠它们解释，
+ 服务器模型（VPServerMarketDialModel）没有 name/size/available，页面已有兜底，缺省即可。
  */
 UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
 - (void)dialOnline:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
     callback(resultWithCode(200), NO);
 
-    if ([self isJLDevice]) {
-        [self sendEvent:@"dial" data:@{ @"kind": @"online", @"fail": @YES, @"message": @"jlUseDialList" }];
-        return;
-    }
     VPPeripheralModel *model = [VPBleCentralManage sharedBleManager].peripheralModel;
     if (model.marketDialCount == 0) {
         [self sendEvent:@"dial" data:@{ @"kind": @"online", @"fail": @YES, @"message": @"serverUiNotSupported" }];
@@ -10635,14 +10639,30 @@ UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
     VPMarketDialManager *mgr = [VPMarketDialManager share];
     __weak typeof(self) weakSelf = self;
 
+    // 渠道参数：服务器按它们过滤目录（Android 用包名/versionName，这里对齐）
+    NSString *packName = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+
     [self sendEvent:@"dial" data:@{ @"kind": @"online", @"loading": @YES }];
+
+    // Read 与 HTTP 都可能不回包：20s 总看门狗（与 Android 同上限），别让页面永远停在「正在读取」
+    __block BOOL done = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (done) return;
+        done = YES;
+        [weakSelf sendEvent:@"dial" data:@{ @"kind": @"online", @"fail": @YES, @"message": @"timeout" }];
+    });
+
     [pm veepooSDK_dialChannelWithChannelModel:VPDialChannelModelRead
                                     dialType:VPDeviceDialTypeMarket
                               photoDialModel:nil
                                       result:^(VPPhotoDialModel *photoDialModel,
                                                VPDeviceMarketDialModel *deviceMarketDialModel,
                                                NSError *error) {
+        if (done) return;
         if (error || !deviceMarketDialModel) {
+            done = YES;
             [weakSelf sendEvent:@"dial" data:@{
                 @"kind": @"online", @"fail": @YES,
                 @"message": error.localizedDescription ?: @"readDeviceDialFail"
@@ -10653,22 +10673,55 @@ UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
         weakSelf.dialDeviceInfo = deviceMarketDialModel;
         [mgr getVeepooServerAllMarketDialsWithDeviceInfo:deviceMarketDialModel
                                                  success:^(NSArray<VPServerMarketDialModel *> *response) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || done) return;
+            done = YES;
+
+            // imageId = 设备当前市场表盘的 crc（0 表示没装过）：已安装的不再列出，
+            // 对齐 Android 的 watchIDArr 过滤（官方 dealUiInfoList + unShowUIList 同款语义）
+            NSInteger imageId = (NSInteger)deviceMarketDialModel.imageId;
+            NSInteger total = response.count;
             NSMutableArray *list = [NSMutableArray array];
             for (VPServerMarketDialModel *s in response) {
+                if (imageId != 0 && (NSInteger)s.crc == imageId) continue;
+                // 服务器模型没有展示名，取 fileUrl 最后一段当名字（去掉 query 和扩展名），
+                // 比裸 crc 可读；取不到再退回 crc
+                NSString *name = [[NSURL URLWithString:s.fileUrl ?: @""] lastPathComponent] ?: @"";
+                if ([name.pathExtension length] > 0) name = [name stringByDeletingPathExtension];
+                if ([name length] == 0) name = [NSString stringWithFormat:@"表盘 %d", s.crc];
                 [list addObject:@{
                     @"crc": @(s.crc),
-                    // 服务器模型里没有展示名，只有 crc；用 crc 当名字，页面至少能区分卡片
-                    @"name": [NSString stringWithFormat:@"表盘 %d", s.crc],
+                    @"name": name,
                     @"fileUrl": s.fileUrl ?: @"",
                     @"previewUrl": s.previewUrl ?: @"",
                     @"dialShape": @(s.dialShape),
                     @"binProtocol": @(s.binProtocol)
                 }];
             }
-            NSDictionary *d = @{ @"kind": @"online", @"ok": @YES,
-                                 @"count": @(list.count), @"total": @(list.count), @"list": list };
-            [weakSelf sendEvent:@"dial" data:d];
+
+            NSMutableDictionary *d = [NSMutableDictionary dictionary];
+            d[@"kind"] = @"online";
+            d[@"platform"] = [self dialPlatformName];
+            d[@"ok"] = @YES;
+            d[@"count"] = @(list.count);
+            d[@"total"] = @(total);
+            d[@"list"] = list;
+            // 渠道参数 + 设备侧读到的三个过滤参数（形状/长度/协议）：全部回传给页面诊断条
+            d[@"deviceNumber"] = model.deviceNumber > 0
+                ? [NSString stringWithFormat:@"%lu", (unsigned long)model.deviceNumber] : @"";
+            d[@"appPackName"] = packName;
+            d[@"appVersion"] = appVer;
+            d[@"dialShape"] = @(deviceMarketDialModel.deviceShape);
+            d[@"maxLength"] = @(deviceMarketDialModel.length);
+            d[@"binDataType"] = @(deviceMarketDialModel.binProtocol);
+            if (list.count == 0) {
+                d[@"message"] = total > 0 ? @"表盘都已安装到设备，无新表盘可下载"
+                                          : @"服务器未返回表盘（检查网络、设备型号或 App 渠道）";
+            }
+            [self sendEvent:@"dial" data:d];
         } failure:^(NSError *err, NSInteger code) {
+            if (done) return;
+            done = YES;
             [weakSelf sendEvent:@"dial" data:@{
                 @"kind": @"online", @"fail": @YES,
                 @"message": err.localizedDescription ?: [NSString stringWithFormat:@"服务器返回错误(%ld)", (long)code]
@@ -10689,6 +10742,8 @@ UNI_EXPORT_METHOD(@selector(dialOnline:callback:))
  页面上没有 addr/length 这些字段，所以这里用 dialOnline 时读到的那份缓存；
  缓存缺失时先补一次 Read（与 dialOnline 同一条命令），再下载。
  ⚠ crc 必须由页面传（服务器列表里的 crc），缺省 0 时 SDK 的「同 crc 直接复用」判断会失效。
+ 下载后的推送（pushDialFileAndActivate）不区分平台：杰理与非杰理都走
+ startTransferWithFilePath（官方 Demo 对 K 系列就是这条链），不要在这里按 CPUType 拦。
  */
 UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
 - (void)downloadDial:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -10697,7 +10752,6 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
 
     NSString *url = [options[@"url"] isKindOfClass:[NSString class]] ? options[@"url"] : @"";
     if (url.length == 0) { [self emitDialFail:@"emptyUrl"]; return; }
-    if ([self isJLDevice]) { [self emitDialFail:@"jlUseDialList"]; return; }
 
     VPServerMarketDialModel *server = [[VPServerMarketDialModel alloc] init];
     server.fileUrl = url;
@@ -10720,7 +10774,19 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
         [mgr downloadMarketDialBinFileWithModel:server deviceMarketDialModel:device success:^(NSURL *filePath) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self || seq != self.dialSwitchSeq) return;
-            [self sendEvent:@"dial" data:@{ @"downloaded": @YES, @"path": filePath.path ?: @"" }];
+            // 落盘文件名/字节数随事件回传：页面诊断条靠它们定位（杰理的设备侧表盘名
+            // 就是由本机文件名推出来的）。空/半截文件会被设备按 16896「文件信息不匹配」
+            // 拒掉，报出来像格式问题、其实是没下全，所以先在这里拦一道。
+            long long size = 0;
+            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:filePath.path error:nil];
+            if (attrs) size = [attrs[NSFileSize] longLongValue];
+            if (size <= 0) {
+                [self sendEvent:@"dial" data:@{ @"ok": @NO, @"fail": @YES, @"message": @"downloadEmpty" }];
+                return;
+            }
+            [self sendEvent:@"dial" data:@{ @"downloaded": @YES, @"path": filePath.path ?: @"",
+                                            @"fileName": [filePath lastPathComponent] ?: @"",
+                                            @"fileSize": @(size) }];
             [self pushDialFileAndActivate:filePath name:displayName];
         } failure:^(NSError *error, NSInteger code) {
             __strong typeof(weakSelf) self = weakSelf;
