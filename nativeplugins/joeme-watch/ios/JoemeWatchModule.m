@@ -9900,13 +9900,14 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
 }
 
 /**
- 推送天气数据。options: { cityName, timestamp, source, temp, temp2, weatherId, crc }
+ 推送天气数据。options: { cityName, timestamp, source, crc, lat, lng, hourly[], daily[] }
  iOS SDK：VPWeatherHandle syncWeatherDataToDeviceWithWeatherServerModel:result:
  Android：settingWeatherData；JS：joemeWatch.setWeatherData({...}) -> on('weather')
- 说明：iOS 的天气推送模型是 VPWeatherServerModel（含逐小时/逐天数组），比 Android 的
-      WeatherData 复杂得多；这里用最小可用模型：城市 + 更新时间 + 当前温度（一次逐小时项）。
-      页面当前只传 cityName/timestamp/source（天气列表数据由业务侧提供），
-      温度缺省 0，设备端会显示「--」。完整逐小时/逐天推送需业务侧补齐 hourly/forecast。
+ 说明：推送模型是 VPWeatherServerModel（逐小时 + 逐天数组），字段口径见
+      VPWeatherServerHourlyModel.h / VPWeatherServerForecastModel.h：温度是**华氏度**，
+      时间是 "yyyy-MM-dd HH:mm" / "yyyy-MM-dd"。
+      两张表为空时 SDK 仍可能回成功，但设备天气页没有任何内容 —— 旧实现最多放一条，
+      所以「App 提示成功、手表上没同步」。现在按 SDK 文档完整下发。
  */
 UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
 - (void)setWeatherData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -9919,16 +9920,52 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
     fmt.dateFormat = @"yyyy-MM-dd HH:mm";
     m.update = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:tsMs / 1000.0]];
 
-    // 当前温度：页面若提供 temp（摄氏）就放进一个逐小时项，否则留空
-    if (options[@"temp"] != nil) {
+    // 逐小时：每项一个整点（SDK 自己挑最接近当前时间的下一项）
+    // 字段口径见 VPWeatherServerHourlyModel.h：温度是华氏度，time 是 "yyyy-MM-dd HH:mm"
+    NSMutableArray<VPWeatherServerHourlyModel *> *hourly = [NSMutableArray array];
+    NSArray *hourlyIn = [options[@"hourly"] isKindOfClass:[NSArray class]] ? options[@"hourly"] : @[];
+    for (id obj in hourlyIn) {
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *it = (NSDictionary *)obj;
+        VPWeatherServerHourlyModel *h = [[VPWeatherServerHourlyModel alloc] init];
+        h.time = [it[@"time"] isKindOfClass:[NSString class]] ? it[@"time"] : m.update;
+        h.temp = [it[@"tempF"] doubleValue];   // 华氏度，页面按摄氏换算好传下来
+        h.code = [it[@"code"] intValue];
+        h.uvi = @([it[@"uv"] intValue]);
+        h.wind_sc = [it[@"wind"] isKindOfClass:[NSString class]] ? it[@"wind"] : @"0";
+        h.vis = @([it[@"vis"] doubleValue]);
+        [hourly addObject:h];
+    }
+    m.hourly = hourly;
+
+    // 逐天：date 是 "yyyy-MM-dd"，最高/最低温同样是华氏度
+    NSMutableArray<VPWeatherServerForecastModel *> *forecast = [NSMutableArray array];
+    NSArray *dailyIn = [options[@"daily"] isKindOfClass:[NSArray class]] ? options[@"daily"] : @[];
+    for (id obj in dailyIn) {
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *it = (NSDictionary *)obj;
+        VPWeatherServerForecastModel *f = [[VPWeatherServerForecastModel alloc] init];
+        f.date = [it[@"date"] isKindOfClass:[NSString class]] ? it[@"date"] : @"";
+        f.maxTemp = [it[@"maxF"] doubleValue];
+        f.minTemp = [it[@"minF"] doubleValue];
+        f.uvi = @([it[@"uv"] intValue]);
+        f.dayCode = @([it[@"dayCode"] intValue]);
+        f.nightCode = @([it[@"nightCode"] intValue]);
+        f.wind_sc = [it[@"wind"] isKindOfClass:[NSString class]] ? it[@"wind"] : @"0";
+        f.vis = @([it[@"vis"] doubleValue]);
+        [forecast addObject:f];
+    }
+    m.forecast = forecast;
+
+    // 兜底：调用方只给当前温度、没给逐时表时，仍放一条（兼容旧用法）
+    if (hourly.count == 0 && options[@"temp"] != nil) {
         VPWeatherServerHourlyModel *h = [[VPWeatherServerHourlyModel alloc] init];
         h.time = m.update;
         double celsius = [options[@"temp"] doubleValue];
-        h.temp = celsius * 9.0 / 5.0 + 32.0;   // 模型字段是华氏度
+        h.temp = celsius * 9.0 / 5.0 + 32.0;
         h.code = options[@"weatherId"] ? [options[@"weatherId"] intValue] : 0;
         m.hourly = @[ h ];
     }
-    m.forecast = @[];
 
     __weak typeof(self) weakSelf = self;
     __block BOOL settled = NO;
@@ -10822,6 +10859,60 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
 }
 
 /**
+ 传输完成后让设备显示新表盘，并在回调失败时复核一次。
+
+ 背景：部分固件对 veepooSDKSettingDeviceScreenStyle(1, MARKET) 会回 ok=NO，
+ 但 bin 已经落盘、设备其实已经切到新表盘了（手表上看到的已经是新盘），
+ 直接报 uiUpdateFailed 会让 App 与设备状态对不上。
+
+ 复核方式：按 readScreenStyle 同样的用法（settingMode 2、dialType default）
+ 读一次当前表盘类型，只要 dialType == Market 就按成功收尾。
+ 连「读样式」都不回包的固件用 4s 看门狗兜底，仍按失败处理。
+ */
+- (void)activateMarketDial:(NSString *)name finish:(void (^)(NSDictionary *))finish {
+    VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
+    __weak typeof(self) weakSelf = self;
+
+    void (^succeed)(void) = ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        // 新装/换了表盘：列表内容与「使用中」都变了
+        [self invalidateDialCache];
+        finish(@{ @"ok": @YES, @"complete": @YES, @"name": name ?: @"",
+                  @"kind": @"server", @"screenType": @"MARKET", @"screenIndex": @(-1) });
+    };
+
+    [pm veepooSDKSettingDeviceScreenStyle:1
+                              settingMode:1
+                                 dialType:VPDeviceDialTypeMarket
+                                   result:^(VPDeviceDialType dt, int screenStyle, BOOL ok) {
+        if (ok) { succeed(); return; }
+
+        // 回调说失败：读一次当前屏幕样式复核，避免把已经生效的切换判成失败
+        __block BOOL verified = NO;
+        void (^decide)(VPDeviceDialType) = ^(VPDeviceDialType curType) {
+            if (verified) return;
+            verified = YES;
+            if (curType == VPDeviceDialTypeMarket) succeed();
+            else finish(@{ @"ok": @NO, @"fail": @YES, @"message": @"uiUpdateFailed" });
+        };
+
+        [pm veepooSDKSettingDeviceScreenStyle:0
+                                  settingMode:2
+                                     dialType:VPDeviceDialTypeDefault
+                                       result:^(VPDeviceDialType curType, int curStyle, BOOL readOk) {
+            decide(curType);
+        }];
+
+        // 个别固件不回「读样式」：4s 后按默认类型收尾，避免拖到 90s 看门狗
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            decide(VPDeviceDialTypeDefault);
+        });
+    }];
+}
+
+/**
  把 bin 文件推给设备并切过去（downloadDial 的第二步，setDialFile 也走这里）。
  官方链路 = VPMarketDialManager.startTransferWithFilePath:（内部 → VPDialTransformManager
  enterDataTransformStateWithFileUrl，先发 20 字节通道头再分片），完成后
@@ -10834,6 +10925,8 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
     NSInteger seq = self.dialSwitchSeq;
     __weak typeof(self) weakSelf = self;
     __block BOOL done = NO;
+    // 进度可能多帧都 >= 0.999，确保「让设备显示」只触发一次
+    __block BOOL activating = NO;
 
     void (^finish)(NSDictionary *) = ^(NSDictionary *d) {
         __strong typeof(weakSelf) self = weakSelf;
@@ -10848,22 +10941,9 @@ UNI_EXPORT_METHOD(@selector(downloadDial:callback:))
         __strong typeof(weakSelf) self = weakSelf;
         if (!self || seq != self.dialSwitchSeq) return;
         [self sendEvent:@"dial" data:@{ @"progress": @(progress * 100.0) }];
-        if (progress >= 0.999 && !done) {
-            VPPeripheralBaseManage *pm = [VPBleCentralManage sharedBleManager].peripheralManage;
-            [pm veepooSDKSettingDeviceScreenStyle:1
-                                      settingMode:1
-                                         dialType:VPDeviceDialTypeMarket
-                                           result:^(VPDeviceDialType dt, int screenStyle, BOOL ok) {
-                if (ok) {
-                    // 新装/换了表盘：列表内容与「使用中」都变了
-                    [self invalidateDialCache];
-                    finish(@{ @"ok": @YES, @"complete": @YES, @"name": name ?: @"",
-                              @"kind": @"server", @"screenType": @"MARKET",
-                              @"screenIndex": @(screenStyle), @"style": @(screenStyle) });
-                } else {
-                    finish(@{ @"ok": @NO, @"fail": @YES, @"message": @"uiUpdateFailed" });
-                }
-            }];
+        if (progress >= 0.999 && !done && !activating) {
+            activating = YES;
+            [self activateMarketDial:name finish:finish];
         }
     } failure:^(NSError *error) {
         NSMutableDictionary *d = [@{ @"ok": @NO, @"fail": @YES, @"message": @"uploadFailed" } mutableCopy];
