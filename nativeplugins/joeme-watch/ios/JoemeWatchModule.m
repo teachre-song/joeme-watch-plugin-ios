@@ -9912,13 +9912,28 @@ UNI_EXPORT_METHOD(@selector(setWeatherStatus:callback:))
 UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
 - (void)setWeatherData:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (![self checkReady:callback]) return;
+    // 上一次内容同步是否以「超时」收场（函数内 static：跨调用保持，不需要文件级变量）
+    static BOOL sWeatherSyncStalled = NO;
+    // 设备**真实**天气能力位：0=无天气、1=标准通道(VPWeatherHandle)、2=UM/优美(WLWeatherManager)。
+    // 必须在 enterWeatherCapability 之前取 —— 那里会把它临时顶成 1，之后就读不到真值了。
+    VPPeripheralModel *periphModel = [VPBleCentralManage sharedBleManager].peripheralModel;
+    const NSInteger realWeatherType = periphModel ? (NSInteger)periphModel.weatherType : -1;
     VPWeatherServerModel *m = [[VPWeatherServerModel alloc] init];
     m.city = [options[@"cityName"] isKindOfClass:[NSString class]] ? options[@"cityName"] : @"";
     m.type = options[@"source"] ? [options[@"source"] intValue] : 0;
     double tsMs = options[@"timestamp"] ? [options[@"timestamp"] doubleValue] : [[NSDate date] timeIntervalSince1970] * 1000.0;
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    // 头文件原话：update 必须是 "yyyy-MM-dd HH:mm"，「如果不是这个格式，设备可能无法显示数据」。
+    // 显式锁 en_US_POSIX + 本地时区：不锁的话，手机设成 12 小时制或非公历地区时，
+    // dateFormat 可能被系统改写，发下去的字符串就变形了。
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.timeZone = [NSTimeZone localTimeZone];
     fmt.dateFormat = @"yyyy-MM-dd HH:mm";
     m.update = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:tsMs / 1000.0]];
+
+    // 经纬度：模型有 lon/lat 字段，JS 一直在传，之前漏掉了
+    if ([options[@"lat"] isKindOfClass:[NSNumber class]]) m.lat = [options[@"lat"] doubleValue];
+    if ([options[@"lng"] isKindOfClass:[NSNumber class]]) m.lon = [options[@"lng"] doubleValue];
 
     // 逐小时：每项一个整点（SDK 自己挑最接近当前时间的下一项）
     // 字段口径见 VPWeatherServerHourlyModel.h：温度是华氏度，time 是 "yyyy-MM-dd HH:mm"
@@ -9969,18 +9984,31 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
 
     __weak typeof(self) weakSelf = self;
     __block BOOL settled = NO;
-    void (^finish)(BOOL, NSString *, BOOL) = ^(BOOL ok, NSString *oprate, BOOL timeout) {
+    // 自检数值要在 finish 里拼超时文案（finish 必须先定义才能「打包为空就立刻失败」，探测在后面填）
+    __block NSUInteger diagHourlyBytes = 0;
+    __block NSUInteger diagForecastBytes = 0;
+    __block NSUInteger diagContentBytes = 0;
+    void (^finish)(BOOL, NSString *, BOOL, NSString *) = ^(BOOL ok, NSString *oprate, BOOL timeout, NSString *customMsg) {
         if (settled) return;
         settled = YES;
+        // 能力位在这里才还原：整笔传输已经出结论（成功/失败/超时），门可以关了
+        [weakSelf exitWeatherCapability];
+        if (timeout) sWeatherSyncStalled = YES;
         NSMutableDictionary *d = [@{
             @"ok": @(ok),
             @"oprate": oprate,
             @"setWeatherData": @(ok),
             @"cityName": m.city ?: @""
         } mutableCopy];
-        if (timeout) {
-            d[@"timeout"] = @YES;
-            d[@"message"] = @"设备 8 秒内未回天气数据回执";
+        if (timeout) d[@"timeout"] = @YES;
+        if (customMsg.length > 0) {
+            d[@"message"] = customMsg;
+        } else if (timeout) {
+            d[@"message"] = [NSString stringWithFormat:
+                @"设备 15 秒内未回天气数据回执（模型自检：hourly %lu 项/%.0f 字节、forecast %lu 项/%.0f 字节、整包 %.0f 字节）",
+                (unsigned long)m.hourly.count, (double)diagHourlyBytes,
+                (unsigned long)m.forecast.count, (double)diagForecastBytes,
+                (double)diagContentBytes];
         }
         [weakSelf sendEvent:@"weather" data:d];
         // 一律 200（结论在 ok/timeout 里），页面才能区分「设备拒绝」和「没回执」
@@ -9989,21 +10017,74 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
         callback(r, NO);
     };
 
-    // syncWeatherData 要按 hourly/forecast 逐包推送，本来就慢；设备不回包时给 8 秒上限，
-    // 否则页面的「检测并同步」会一直停在「同步中...」
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+    NSLog(@"[weather] 设备真实天气能力位 weatherType=%ld（0=无 1=标准 2=UM）", (long)realWeatherType);
+    // UM(优美) 机型在 iOS 走 WLWeatherManager 那套（WLWeatherModel + WL 自己的天气 ID 表），
+    // 我们还没实现。若把这种机型硬按标准通道发，设备根本不认这些帧 —— 表现就是
+    // 「N 秒内未回天气数据回执」。与其静默超时，不如直接给可读结论。
+    // （Android 侧对应的是 weatherStyle=2；本机型 Android 报的是 1，所以大概率不会走到这里。）
+    if (realWeatherType == 2) {
+        finish(NO, @"SETTING_CONTENT_UM_UNSUPPORTED", NO,
+               @"设备走 UM(优美) 天气通道，iOS 端尚未实现该路径");
+        return;
+    }
+
+    // 上一次同步卡住过 → 先清掉 SDK 里残留的传输状态（`_syncIndex` / 挂着的回调 block）。
+    // 只在「确实卡过」时做，避免每次同步都动 SDK 内部缓存。
+    if (sWeatherSyncStalled) {
+        sWeatherSyncStalled = NO;
+        [[VPWeatherHandle share] reset];
+        NSLog(@"[weather] 上一次同步卡住过，已 reset SDK 天气缓存状态");
+    }
+
+    // 自检：SDK 内部会用 -valid 过滤每一项，再用 hourlysData / forecastsData / sendDeviceContentData
+    // 打包。字段口径不对时可能过滤成空内容 —— 设备收到空包**不会回执**，
+    // 页面就只能看到一个「N 秒超时」，完全无法定位。把 SDK 自己算出来的长度打出来，
+    // 下次一眼就能判定是「模型打包成空」还是「包发了但设备没回」。
+    uint16_t modelCrc = [m currentModelCrc];
+    NSUInteger hourlyBytes = [[m hourlysData] length];
+    NSUInteger forecastBytes = [[m forecastsData] length];
+    NSUInteger contentBytes = [[m sendDeviceContentData] length];
+    diagHourlyBytes = hourlyBytes;
+    diagForecastBytes = forecastBytes;
+    diagContentBytes = contentBytes;
+    NSLog(@"[weather] iOS 模型自检 update=%@ city=%@ lat=%.4f lon=%.4f source=%d"
+          @" hourly=%lu 项/%lu 字节 forecast=%lu 项/%lu 字节 content=%lu 字节 crc=%u"
+          @" valid(type1)=%d valid(type2)=%d",
+          m.update, m.city, m.lat, m.lon, m.type,
+          (unsigned long)m.hourly.count, (unsigned long)hourlyBytes,
+          (unsigned long)m.forecast.count, (unsigned long)forecastBytes,
+          (unsigned long)contentBytes, modelCrc,
+          (int)[m weatherValidWithWeatherType:1],
+          (int)[m weatherValidWithWeatherType:2]);
+
+    // 打包结果为空就别让页面白等整段超时：直接给明确结论
+    if (contentBytes == 0 || m.hourly.count == 0 || m.forecast.count == 0) {
+        finish(NO, @"SETTING_CONTENT_EMPTY", NO,
+               @"模型没有可下发的天气内容（hourly/forecast 为空或打包成 0 字节），SDK 不会发出任何包");
+        return;
+    }
+
+    // 超时上限给 15 秒（原本 8 秒）：iOS 的 syncWeatherData 是按 hourly/forecast 逐包推送的，
+    // 24 条逐时 + 3 条逐天在 MTU 偏小时包数不少，8 秒在慢设备/弱信号下可能不够。
+    const NSTimeInterval budget = 15.0;
+    NSDate *startedAt = [NSDate date];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        finish(NO, @"SETTING_CONTENT_TIMEOUT", YES);
+        NSLog(@"[weather] 等了 %.1f 秒仍没拿到设备回执（上限 %.0f 秒）→ 判超时", [[NSDate date] timeIntervalSinceDate:startedAt], budget);
+        finish(NO, @"SETTING_CONTENT_TIMEOUT", YES, nil);
     });
 
-    // 同一个门禁：syncWeatherData 也要求天气能力位为真，否则命令直接丢弃
+    // 同一个门禁：syncWeatherData 也要求天气能力位为真，否则命令直接丢弃。
+    // **这里不能再立刻 exit**：能力位是 SDK 发包时读的门禁，整笔传输是异步多包的，
+    // 调完就还原等于「包还在发、门已经关」（Android 侧是靠持久写 SP 支持位，所以没这个坑）。
+    // 还原动作挪到 finish 里，等拿到回执/超时再关。
     [self enterWeatherCapability];
     [[VPWeatherHandle share] syncWeatherDataToDeviceWithWeatherServerModel:m result:^(VPWeatherSettingState state) {
         BOOL ok = (state == VPWeatherSettingStateSuccess);
+        NSLog(@"[weather] syncWeatherData 回调 state=%ld（1=成功 0=无此功能 2=失败）", (long)state);
         // oprate 与 Android 的 SETTING_CONTENT_SUCCESS/FAIL 对齐，页面据此判同步结果
-        finish(ok, ok ? @"SETTING_CONTENT_SUCCESS" : @"SETTING_CONTENT_FAIL", NO);
+        finish(ok, ok ? @"SETTING_CONTENT_SUCCESS" : @"SETTING_CONTENT_FAIL", NO, nil);
     }];
-    [self exitWeatherCapability];
 }
 
 /**
