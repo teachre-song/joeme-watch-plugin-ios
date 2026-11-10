@@ -9781,7 +9781,7 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
 
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         if (live) {
-            d[@"isOpen"] = @(cfg.switchState == 1);
+            d[@"isOpen"] = @((BOOL)(cfg.switchState == 1));
             d[@"weatherType"] = (cfg.weatherUnit == 1) ? @"F" : @"C";
             d[@"crc"] = @(cfg.crc);
             d[@"ok"] = @YES;
@@ -9790,7 +9790,7 @@ UNI_EXPORT_METHOD(@selector(readWeatherStatus:callback:))
                          cfg.switchState == 1 ? @"true" : @"false", d[@"weatherType"]];
             // 只有实时读到的才更新快照
             weakSelf.lastWeatherStatus = @{
-                @"isOpen": @(cfg.switchState == 1),
+                @"isOpen": @((BOOL)(cfg.switchState == 1)),
                 @"weatherType": d[@"weatherType"],
                 @"crc": @(cfg.crc)
             };
@@ -9988,6 +9988,11 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
     __block NSUInteger diagHourlyBytes = 0;
     __block NSUInteger diagForecastBytes = 0;
     __block NSUInteger diagContentBytes = 0;
+    // SDK 自己算的 crc（= 它实际发给设备的那个值）。**不是** JS 传下来的 crc：
+    // iOS SDK 用 `crc16WithWeatherData:length:` 在打包后自己算，跟页面那套摘要算法无关，
+    // 所以拿 content.crc 去比设备回读值必然「不一致」（2026-11-10 实测 0xaa47 vs 0x51e）。
+    __block uint16_t sdkCrcBox = 0;
+    __block BOOL hasSdkCrc = NO;
     void (^finish)(BOOL, NSString *, BOOL, NSString *) = ^(BOOL ok, NSString *oprate, BOOL timeout, NSString *customMsg) {
         if (settled) return;
         settled = YES;
@@ -10001,6 +10006,9 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
             @"cityName": m.city ?: @""
         } mutableCopy];
         if (timeout) d[@"timeout"] = @YES;
+        // 把「SDK 实际下发的 crc」回传给页面：设备回读的 crc 就是这个值，
+        // 页面拿它比对才是有意义的（拿 JS 自己算的 crc 比必然不一致）。
+        if (hasSdkCrc) d[@"modelCrc"] = @(sdkCrcBox);
         if (customMsg.length > 0) {
             d[@"message"] = customMsg;
         } else if (timeout) {
@@ -10040,10 +10048,13 @@ UNI_EXPORT_METHOD(@selector(setWeatherData:callback:))
     // 打包。字段口径不对时可能过滤成空内容 —— 设备收到空包**不会回执**，
     // 页面就只能看到一个「N 秒超时」，完全无法定位。把 SDK 自己算出来的长度打出来，
     // 下次一眼就能判定是「模型打包成空」还是「包发了但设备没回」。
-    uint16_t modelCrc = [m currentModelCrc];
     NSUInteger hourlyBytes = [[m hourlysData] length];
     NSUInteger forecastBytes = [[m forecastsData] length];
     NSUInteger contentBytes = [[m sendDeviceContentData] length];
+    // crc 放在打包之后取：万一 SDK 是懒计算，先调 sendDeviceContentData 更稳
+    uint16_t modelCrc = [m currentModelCrc];
+    sdkCrcBox = modelCrc;
+    hasSdkCrc = YES;
     diagHourlyBytes = hourlyBytes;
     diagForecastBytes = forecastBytes;
     diagContentBytes = contentBytes;
