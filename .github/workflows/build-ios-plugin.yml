@@ -41,10 +41,12 @@ on:
 
 jobs:
   build:
-    # macos-14 = Apple Silicon，原生编译 arm64 目标。Xcode 15+ 最低部署目标为
-    # iOS 12，脚本里 MIN_IOS 默认 12.0；云打包基座实际链接的是 -target
-    # arm64-apple-ios15.0，所以 12.0 只是够用，不影响最终产物。
-    runs-on: macos-14
+    # 2026-11-10：原来的 `runs-on: macos-14` 排队即被拒，注解是
+    #   "The configuration 'macos-14-arm64-us-default' is not supported"
+    # （同 label 在 2026-11-02 的 #60 还能跑，属运行器配置层面的变化）。
+    # 改用 macos-latest 跟随 GitHub 当前默认镜像；脚本本身是
+    # -target arm64-apple-ios，Intel/Apple Silicon 都能交叉编译，镜像变了不影响产物。
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
